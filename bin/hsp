@@ -1,0 +1,414 @@
+#!/system/bin/sh
+# hotspot_plus CLI.  Usage: su -c /data/adb/modules/hotspot_plus/bin/hsp <command>
+#   on | off | toggle | restart        控制热点（经 TetheringManager，使用系统已保存的 SSID/密码）
+#   status [--json]                    状态
+#   clients [--json]                   已连接设备 (IP/MAC/主机名)
+#   apply                              重新加载配置（需要时重启热点 / DHCP）
+#   config --json                      输出配置 + 静态租约 (WebUI 用)
+#   set KEY=VALUE [KEY=VALUE ...]      修改配置（带校验）
+#   lease list | add <MAC> <IP> [备注] | del <MAC> | import <base64>
+#   log [N]  | diag | daemon start|stop|restart|status | hsctl <args>
+#   unstick                            清除卡住的操作（结束残留 hsp/hsctl 进程并删除操作锁）
+MODDIR=${0%/*}; MODDIR=${MODDIR%/bin}
+# Re-exec under BusyBox ash standalone for a predictable environment (WebUI exec uses plain sh).
+if [ -z "$HSP_BB" ]; then
+    for _b in /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox /data/adb/magisk/busybox; do
+        [ -x "$_b" ] && HSP_BB=1 ASH_STANDALONE=1 exec "$_b" sh "$0" "$@"
+    done
+fi
+export HSP_BB=1 MODDIR
+# shellcheck disable=SC2034
+TAG=hsp
+# shellcheck source=../lib/common.sh
+. "$MODDIR/lib/common.sh"
+load_config
+
+wait_ap() { # wait_ap up|down seconds
+    _i=0
+    while [ $_i -lt "$2" ]; do
+        if ap_detect; then [ "$1" = up ] && return 0; else [ "$1" = down ] && return 0; fi
+        sleep 1; _i=$((_i+1))
+    done
+    return 1
+}
+
+client_placeholder() { # last usable address of configured subnet, used only for Android's single-client DhcpServer
+    _m=$(pfx2mask_int "$PREFIX"); _n=$(( $(ip2int "$GATEWAY") & _m )); _sz=$(( 1 << (32 - PREFIX) ))
+    _c=$(int2ip $(( _n + _sz - 2 )))
+    [ "$_c" = "$GATEWAY" ] && _c=$(int2ip $(( _n + _sz - 3 )))
+    echo "$_c"
+}
+
+b64d() { echo "$1" | base64 -d 2>/dev/null; }
+
+fallback_start() {
+    # 1) saved config via IWifiManager, 2) WifiConfigStoreSoftAp.xml, 3) FALLBACK_SSID/FALLBACK_PASS from config
+    _cfg=$(hsctl config 2>/dev/null)
+    _ssid=$(b64d "$(echo "$_cfg" | sed -n 's/^ssid_b64=//p')")
+    _pass=$(b64d "$(echo "$_cfg" | sed -n 's/^pass_b64=//p')")
+    _sec=$(echo "$_cfg" | sed -n 's/^security=//p')
+    _band=$(echo "$_cfg" | sed -n 's/^band=//p')
+    if [ -z "$_ssid" ]; then
+        # Android 14+ may keep it in credential-encrypted storage (seen on HyperOS OS4 / Android 17)
+        _x=""
+        for _c in /data/misc/apexdata/com.android.wifi/WifiConfigStoreSoftAp.xml /data/misc_ce/0/apexdata/com.android.wifi/WifiConfigStoreSoftAp.xml; do
+            [ -f "$_c" ] && { _x=$_c; break; }
+        done
+        if [ -n "$_x" ]; then
+            _ssid=$(sed -n 's/.*<string name="SSID">"\{0,1\}\([^"<]*\)"\{0,1\}<\/string>.*/\1/p' "$_x" | head -n1)
+            [ -n "$_ssid" ] || _ssid=$(sed -n 's/.*<string name="WifiSsid">"\{0,1\}\([^"<]*\)"\{0,1\}<\/string>.*/\1/p' "$_x" | head -n1)
+            _pass=$(sed -n 's/.*<string name="Passphrase">\([^<]*\)<\/string>.*/\1/p' "$_x" | head -n1)
+            _sec=$(sed -n 's/.*<int name="SecurityType" value="\([0-9]*\)".*/\1/p' "$_x" | head -n1)
+        fi
+    fi
+    [ -n "$_ssid" ] || _ssid=$FALLBACK_SSID
+    [ -n "$_pass" ] || _pass=$FALLBACK_PASS
+    if [ -z "$_ssid" ]; then say "回退方案失败：读不到热点 SSID（可在 config.conf 设置 FALLBACK_SSID/FALLBACK_PASS）"; return 1; fi
+    case "$_sec" in 0) _st=open ;; 2) _st=wpa3_transition ;; 3) _st=wpa3 ;; 4) _st=owe_transition ;; 5) _st=owe ;; *) _st=wpa2 ;; esac
+    [ -z "$_pass" ] && _st=open
+    _b=""
+    case "$_band" in 1) _b="-b 2" ;; 2|3) _b="-b 5" ;; 4|5|6|7) _b="-b 6" ;; esac
+    log "fallback: cmd wifi start-softap ssid=$_ssid sec=$_st band=${_b:-default}"
+    if [ "$_st" = open ] || [ "$_st" = owe ] || [ "$_st" = owe_transition ]; then
+        # shellcheck disable=SC2086
+        tmo 25 "cmd wifi start-softap" cmd wifi start-softap "$_ssid" "$_st" $_b >> "$LOG" 2>&1
+    else
+        # shellcheck disable=SC2086
+        tmo 25 "cmd wifi start-softap" cmd wifi start-softap "$_ssid" "$_st" "$_pass" $_b >> "$LOG" 2>&1
+    fi
+}
+
+do_on() {
+    if ap_detect; then
+        if [ "$FIXED_GATEWAY" = 1 ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ] && dhcp_capable; then
+            say "热点已开启但网关为 ${AP_ADDR%/*}，按配置重启"
+            do_off quiet
+        else
+            say "热点已开启：$AP_IF ${AP_ADDR}"
+            return 0
+        fi
+    fi
+    _args=""
+    if [ "$FIXED_GATEWAY" = 1 ]; then
+        if dhcp_capable; then
+            _args="--static $GATEWAY/$PREFIX $(client_placeholder)/$PREFIX"
+        else
+            say "警告：自建 DHCP 不可用（DHCP_ENABLE=0 / 无 udhcpd / iptables owner 不支持），本次不固定网关（否则系统 DHCP 只会给 1 台设备分配地址）"
+        fi
+    fi
+    date +%s > "$RUN/started_by_hsp"
+    log "starting hotspot via TetheringManager ${_args:+($_args)}"
+    # shellcheck disable=SC2086
+    _out=$(hsctl start $_args --pkg "$CALLER_PKG" --timeout 25)
+    _rc=$?
+    log "hsctl start rc=$_rc"
+    echo "$_out" | while read -r _l; do [ -n "$_l" ] && log "  hsctl: $_l"; done
+    if [ $_rc -eq 2 ]; then
+        # exception (e.g. hidden-API exemption / reflection problem): retry once without the exemption hack
+        log "hsctl start: exception, retrying with --no-exempt"
+        # shellcheck disable=SC2086
+        _out=$(hsctl start $_args --pkg "$CALLER_PKG" --timeout 25 --no-exempt)
+        _rc=$?
+        log "hsctl start (no-exempt) rc=$_rc"
+        echo "$_out" | while read -r _l; do [ -n "$_l" ] && log "  hsctl: $_l"; done
+    fi
+    echo "$_out" | grep -E '^(start_result|error|sdk|method)=' | sed 's/^/  hsctl: /'
+    case $_rc in
+        0) : ;;
+        1|3) say "TetheringManager 返回：$(echo "$_out" | sed -n 's/^start_result=//p')" ;;
+        124|137|143) say "hsctl 超时被终止，尝试 cmd wifi start-softap 回退"; fallback_start ;;
+        *) say "hsctl 调用失败 rc=$_rc（$(echo "$_out" | sed -n 's/^error=//p')），尝试 cmd wifi start-softap 回退"
+           fallback_start ;;
+    esac
+    if wait_ap up 20; then
+        say "热点已开启：$AP_IF $AP_ADDR"
+        if [ -n "$_args" ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ]; then
+            say "警告：请求的固定网关 $GATEWAY 未生效（系统可能忽略了静态地址请求），DHCP 将按实际网段工作"
+        fi
+        daemon_wake up
+        return 0
+    fi
+    say "热点未能开启（详见 $LOG）"
+    return 1
+}
+
+do_off() {
+    log "stopping hotspot"
+    rm -f "$RUN/started_by_hsp"
+    _out=$(hsctl stop --pkg "$CALLER_PKG" --timeout 10)
+    _rc=$?
+    log "hsctl stop rc=$_rc"
+    echo "$_out" | while read -r _l; do [ -n "$_l" ] && log "  hsctl: $_l"; done
+    if [ $_rc -ge 2 ]; then
+        say "hsctl stop 失败 rc=$_rc，回退 cmd wifi stop-softap"
+        tmo 15 "cmd wifi stop-softap" cmd wifi stop-softap >> "$LOG" 2>&1
+    fi
+    if wait_ap down 15; then
+        [ "$1" = quiet ] || say "热点已关闭"
+        daemon_wake down
+        return 0
+    fi
+    say "热点关闭超时"
+    return 1
+}
+
+do_status_json() {
+    _ap=false; _if=""; _addr=""
+    ap_detect_fast && { _ap=true; _if=$AP_IF; _addr=$AP_ADDR; }
+    _gwok=false; [ "${_addr%/*}" = "$GATEWAY" ] && _gwok=true
+    _dhcp=false; dhcp_running && _dhcp=true
+    _fw=false; [ -n "$_if" ] && fw_check "$_if" && _fw=true
+    _dm=false; [ -n "$(daemon_pid)" ] && _dm=true
+    _udh=false; bb_has udhcpd && _udh=true
+    _eb=false; [ -f "$RUN/enforce_broken" ] && _eb=true
+    _ver=$(sed -n 's/^version=//p' "$MODDIR/module.prop")
+    _last=$(grep -E 'ERROR|WARN|TIMEOUT|LOCK: (breaking|flock)|另一个操作' "$LOG" 2>/dev/null | tail -n1)
+    _opb=false; H_PID=""; H_OP=""; H_AGE=""
+    if lock_busy; then _opb=true; lock_holder_info; fi
+    printf '{"ap":%s,"iface":"%s","addr":"%s","gateway_cfg":"%s","prefix_cfg":%s,"gateway_ok":%s,' \
+        "$_ap" "$_if" "$_addr" "$GATEWAY" "$PREFIX" "$_gwok"
+    printf '"fixed_gateway":%s,"dhcp_enable":%s,"dhcp_running":%s,"fw_ok":%s,"daemon":%s,"udhcpd_available":%s,' \
+        "$([ "$FIXED_GATEWAY" = 1 ] && echo true || echo false)" "$([ "$DHCP_ENABLE" = 1 ] && echo true || echo false)" \
+        "$_dhcp" "$_fw" "$_dm" "$_udh"
+    printf '"op_busy":%s,"op_name":"%s","op_pid":"%s","op_age":"%s",' "$_opb" "$H_OP" "$H_PID" "$H_AGE"
+    printf '"enforce_broken":%s,"sdk":"%s","release":"%s","hyperos":"%s","version":"%s","busybox":"%s","last_issue":"%s"}\n' \
+        "$_eb" "$SDK" "$RELEASE" "$(json_esc "$HYPEROS")" "$_ver" "$BB" "$(json_esc "$_last")"
+}
+
+do_status_text() {
+    echo "hotspot_plus $(sed -n 's/^version=//p' "$MODDIR/module.prop")  Android $RELEASE (SDK $SDK)  $HYPEROS"
+    if ap_detect; then echo "热点: 开启  接口=$AP_IF  地址=$AP_ADDR"; else echo "热点: 关闭"; fi
+    echo "配置网关: $GATEWAY/$PREFIX (固定=$FIXED_GATEWAY 强制=$ENFORCE_GATEWAY)"
+    echo "DHCP: enable=$DHCP_ENABLE running=$(dhcp_running && echo yes || echo no) udhcpd=$(bb_has udhcpd && echo yes || echo no)"
+    [ -n "$AP_IF" ] && echo "防火墙拦截系统DHCP: $(fw_check "$AP_IF" && echo yes || echo no)"
+    echo "守护进程: $([ -n "$(daemon_pid)" ] && echo "运行中 pid $(daemon_pid)" || echo 未运行)"
+    if lock_busy; then lock_holder_info; echo "操作锁: 被占用 ${H_OP:-?} pid=${H_PID:-?} ${H_AGE:-?}s"; else echo "操作锁: 空闲"; fi
+    [ -f "$RUN/enforce_broken" ] && echo "注意: 静态网关请求未被系统采纳（本次开机已停止强制）"
+    echo "AP 状态(IWifiManager): $(hsctl state 2>/dev/null | sed -n 's/^ap_state_name=//p')"
+}
+
+# clients: merge ip neigh + udhcpd leases + static lease names (+ Wi-Fi association count)
+do_clients_json() {
+    if ! ap_detect_fast; then echo '{"ap":false,"clients":[]}'; return 0; fi
+    _tmp=$RUN/clients.$$
+    {
+        $IPB -4 neigh show dev "$AP_IF" 2>/dev/null | awk '{ip=$1; mac=""; st=$NF; for(i=2;i<=NF;i++) if($i=="lladdr") mac=$(i+1); if(mac!="") print "N", tolower(mac), ip, st}'
+        $IPB -6 neigh show dev "$AP_IF" 2>/dev/null | awk '{ip=$1; mac=""; st=$NF; for(i=2;i<=NF;i++) if($i=="lladdr") mac=$(i+1); if(mac!="" && ip !~ /^fe80/) print "S", tolower(mac), ip, st}'
+        # SIGUSR1 makes udhcpd flush its in-memory leases to the lease file right now
+        _dp=$(dhcp_pid); [ -n "$_dp" ] && kill -USR1 "$_dp" 2>/dev/null && sleep 0.3
+        if [ -s "$LEASE_DB" ] && bb_has dumpleases; then
+            "$BB" dumpleases -f "$LEASE_DB" 2>/dev/null | awk 'NR>1 && length($0)>=36 {
+                mac=substr($0,1,17); ip=substr($0,19,16); host=substr($0,35,20); ex=substr($0,55);
+                gsub(/ +$/,"",ip); gsub(/^ +| +$/,"",host); gsub(/^ +| +$/,"",ex); gsub(/ /,"_",ex);
+                if (host=="") host="-"; gsub(/[ \t]/,"_",host);
+                print "L", tolower(mac), ip, ex, host }'
+        fi
+        [ -f "$LEASES" ] && awk '!/^#/ && NF>=2 {n=""; for(i=3;i<=NF;i++) n=n (i>3?" ":"") $i; print "T", tolower($1), $2, n}' "$LEASES"
+    } > "$_tmp"
+    # Wi-Fi association count from SoftApManager dump (dumpsys wifi is heavy: cache 30s)
+    _ac=$RUN/assoc.cache
+    if [ -f "$_ac" ] && [ $(( $(date +%s) - $(stat -c %Y "$_ac" 2>/dev/null || echo 0) )) -lt 30 ]; then
+        _assoc=$(cat "$_ac")
+    else
+        _assoc=$(tmo 8 "dumpsys wifi" dumpsys wifi 2>/dev/null | sed -n 's/.*getConnectedClientList().size(): *\([0-9]*\).*/\1/p' | head -n1)
+        echo "$_assoc" > "$_ac"
+    fi
+    awk -v iface="$AP_IF" -v addr="$AP_ADDR" -v assoc="${_assoc:-null}" '
+    function esc(s) { gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); return s }
+    function add(m) { if (!(m in seen)) { seen[m]=1; order[++n]=m } }
+    $1=="N" { add($2); ip[$2]=$3; st[$2]=$4 }
+    $1=="S" { add6[$2]=(add6[$2]=="" ? $3 : add6[$2] " " $3) }
+    $1=="L" { if ($4!="expired") { add($2); lip[$2]=$3; lexp[$2]=$4; if ($5!="-") host[$2]=$5 } }
+    $1=="T" { tip[$2]=$3; s=$0; sub(/^T [^ ]+ [^ ]+ ?/,"",s); tname[$2]=s }
+    END {
+        printf "{\"ap\":true,\"iface\":\"%s\",\"addr\":\"%s\",\"assoc\":%s,\"clients\":[", iface, addr, assoc
+        first=1
+        for (i=1;i<=n;i++) { m=order[i]
+            state = (m in st) ? st[m] : "NOLEASE"
+            if (state=="FAILED" || state=="INCOMPLETE") { if (!(m in lip)) continue }
+            online = (state ~ /REACHABLE|STALE|DELAY|PROBE|PERMANENT/) ? "true" : "false"
+            cip = (m in ip) ? ip[m] : lip[m]
+            if (!first) printf ","; first=0
+            printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"hostname\":\"%s\",\"remark\":\"%s\",\"static_ip\":\"%s\",\"state\":\"%s\",\"online\":%s,\"lease\":\"%s\"}",
+                m, cip, add6[m], esc(host[m]), esc(tname[m]), tip[m], state, online, lexp[m]
+        }
+        print "]}"
+    }' "$_tmp"
+    rm -f "$_tmp"
+}
+
+do_clients_text() {
+    do_clients_json | awk '
+      { s=$0; gsub(/.*"clients":\[/,"",s); gsub(/\]\}$/,"",s); n=split(s,a,/\},\{/);
+        printf "%-17s  %-15s  %-18s  %-10s  %s\n", "MAC", "IP", "主机名/备注", "状态", "租约剩余";
+        for(i=1;i<=n;i++){ r=a[i]; m=f(r,"mac"); if(m=="") continue;
+          nm=f(r,"remark"); if(nm=="") nm=f(r,"hostname");
+          printf "%-17s  %-15s  %-18s  %-10s  %s\n", m, f(r,"ip"), nm, f(r,"state"), f(r,"lease") } }
+      function f(r,k,  t){ t=r; if (!match(t,"\"" k "\":\"[^\"]*\"")) return ""; t=substr(t,RSTART+length(k)+4,RLENGTH-length(k)-5); return t }'
+}
+
+do_config_json() {
+    printf '{"FIXED_GATEWAY":"%s","GATEWAY":"%s","PREFIX":"%s","DHCP_ENABLE":"%s","DHCP_START":"%s","DHCP_END":"%s",' \
+        "$FIXED_GATEWAY" "$GATEWAY" "$PREFIX" "$DHCP_ENABLE" "$DHCP_START" "$DHCP_END"
+    printf '"LEASE_TIME":"%s","DNS":"%s","ENFORCE_GATEWAY":"%s","AUTO_START":"%s","AP_IFACE":"%s","METERED":"%s","leases":[' \
+        "$LEASE_TIME" "$(json_esc "$DNS")" "$ENFORCE_GATEWAY" "$AUTO_START" "$(json_esc "$AP_IFACE")" "$METERED"
+    _first=1
+    if [ -f "$LEASES" ]; then
+        while read -r _mac _ip _rest; do
+            case "$_mac" in ''|'#'*) continue ;; esac
+            [ $_first = 1 ] || printf ','
+            _first=0
+            printf '{"mac":"%s","ip":"%s","name":"%s"}' "$(json_esc "$_mac")" "$(json_esc "$_ip")" "$(json_esc "$_rest")"
+        done < "$LEASES"
+    fi
+    printf ']}\n'
+}
+
+# ---------------------------------------------------------------- config editing (validated)
+conf_set_raw() { # key value  (value already validated)
+    touch "$CONF"
+    _tmpc=$CONF.tmp.$$
+    grep -v "^$1=" "$CONF" > "$_tmpc" 2>/dev/null
+    echo "$1=\"$2\"" >> "$_tmpc"
+    mv -f "$_tmpc" "$CONF"
+}
+do_set() {
+    [ $# -gt 0 ] || { echo "用法: hsp set KEY=VALUE ..."; return 1; }
+    for _kv in "$@"; do
+        _k=${_kv%%=*}; _v=${_kv#*=}
+        case "$_k" in
+            FIXED_GATEWAY|DHCP_ENABLE|ENFORCE_GATEWAY|AUTO_START|METERED)
+                case "$_v" in 0|1) ;; *) echo "无效值 $_k=$_v (0/1)"; return 1 ;; esac ;;
+            GATEWAY|DHCP_START|DHCP_END)
+                is_ipv4 "$_v" || { echo "无效 IP: $_k=$_v"; return 1; } ;;
+            PREFIX)
+                case "$_v" in 16|17|18|19|20|21|22|23|24|25|26|27|28) ;; *) echo "前缀长度需 16-28"; return 1 ;; esac ;;
+            LEASE_TIME)
+                case "$_v" in ''|*[!0-9]*) echo "租期需为秒数"; return 1 ;; esac
+                [ "$_v" -ge 120 ] || { echo "租期至少 120 秒"; return 1; } ;;
+            POLL_INTERVAL)
+                case "$_v" in [1-9]|[1-5][0-9]|60) ;; *) echo "POLL_INTERVAL 1-60"; return 1 ;; esac ;;
+            DNS)
+                for _d in $(echo "$_v" | tr ',' ' '); do is_ipv4 "$_d" || { echo "无效 DNS: $_d"; return 1; }; done ;;
+            AP_IFACE)
+                echo "$_v" | grep -qE '^[A-Za-z0-9_.-]{0,15}$' || { echo "无效接口名"; return 1; } ;;
+            CALLER_PKG)
+                echo "$_v" | grep -qE '^[A-Za-z0-9_.]{1,100}$' || { echo "无效包名"; return 1; } ;;
+            FALLBACK_SSID|FALLBACK_PASS)
+                echo "$_v" | grep -q '["$`\\]' && { echo "$_k 不能包含 \" \$ \` \\"; return 1; } ;;
+            *) echo "未知配置项: $_k"; return 1 ;;
+        esac
+    done
+    # cross-field checks with the new values applied
+    load_config
+    for _kv in "$@"; do eval "${_kv%%=*}=\${_kv#*=}"; done
+    _m=$(pfx2mask_int "$PREFIX"); _n=$(( $(ip2int "$GATEWAY") & _m )); _sz=$(( 1 << (32 - PREFIX) ))
+    _g=$(( $(ip2int "$GATEWAY") - _n ))
+    if [ "$_g" -le 0 ] || [ "$_g" -ge $(( _sz - 1 )) ]; then echo "网关不能是网络地址/广播地址"; return 1; fi
+    case "$GATEWAY" in 10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;; *) echo "网关需在私有网段 (10/8, 172.16/12, 192.168/16)"; return 1 ;; esac
+    for _ip in "$DHCP_START" "$DHCP_END"; do
+        _o=$(( $(ip2int "$_ip") - _n ))
+        if [ "$_o" -le 0 ] || [ "$_o" -ge $(( _sz - 1 )) ]; then echo "DHCP 范围 $_ip 不在 $(int2ip $_n)/$PREFIX 内"; return 1; fi
+    done
+    [ "$(ip2int "$DHCP_START")" -le "$(ip2int "$DHCP_END")" ] || { echo "DHCP 起始地址大于结束地址"; return 1; }
+    for _kv in "$@"; do conf_set_raw "${_kv%%=*}" "${_kv#*=}"; done
+    log "config updated: $*"
+    echo "已保存"
+}
+
+lease_validate_line() { # mac ip name -> normalized line or error
+    is_mac "$1" || { echo "ERR 无效 MAC: $1"; return 1; }
+    is_ipv4 "$2" || { echo "ERR 无效 IP: $2"; return 1; }
+    _nm=$(echo "$3" | tr -d '"$`\\\t\r' | cut -c1-64)
+    echo "$(lc "$1") $2${_nm:+ $_nm}"
+}
+do_lease() {
+    _sub=$1; shift
+    case "$_sub" in
+        list|"") [ -f "$LEASES" ] && grep -vE '^[[:space:]]*(#|$)' "$LEASES" ;;
+        add)
+            _line=$(lease_validate_line "$1" "$2" "$3") || { echo "$_line"; return 1; }
+            _mac=$(lc "$1")
+            touch "$LEASES"
+            if grep -v "^#" "$LEASES" | awk -v ip="$2" -v m="$_mac" '$2==ip && tolower($1)!=m {f=1} END{exit !f}'; then
+                echo "IP $2 已被其他 MAC 使用"; return 1
+            fi
+            { grep -vi "^$_mac " "$LEASES"; echo "$_line"; } > "$LEASES.tmp" && mv -f "$LEASES.tmp" "$LEASES"
+            log "lease add: $_line"; echo "已添加: $_line" ;;
+        del)
+            _mac=$(lc "$1"); is_mac "$_mac" || { echo "无效 MAC"; return 1; }
+            grep -vi "^$_mac " "$LEASES" > "$LEASES.tmp"; mv -f "$LEASES.tmp" "$LEASES"
+            log "lease del: $_mac"; echo "已删除 $_mac" ;;
+        import)
+            # base64 of UTF-8 text, one "MAC IP [备注]" per line (WebUI saves the whole table this way)
+            _txt=$(echo "$1" | base64 -d 2>/dev/null) || { echo "base64 解码失败"; return 1; }
+            _out=$LEASES.new; : > "$_out"
+            _err=$(echo "$_txt" | while read -r _m _i _n; do
+                [ -z "$_m" ] && continue
+                case "$_m" in '#'*) continue ;; esac
+                _l=$(lease_validate_line "$_m" "$_i" "$_n") || { echo "$_l"; break; }
+                echo "$_l" >> "$_out"
+            done)
+            [ -n "$_err" ] && { rm -f "$_out"; echo "$_err"; return 1; }
+            _dup=$(awk '{print $1}' "$_out" | sort | uniq -d | head -n1)
+            [ -n "$_dup" ] && { rm -f "$_out"; echo "MAC 重复: $_dup"; return 1; }
+            _dup=$(awk '{print $2}' "$_out" | sort | uniq -d | head -n1)
+            [ -n "$_dup" ] && { rm -f "$_out"; echo "IP 重复: $_dup"; return 1; }
+            { echo "# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)"; cat "$_out"; } > "$LEASES.tmp" && mv -f "$LEASES.tmp" "$LEASES"
+            rm -f "$_out"
+            log "leases imported: $(grep -vc '^#' "$LEASES") entries"
+            echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约" ;;
+        *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64"; return 1 ;;
+    esac
+}
+
+do_apply() {
+    load_config
+    if ap_detect; then
+        if [ "$FIXED_GATEWAY" = 1 ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ] && dhcp_capable; then
+            rm -f "$RUN/enforce_broken"
+            say "网关需变更为 $GATEWAY，正在重启热点…"
+            lock apply; do_off quiet; do_on
+            return $?
+        fi
+        daemon_wake reload
+        say "已应用（DHCP 将按新配置重启）"
+    else
+        daemon_wake reload
+        say "已保存，下次开启热点时生效"
+    fi
+}
+
+daemon_ctl() {
+    case "$1" in
+        start)
+            if [ -n "$(daemon_pid)" ]; then echo "守护进程已在运行 ($(daemon_pid))"; return 0; fi
+            setsid "$BB" sh "$MODDIR/bin/hspd" >/dev/null 2>&1 < /dev/null 9>&- 3>&- &
+            sleep 1; if [ -n "$(daemon_pid)" ]; then say "守护进程已启动 ($(daemon_pid))"; else say "守护进程启动失败"; fi ;;
+        stop)
+            _p=$(daemon_pid); [ -n "$_p" ] && kill "$_p"; sleep 1
+            dhcp_stop; fw_del; echo "守护进程已停止，已移除 DHCP 拦截规则" ;;
+        restart) daemon_ctl stop; daemon_ctl start ;;
+        *) [ -n "$(daemon_pid)" ] && echo "running $(daemon_pid)" || echo "stopped" ;;
+    esac
+}
+
+cmd=$1; [ $# -gt 0 ] && shift
+case "$cmd" in
+    on|start) lock on; do_on ;;
+    off|stop) lock off; do_off ;;
+    toggle) lock toggle; if ap_detect; then do_off; else do_on; fi ;;
+    restart) lock restart; do_off quiet; do_on ;;
+    unstick) unstick ;;
+    status) if [ "$1" = --json ]; then do_status_json; else do_status_text; fi ;;
+    clients) if [ "$1" = --json ]; then do_clients_json; else do_clients_text; fi ;;
+    config) do_config_json ;;
+    set) do_set "$@" ;;
+    lease|leases) do_lease "$@" ;;
+    apply) do_apply ;;
+    log) tail -n "${1:-120}" "$LOG" 2>/dev/null ;;
+    diag) sh "$MODDIR/diag.sh" "$@" 9>&- ;;
+    daemon) daemon_ctl "$1" ;;
+    hsctl) hsctl "$@" ;;
+    *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ; exit 1 ;;
+esac

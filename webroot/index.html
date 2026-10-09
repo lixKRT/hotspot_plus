@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hotspot Plus 热点增强</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1d1d1f;--sub:#6b7280;--line:#e5e7eb;--acc:#2563eb;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--chip:#eef2ff}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#1a1d23;--fg:#e8eaed;--sub:#9aa0a6;--line:#2c3038;--acc:#5b8cff;--chip:#232a3d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;padding:calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 24px)}
+h1{font-size:22px;margin:4px 4px 12px}
+h2{font-size:16px;margin:0 0 10px;display:flex;align-items:center;justify-content:space-between}
+.card{background:var(--card);border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:none}
+.row>label:not(.switch){flex:1}
+.sub{color:var(--sub);font-size:13px}
+.big{font-size:18px;font-weight:600}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:14px;margin-top:8px}
+.kv span:nth-child(odd){color:var(--sub)}
+input[type=text],input[type=number],select{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:transparent;color:var(--fg);font-size:15px}
+input.bad{border-color:var(--bad)}
+.field{margin:8px 0}
+.field .sub{display:block;margin-bottom:4px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{border:none;border-radius:10px;padding:9px 14px;font-size:14px;background:var(--chip);color:var(--acc);cursor:pointer}
+button.primary{background:var(--acc);color:#fff}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.5}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.switch{position:relative;width:52px;height:30px;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:#c7cbd1;border-radius:30px;transition:.2s}
+.slider:before{content:"";position:absolute;width:24px;height:24px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+.switch input:checked+.slider{background:var(--acc)}
+.switch input:checked+.slider:before{transform:translateX(22px)}
+.switch input:disabled+.slider{opacity:.5}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--sub)}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+.client{border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:8px 0}
+.client .top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.client .name{font-weight:600;word-break:break-all}
+.client .meta{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:var(--sub);word-break:break-all}
+.tag{font-size:11px;padding:1px 6px;border-radius:6px;background:var(--chip);color:var(--acc);margin-left:4px;white-space:nowrap}
+.tag.off{color:var(--sub)}
+.lease{display:grid;grid-template-columns:1.35fr 1fr 1fr auto;gap:6px;margin:6px 0;align-items:center}
+.lease input{padding:7px 8px;font-size:13px}
+.lease button{padding:7px 9px}
+pre{white-space:pre-wrap;word-break:break-all;font-size:12px;background:var(--bg);border-radius:10px;padding:10px;max-height:360px;overflow:auto;margin:8px 0 0}
+#toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 24px);transform:translateX(-50%);background:rgba(0,0,0,.82);color:#fff;padding:9px 14px;border-radius:10px;font-size:14px;display:none;max-width:90%;z-index:9}
+#banner{display:none;background:#fde68a;color:#7c2d12;padding:10px;border-radius:10px;margin-bottom:12px}
+.warnbox{background:rgba(217,119,6,.12);color:var(--warn);border-radius:10px;padding:8px 10px;font-size:13px;margin-top:8px;display:none}
+details summary{cursor:pointer;color:var(--sub)}
+#opBanner{display:none;background:rgba(37,99,235,.12);color:var(--acc);border-radius:10px;padding:8px 10px;font-size:13px;margin-top:8px}
+#opBanner.stuck{background:rgba(220,38,38,.12);color:var(--bad)}
+#opBox{max-height:300px}
+.opok{color:var(--ok)}.opbad{color:var(--bad)}
+</style>
+</head>
+<body>
+<h1>热点增强 <span class="sub" id="ver"></span></h1>
+<div id="banner">未检测到 KernelSU WebUI 环境（window.ksu 不存在），页面仅供预览。</div>
+
+<!-- 状态 / 开关 -->
+<div class="card">
+  <div class="row" style="border:none">
+    <div>
+      <div class="big"><span class="dot" id="apDot"></span><span id="apText">读取中…</span></div>
+      <div class="sub" id="apSub"></div>
+    </div>
+    <label class="switch"><input type="checkbox" id="apSwitch"><span class="slider"></span></label>
+  </div>
+  <div class="kv" id="kv"></div>
+  <div class="warnbox" id="warn"></div>
+  <div id="opBanner"></div>
+  <div class="btns"><button id="btnRefresh">刷新</button><button class="op" id="btnRestart">重启热点</button>
+    <button class="danger" id="btnUnstick">清除卡住的操作</button></div>
+</div>
+
+<!-- 操作输出 -->
+<div class="card" id="opCard" style="display:none">
+  <h2><span>操作输出 <span class="sub" id="opTitle"></span></span><button id="btnOpHide" style="padding:4px 10px">收起</button></h2>
+  <pre id="opBox"></pre>
+</div>
+
+<!-- 已连接设备 -->
+<div class="card">
+  <h2><span>已连接设备 <span class="sub" id="clientCount"></span></span>
+    <span><label class="sub" style="font-weight:normal"><input type="checkbox" id="autoRef" checked> 自动刷新</label></span></h2>
+  <div id="clients"><div class="sub">—</div></div>
+  <div class="btns"><button id="btnClients">刷新设备</button></div>
+</div>
+
+<!-- 网关 & DHCP -->
+<div class="card">
+  <h2>网关与 DHCP</h2>
+  <div class="row"><label>固定热点网关<div class="sub">开启热点时请求固定地址（需自建 DHCP）</div></label>
+    <label class="switch"><input type="checkbox" id="FIXED_GATEWAY"><span class="slider"></span></label></div>
+  <div class="grid2">
+    <div class="field"><span class="sub">网关 IP</span><input type="text" id="GATEWAY" inputmode="decimal" placeholder="192.168.4.1"></div>
+    <div class="field"><span class="sub">前缀长度</span>
+      <select id="PREFIX"><option>24</option><option>23</option><option>22</option><option>20</option><option>16</option><option>25</option><option>26</option><option>27</option><option>28</option></select></div>
+  </div>
+  <div class="row"><label>自建 DHCP（静态绑定）<div class="sub">busybox udhcpd，替代系统 DhcpServer</div></label>
+    <label class="switch"><input type="checkbox" id="DHCP_ENABLE"><span class="slider"></span></label></div>
+  <div class="grid2">
+    <div class="field"><span class="sub">地址池起始</span><input type="text" id="DHCP_START" inputmode="decimal"></div>
+    <div class="field"><span class="sub">地址池结束</span><input type="text" id="DHCP_END" inputmode="decimal"></div>
+    <div class="field"><span class="sub">租期（秒）</span><input type="number" id="LEASE_TIME" min="120"></div>
+    <div class="field"><span class="sub">DNS（留空=网关）</span><input type="text" id="DNS" placeholder="如 223.5.5.5,119.29.29.29"></div>
+  </div>
+  <div class="row"><label>强制固定网关<div class="sub">从系统开关打开且网关不符时自动重启一次热点</div></label>
+    <label class="switch"><input type="checkbox" id="ENFORCE_GATEWAY"><span class="slider"></span></label></div>
+  <div class="row"><label>开机自动开启热点</label>
+    <label class="switch"><input type="checkbox" id="AUTO_START"><span class="slider"></span></label></div>
+  <details><summary>高级</summary>
+    <div class="field"><span class="sub">热点接口（留空自动识别）</span><input type="text" id="AP_IFACE" placeholder="wlan1 / ap0 …"></div>
+    <div class="row"><label>下发计量网络标记 (ANDROID_METERED)</label>
+      <label class="switch"><input type="checkbox" id="METERED"><span class="slider"></span></label></div>
+  </details>
+  <div class="btns"><button class="primary op" id="btnSaveCfg">保存并应用</button></div>
+</div>
+
+<!-- 静态租约 -->
+<div class="card">
+  <h2>静态 IP 绑定</h2>
+  <div class="sub">按 MAC 分配固定 IP（需“自建 DHCP”开启）。客户端连接时多使用“随机 MAC”：Android 10+/iOS 14+ 对同一热点的随机 MAC 通常固定，可直接在上方设备列表点“绑定”；若客户端启用了轮换/非持久随机 MAC，请对该热点关闭随机 MAC。</div>
+  <div class="lease sub" style="margin-top:10px"><span>MAC</span><span>IP</span><span>备注</span><span></span></div>
+  <div id="leases"></div>
+  <div class="btns"><button id="btnAddLease">添加一行</button><button class="primary op" id="btnSaveLeases">保存绑定</button></div>
+</div>
+
+<!-- 日志 -->
+<div class="card">
+  <h2>日志与诊断</h2>
+  <div class="btns"><button id="btnLog">查看日志</button><button id="btnDiag">生成诊断文件</button><button class="op" id="btnDaemon">重启守护进程</button></div>
+  <pre id="logBox" style="display:none"></pre>
+</div>
+
+<div id="toast"></div>
+
+<script>
+'use strict';
+const HSP = '/data/adb/modules/hotspot_plus/bin/hsp';
+const $ = (id) => document.getElementById(id);
+const hasKsu = typeof window.ksu !== 'undefined' && window.ksu && typeof window.ksu.exec === 'function';
+if (!hasKsu) $('banner').style.display = 'block';
+
+// ---- KernelSU exec wrapper (same protocol as the `kernelsu` npm package) ----
+let cbSeq = 0;
+function exec(cmd, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!hasKsu) { resolve({ errno: -1, stdout: '', stderr: 'no ksu' }); return; }
+    const name = `hsp_cb_${Date.now()}_${cbSeq++}`;
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; delete window[name]; resolve({ errno: -2, stdout: '', stderr: 'timeout' }); } }, timeoutMs || 90000);
+    window[name] = (errno, stdout, stderr) => {
+      if (done) return; done = true; clearTimeout(timer); delete window[name];
+      resolve({ errno, stdout: stdout || '', stderr: stderr || '' });
+    };
+    try { ksu.exec(cmd, '{}', name); } catch (e) { done = true; clearTimeout(timer); delete window[name]; resolve({ errno: -1, stdout: '', stderr: String(e) }); }
+  });
+}
+const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+const hsp = (args, t) => exec(`LOCK_WAIT=20 sh ${HSP} ${args}`, t); // short lock wait: UI never queues behind a stuck op
+function toast(msg) {
+  msg = String(msg || '').trim(); if (!msg) return;
+  try { if (hasKsu && ksu.toast) { ksu.toast(msg); return; } } catch (e) {}
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast._t); toast._t = setTimeout(() => (t.style.display = 'none'), 3500);
+}
+function parseJson(s) { try { return JSON.parse(s.trim().split('\n').pop()); } catch (e) { return null; } }
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const IPRE = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+const MACRE = /^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$/;
+const normMac = (m) => m.trim().toLowerCase().replace(/-/g, ':');
+
+// ---- operation guard: never fire overlapping operations ----
+let busy = false, lastStatus = null, opLabel = '';
+function setOpsDisabled(dis) {
+  document.querySelectorAll('button.op').forEach((b) => (b.disabled = dis));
+  $('apSwitch').disabled = dis;
+}
+function opRender(title, results, startedAt) {
+  const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+  $('opCard').style.display = 'block';
+  $('opTitle').textContent = `${title} · ${new Date().toLocaleTimeString()} · ${secs}s`;
+  $('opBox').textContent = results.map((x) => {
+    let t = `$ hsp ${x.args}\n`;
+    if (x.r.stdout.trim()) t += x.r.stdout.trimEnd() + '\n';
+    if (x.r.stderr.trim()) t += '[stderr]\n' + x.r.stderr.trimEnd() + '\n';
+    t += x.r.errno === -2 ? '[WebUI 等待超时：后台可能仍在运行。稍后点“刷新”；若一直显示“操作进行中”，点“清除卡住的操作”]\n'
+                          : `[退出码 ${x.r.errno}]\n`;
+    return t;
+  }).join('\n');
+  $('opBox').scrollTop = $('opBox').scrollHeight;
+}
+const lastLine = (r) => ((r.stdout || '') + '\n' + (r.stderr || '')).trim().split('\n').filter((l) => l.trim()).pop() || (r.errno === -2 ? '等待超时' : '');
+// runOp(title, async (call) => {...}); call(args, timeoutMs) runs hsp and records its full output.
+async function runOp(title, body) {
+  if (busy) { toast(`正在执行“${opLabel}”，请等待完成`); return false; }
+  if (lastStatus && lastStatus.op_busy) { toast(`后台操作进行中（${lastStatus.op_name}），请稍后或点“清除卡住的操作”`); return false; }
+  busy = true; opLabel = title; setOpsDisabled(true);
+  const results = [], t0 = Date.now();
+  $('opBanner').className = ''; $('opBanner').style.display = 'block'; $('opBanner').textContent = `正在执行：${title}…`;
+  const call = async (args, t) => { const r = await hsp(args, t); results.push({ args, r }); opRender(title, results, t0); return r; };
+  try { await body(call); } catch (e) { results.push({ args: '(js)', r: { errno: -1, stdout: '', stderr: String(e) } }); opRender(title, results, t0); }
+  busy = false; opLabel = ''; setOpsDisabled(false); $('opBanner').style.display = 'none';
+  await refreshStatus();
+  return true;
+}
+
+// ---- status ----
+async function refreshStatus() {
+  const r = await hsp('status --json', 25000);
+  const s = parseJson(r.stdout);
+  if (!s) { $('apText').textContent = '状态读取失败'; $('apSub').textContent = (r.stderr || r.stdout).slice(0, 200); return; }
+  lastStatus = s;
+  $('ver').textContent = s.version || '';
+  if (!busy) $('apSwitch').checked = !!s.ap;
+  $('apText').textContent = busy ? `正在执行：${opLabel}…` : (s.ap ? '热点已开启' : '热点已关闭');
+  $('apDot').className = 'dot ' + (s.ap ? (s.gateway_ok || !s.fixed_gateway ? 'ok' : 'warn') : '');
+  $('apSub').textContent = s.ap ? `${s.iface} · ${s.addr}` : `Android ${s.release} (SDK ${s.sdk})`;
+  const yes = (b) => (b ? '是' : '否');
+  const rows = [
+    ['配置网关', `${s.gateway_cfg}/${s.prefix_cfg}` + (s.fixed_gateway ? '' : '（未启用固定）')],
+    ['自建 DHCP', s.dhcp_enable ? (s.dhcp_running ? '运行中' : (s.ap ? '未运行' : '待命')) : '已关闭'],
+    ['拦截系统 DHCP', s.ap ? yes(s.fw_ok) : '—'],
+    ['守护进程', s.daemon ? '运行中' : '未运行'],
+    ['操作锁', s.op_busy ? `占用：${s.op_name || '?'} (pid ${s.op_pid || '?'}, ${s.op_age || '?'}s)` : '空闲'],
+    ['系统', `Android ${s.release} / SDK ${s.sdk} / ${s.hyperos}`],
+  ];
+  $('kv').innerHTML = rows.map(([k, v]) => `<span>${esc(k)}</span><span>${esc(v)}</span>`).join('');
+  const w = [];
+  if (!s.udhcpd_available) w.push('busybox 缺少 udhcpd：静态绑定/固定网关不可用。');
+  if (!s.daemon) w.push('守护进程未运行（可点“重启守护进程”）。');
+  if (s.ap && s.fixed_gateway && !s.gateway_ok) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致` + (s.enforce_broken ? '：系统未采纳静态地址请求（见日志）。' : '，可点“重启热点”。'));
+  if (s.ap && s.dhcp_enable && !s.dhcp_running) w.push('自建 DHCP 未运行，当前由系统 DHCP 分配地址（静态绑定不生效）。');
+  if (s.last_issue && w.length) w.push('最近日志：' + s.last_issue);
+  $('warn').style.display = w.length ? 'block' : 'none';
+  $('warn').textContent = w.join('\n');
+  // background operation (another WebUI session, CLI, daemon auto-restart, or a stuck one)
+  if (!busy) {
+    if (s.op_busy) {
+      const age = +s.op_age || 0, stuck = age > 120;
+      $('opBanner').className = stuck ? 'stuck' : '';
+      $('opBanner').style.display = 'block';
+      $('opBanner').textContent = `后台操作进行中：${s.op_name || '?'}（pid ${s.op_pid || '?'}，已 ${age}s）` + (stuck ? '，可能已卡住 → 点“清除卡住的操作”' : '');
+      setOpsDisabled(true);
+    } else {
+      $('opBanner').style.display = 'none';
+      setOpsDisabled(false);
+    }
+  }
+}
+
+async function setHotspot(on) {
+  const ok = await runOp(on ? '开启热点' : '关闭热点', async (call) => {
+    $('apText').textContent = on ? '正在开启…' : '正在关闭…';
+    const r = await call(`${on ? 'on' : 'off'}`, on ? 200000 : 120000);
+    toast(lastLine(r));
+  });
+  if (!ok) $('apSwitch').checked = !on;
+  refreshClients();
+}
+$('apSwitch').addEventListener('change', (e) => setHotspot(e.target.checked));
+$('btnRefresh').onclick = () => { refreshStatus(); refreshClients(); };
+$('btnRestart').onclick = () => runOp('重启热点', async (call) => {
+  $('apText').textContent = '正在重启…';
+  const r = await call('restart', 300000); toast(lastLine(r));
+  refreshClients();
+});
+let unstickArmed = 0;
+$('btnUnstick').onclick = async () => {
+  if (Date.now() - unstickArmed > 4000) { unstickArmed = Date.now(); $('btnUnstick').textContent = '再点一次确认清除'; setTimeout(() => ($('btnUnstick').textContent = '清除卡住的操作'), 4000); return; }
+  unstickArmed = 0; $('btnUnstick').textContent = '清除卡住的操作'; $('btnUnstick').disabled = true;
+  const t0 = Date.now(); const r = await hsp('unstick', 30000);
+  opRender('清除卡住的操作', [{ args: 'unstick', r }], t0);
+  toast(lastLine(r));
+  busy = false; opLabel = ''; $('btnUnstick').disabled = false;
+  await refreshStatus();
+};
+$('btnOpHide').onclick = () => ($('opCard').style.display = 'none');
+
+// ---- clients ----
+let clientsBusy = false;
+async function refreshClients() {
+  if (clientsBusy) return; clientsBusy = true;
+  const r = await hsp('clients --json', 20000);
+  clientsBusy = false;
+  const d = parseJson(r.stdout);
+  const box = $('clients');
+  if (!d) { box.innerHTML = `<div class="sub">读取失败 ${esc(r.stderr)}</div>`; return; }
+  if (!d.ap) { box.innerHTML = '<div class="sub">热点未开启</div>'; $('clientCount').textContent = ''; return; }
+  const list = d.clients || [];
+  const online = list.filter((c) => c.online).length;
+  $('clientCount').textContent = `在线 ${online}` + (d.assoc != null ? ` · Wi‑Fi 关联 ${d.assoc}` : '');
+  if (!list.length) { box.innerHTML = '<div class="sub">暂无设备</div>'; return; }
+  list.sort((a, b) => (b.online - a.online) || ipNum(a.ip) - ipNum(b.ip));
+  box.innerHTML = list.map((c, i) => {
+    const name = c.remark || c.hostname || '未知设备';
+    const tags = [c.online ? '<span class="tag">在线</span>' : '<span class="tag off">离线</span>'];
+    if (c.static_ip) tags.push(`<span class="tag">${c.static_ip === c.ip ? '已绑定' : '绑定 ' + esc(c.static_ip)}</span>`);
+    return `<div class="client"><div class="top"><div class="name">${esc(name)}${tags.join('')}</div>
+      <button data-i="${i}" class="bindBtn">${c.static_ip ? '编辑' : '绑定'}</button></div>
+      <div class="meta">IP ${esc(c.ip || '-')}　MAC ${esc(c.mac)}</div>
+      <div class="meta">${c.hostname ? '主机名 ' + esc(c.hostname) + '　' : ''}${c.lease ? '租约剩余 ' + esc(c.lease.replace(/_/g, ' ')) + '　' : ''}${esc(c.state)}</div>
+      ${c.ip6 ? `<div class="meta">IPv6 ${esc(c.ip6)}</div>` : ''}</div>`;
+  }).join('');
+  box.querySelectorAll('.bindBtn').forEach((b) => (b.onclick = () => {
+    const c = list[+b.dataset.i];
+    addLeaseRow(c.mac, c.static_ip || c.ip || '', c.remark || c.hostname || '', true);
+    toast('已加入下方“静态 IP 绑定”，确认后点“保存绑定”');
+    $('leases').lastElementChild && $('leases').lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }));
+}
+const ipNum = (ip) => (IPRE.test(ip || '') ? ip.split('.').reduce((a, x) => a * 256 + +x, 0) : 4e9);
+$('btnClients').onclick = refreshClients;
+
+// ---- config ----
+const BOOL_KEYS = ['FIXED_GATEWAY', 'DHCP_ENABLE', 'ENFORCE_GATEWAY', 'AUTO_START', 'METERED'];
+const TEXT_KEYS = ['GATEWAY', 'PREFIX', 'DHCP_START', 'DHCP_END', 'LEASE_TIME', 'DNS', 'AP_IFACE'];
+async function loadConfig() {
+  const r = await hsp('config', 15000);
+  const c = parseJson(r.stdout);
+  if (!c) { toast('读取配置失败'); return; }
+  BOOL_KEYS.forEach((k) => ($(k).checked = c[k] === '1'));
+  TEXT_KEYS.forEach((k) => ($(k).value = c[k] || ''));
+  $('leases').innerHTML = '';
+  (c.leases || []).forEach((l) => addLeaseRow(l.mac, l.ip, l.name));
+}
+function validateCfg() {
+  let ok = true;
+  ['GATEWAY', 'DHCP_START', 'DHCP_END'].forEach((k) => { const bad = !IPRE.test($(k).value.trim()); $(k).classList.toggle('bad', bad); if (bad) ok = false; });
+  const dns = $('DNS').value.trim();
+  const dnsBad = dns !== '' && !dns.split(',').every((x) => IPRE.test(x.trim()));
+  $('DNS').classList.toggle('bad', dnsBad); if (dnsBad) ok = false;
+  return ok;
+}
+$('btnSaveCfg').onclick = () => {
+  if (!validateCfg()) { toast('请检查标红的输入'); return; }
+  const args = [];
+  BOOL_KEYS.forEach((k) => args.push(shq(`${k}=${$(k).checked ? 1 : 0}`)));
+  TEXT_KEYS.forEach((k) => args.push(shq(`${k}=${$(k).value.trim().replace(/\s+/g, '')}`)));
+  runOp('保存并应用配置', async (call) => {
+    const r = await call('set ' + args.join(' '), 15000);
+    if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
+    toast('已保存，正在应用…');
+    const a = await call('apply', 300000);
+    toast(lastLine(a));
+  });
+};
+
+// ---- static leases ----
+function addLeaseRow(mac, ip, name, fromClient) {
+  if (fromClient) { // update existing row for this MAC if present
+    for (const row of $('leases').children) {
+      if (normMac(row.querySelector('.m').value) === normMac(mac)) { row.querySelector('.i').value = ip; if (name) row.querySelector('.n').value = name; return; }
+    }
+  }
+  const d = document.createElement('div'); d.className = 'lease';
+  d.innerHTML = `<input class="m" type="text" placeholder="aa:bb:cc:dd:ee:ff" autocapitalize="off">
+    <input class="i" type="text" inputmode="decimal" placeholder="192.168.4.10">
+    <input class="n" type="text" placeholder="备注"><button class="danger">删除</button>`;
+  d.querySelector('.m').value = mac || ''; d.querySelector('.i').value = ip || ''; d.querySelector('.n').value = name || '';
+  d.querySelector('button').onclick = () => d.remove();
+  $('leases').appendChild(d);
+}
+$('btnAddLease').onclick = () => addLeaseRow('', '', '');
+function b64utf8(s) { const bytes = new TextEncoder().encode(s); let bin = ''; bytes.forEach((b) => (bin += String.fromCharCode(b))); return btoa(bin); }
+$('btnSaveLeases').onclick = async () => {
+  const lines = [], macs = new Set(), ips = new Set(); let ok = true;
+  for (const row of $('leases').children) {
+    const m = row.querySelector('.m'), i = row.querySelector('.i'), n = row.querySelector('.n');
+    const mac = normMac(m.value), ip = i.value.trim(), name = n.value.replace(/[\t\r\n"$`\\]/g, ' ').trim().slice(0, 64);
+    if (!mac && !ip) continue;
+    const mBad = !MACRE.test(mac) || macs.has(mac), iBad = !IPRE.test(ip) || ips.has(ip);
+    m.classList.toggle('bad', mBad); i.classList.toggle('bad', iBad);
+    if (mBad || iBad) { ok = false; continue; }
+    macs.add(mac); ips.add(ip); lines.push(`${mac} ${ip}${name ? ' ' + name : ''}`);
+  }
+  if (!ok) { toast('MAC/IP 格式错误或重复（已标红）'); return; }
+  await runOp('保存静态绑定', async (call) => {
+    const r = await call('lease import ' + shq(b64utf8(lines.join('\n') + '\n')), 15000);
+    if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
+    toast(lastLine(r));
+    const a = await call('apply', 300000);
+    toast(lastLine(a));
+  });
+  loadConfig(); setTimeout(refreshClients, 2500);
+};
+
+// ---- log / diag ----
+$('btnLog').onclick = async () => { const r = await hsp('log 200', 15000); const b = $('logBox'); b.style.display = 'block'; b.textContent = r.stdout || r.stderr || '(空)'; b.scrollTop = b.scrollHeight; };
+$('btnDiag').onclick = async () => {
+  $('btnDiag').disabled = true; toast('正在收集诊断信息（最长约 3 分钟）…');
+  const r = await hsp('diag', 240000); $('btnDiag').disabled = false;
+  const b = $('logBox'); b.style.display = 'block'; b.textContent = (r.stdout + r.stderr) || (r.errno === -2 ? '等待超时' : '(无输出)'); toast(lastLine(r));
+};
+$('btnDaemon').onclick = () => runOp('重启守护进程', async (call) => { const r = await call('daemon restart', 30000); toast(lastLine(r)); });
+
+// ---- init ----
+(async () => {
+  await refreshStatus();
+  await loadConfig();
+  refreshClients();
+  setInterval(() => { if (!busy && !document.hidden) refreshStatus(); }, 6000);
+  setInterval(() => { if ($('autoRef').checked && !document.hidden && lastStatus && lastStatus.ap) refreshClients(); }, 5000);
+})();
+</script>
+</body>
+</html>

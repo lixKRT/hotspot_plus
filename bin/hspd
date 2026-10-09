@@ -1,0 +1,150 @@
+#!/system/bin/sh
+# shellcheck disable=SC3045
+# hotspot_plus daemon: watches the hotspot interface, runs udhcpd (static leases) on it,
+# blocks Android's DhcpServer replies while udhcpd serves, and optionally re-starts a hotspot
+# that was turned on from the system toggle so it gets the fixed gateway.
+MODDIR=${0%/*}; MODDIR=${MODDIR%/bin}
+export MODDIR HSP_BB=1
+# shellcheck disable=SC2034,SC3045
+TAG=hspd
+# shellcheck source=../lib/common.sh
+. "$MODDIR/lib/common.sh"
+
+if [ -n "$(daemon_pid)" ]; then echo "already running"; exit 0; fi
+echo $$ > "$RUN/hspd.pid"
+load_config
+log "daemon start (pid $$) Android $RELEASE SDK $SDK HyperOS $HYPEROS busybox=$BB udhcpd=$(bb_has udhcpd && echo yes || echo no)"
+rm -f "$RUN/enforce_broken" "$RUN/fw_ok" "$RUN/enforce_pending"
+
+CUR=""          # "iface addr" of the session we are serving
+FP=""           # last address fingerprint
+TL=""           # cached tethered iface list
+TICK=0
+TL_AT=0
+DHCP_FAILS=0
+MON_PID=""
+
+cleanup() {
+    log "daemon exit"
+    [ -n "$MON_PID" ] && kill "$MON_PID" 2>/dev/null
+    dhcp_stop; fw_del
+    rm -f "$RUN/hspd.pid" "$RUN/ev" "$RUN/session"
+    exit 0
+}
+trap cleanup INT TERM
+trap '' HUP
+
+# Event source: `ip monitor` pushes a line into the FIFO on any address/link change, so we react
+# within ~1s instead of waiting for the poll interval. Falls back to plain polling.
+rm -f "$RUN/ev"
+if mkfifo "$RUN/ev" 2>/dev/null; then
+    exec 3<>"$RUN/ev"
+    /system/bin/ip monitor address link >&3 2>/dev/null 3>&- 9>&- &
+    MON_PID=$!
+else
+    exec 3</dev/null
+fi
+
+session_down() {
+    [ -n "$CUR" ] && log "AP down / changed: $CUR"
+    dhcp_stop
+    fw_del
+    CUR=""; DHCP_FAILS=0
+    rm -f "$RUN/session" "$RUN/enforce_pending"
+}
+
+maybe_enforce() { # returns 0 if a restart was triggered
+    [ "$FIXED_GATEWAY" = 1 ] && [ "$ENFORCE_GATEWAY" = 1 ] || return 1
+    [ "${AP_ADDR%/*}" = "$GATEWAY" ] && return 1
+    dhcp_capable || return 1
+    [ -f "$RUN/enforce_broken" ] && return 1
+    _now=$(date +%s)
+    _sb=$(cat "$RUN/started_by_hsp" 2>/dev/null || echo 0)
+    if [ $(( _now - _sb )) -lt 90 ]; then
+        log "ERROR: hotspot was started by us with static gateway $GATEWAY but got ${AP_ADDR%/*}; ROM ignores TetheringRequest static address. Stop enforcing this boot."
+        touch "$RUN/enforce_broken"
+        return 1
+    fi
+    _le=$(cat "$RUN/last_enforce" 2>/dev/null || echo 0)
+    [ $(( _now - _le )) -lt 120 ] && return 1
+    echo "$_now" > "$RUN/last_enforce"
+    echo "$_now" > "$RUN/enforce_pending"
+    log "hotspot started elsewhere with gateway ${AP_ADDR%/*}; restarting it with fixed $GATEWAY"
+    setsid sh "$MODDIR/bin/hsp" restart >/dev/null 2>&1 < /dev/null 3>&- 9>&- &
+    return 0
+}
+
+enforce_pending() { # true while a restart we triggered is in flight (max 60s)
+    _ep=$(cat "$RUN/enforce_pending" 2>/dev/null) || return 1
+    [ $(( $(date +%s) - ${_ep:-0} )) -lt 60 ] && return 0
+    rm -f "$RUN/enforce_pending"; return 1
+}
+
+session_up() {
+    log "AP up: $AP_IF $AP_ADDR"
+    CUR="$AP_IF $AP_ADDR"
+    echo "$CUR $(date +%s)" > "$RUN/session"
+    if maybe_enforce; then rm -f "$RUN/started_by_hsp"; return; fi
+    rm -f "$RUN/started_by_hsp"   # consumed: only the first AP-up after `hsp on` counts
+    serve_dhcp
+}
+
+serve_dhcp() {
+    if ! dhcp_capable; then
+        [ "$DHCP_ENABLE" = 1 ] && log "WARN: own DHCP unavailable (udhcpd=$(bb_has udhcpd && echo y || echo n) fw_ok=$(cat "$RUN/fw_ok" 2>/dev/null)); Android DhcpServer stays in charge"
+        dhcp_stop; fw_del
+        return
+    fi
+    if dhcp_start "$AP_IF" "$AP_ADDR"; then
+        if fw_add "$AP_IF"; then
+            log "Android DhcpServer replies on $AP_IF are now blocked (chain $FW_CHAIN)"
+            DHCP_FAILS=0
+        else
+            log "ERROR: iptables rule failed; stopping udhcpd so Android DhcpServer keeps working"
+            dhcp_stop; fw_del
+        fi
+    else
+        DHCP_FAILS=$((DHCP_FAILS+1))
+        fw_del
+    fi
+}
+
+while :; do
+    TICK=$((TICK+1))
+    NEWFP=$(addr_fp)
+    NOW=$(date +%s)
+    if [ "$NEWFP" != "$FP" ] || [ $(( NOW - TL_AT )) -ge 60 ]; then
+        FP=$NEWFP; TL_AT=$NOW
+        TL=$(tethered_ifaces)
+    fi
+    if ap_detect "$TL"; then
+        if [ "$CUR" != "$AP_IF $AP_ADDR" ]; then
+            [ -n "$CUR" ] && session_down
+            session_up
+        elif [ "$DHCP_ENABLE" = 1 ] && ! enforce_pending; then
+            # health checks for the running session
+            if [ $DHCP_FAILS -lt 5 ] && dhcp_capable && ! dhcp_running; then
+                log "udhcpd not running, (re)starting (fails=$DHCP_FAILS)"
+                serve_dhcp
+            elif dhcp_running && [ $((TICK % 5)) -eq 0 ] && ! fw_check "$AP_IF"; then
+                log "firewall rule missing, re-adding"
+                fw_add "$AP_IF" || { dhcp_stop; fw_del; }
+            fi
+        fi
+    else
+        [ -n "$CUR" ] && session_down
+    fi
+
+    # wait for an event or the poll interval
+    if read -r -t "$POLL_INTERVAL" EV <&3; then
+        case "$EV" in
+            reload)
+                load_config
+                log "reload requested"
+                rm -f "$RUN/fw_ok"
+                if [ -n "$CUR" ]; then serve_dhcp; fi ;;
+            up|down) FP="" ;;   # force re-detection
+        esac
+        sleep 0.3
+    fi
+done

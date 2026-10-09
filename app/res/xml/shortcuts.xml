@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="toggle"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/sc_toggle"
+        android:shortcutLongLabel="@string/sc_toggle_long">
+        <intent
+            android:action="com.hsp.hotspotplus.TOGGLE"
+            android:targetPackage="com.hsp.hotspotplus"
+            android:targetClass="com.hsp.hotspotplus.ToggleActivity" />
+    </shortcut>
+</shortcuts>

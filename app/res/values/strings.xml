@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">热点增强</string>
+    <string name="sc_toggle">切换热点</string>
+    <string name="sc_toggle_long">切换 Wi‑Fi 热点（热点增强）</string>
+</resources>

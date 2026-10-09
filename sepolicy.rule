@@ -1,0 +1,2 @@
+allow network_stack su binder { call transfer }
+allow system_server su binder { call transfer }

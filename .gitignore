@@ -1,0 +1,9 @@
+# signing key: never commit
+app/keystore/
+*.jks
+*.keystore
+password.txt
+# build outputs
+app/build/
+*.apk
+*.zip
