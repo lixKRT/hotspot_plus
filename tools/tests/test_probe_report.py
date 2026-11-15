@@ -48,6 +48,17 @@ class ProbeReportTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_probe_artifacts_use_lf_and_avoid_toybox_mktemp_directory(self):
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("tools/probe-8t.sh text eol=lf", attributes)
+        for path in (PROBE, REPORT, ROOT / "tools" / "README.md"):
+            self.assertNotIn(b"\r\n", path.read_bytes(), f"{path} must use LF")
+        self.assertNotIn(
+            "mktemp -d",
+            PROBE.read_text(encoding="utf-8"),
+            "Android toybox mktemp requires an explicit XXXXXX template",
+        )
+
     def test_parser_builds_status_summary_and_redacts(self):
         fixture = self.enter("fixture")
         fixture.write_text(

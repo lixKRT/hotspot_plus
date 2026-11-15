@@ -22,7 +22,9 @@ for candidate in /data/adb/magisk/busybox /data/adb/ksu/bin/busybox /data/adb/ap
     if [ -x "$candidate" ]; then BB=$candidate; break; fi
 done
 
-probe_tmp=$(mktemp -d /data/local/tmp/hsp-probe-02.XXXXXX 2>/dev/null || true)
+probe_tmp=/data/local/tmp/hsp-probe-02.$$
+rm -rf "$probe_tmp"
+mkdir -p "$probe_tmp" 2>/dev/null || probe_tmp=
 chain_created=0
 
 tmo() {
