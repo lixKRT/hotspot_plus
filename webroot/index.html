@@ -56,11 +56,22 @@ details summary{cursor:pointer;color:var(--sub)}
 #opBanner.stuck{background:rgba(220,38,38,.12);color:var(--bad)}
 #opBox{max-height:300px}
 .opok{color:var(--ok)}.opbad{color:var(--bad)}
+#restoreCard{display:none;border:1px solid var(--acc)}
 </style>
 </head>
 <body>
 <h1>热点增强 <span class="sub" id="ver"></span></h1>
 <div id="banner">未检测到 KernelSU WebUI 环境（window.ksu 不存在），页面仅供预览。</div>
+
+<!-- 恢复提示：只在全新安装且存在兼容备份时显示，绝不自动恢复 -->
+<div class="card" id="restoreCard">
+  <h2>发现可恢复的备份</h2>
+  <div class="sub" id="restoreInfo">将恢复配置和静态租约。当前为新安装，没有用户配置会被覆盖。</div>
+  <div class="btns">
+    <button class="primary" id="btnRestore">确认恢复</button>
+    <button id="btnRestoreDismiss">稍后再说</button>
+  </div>
+</div>
 
 <!-- 状态 / 开关 -->
 <div class="card">
@@ -418,10 +429,35 @@ $('btnDiag').onclick = async () => {
 };
 $('btnDaemon').onclick = () => runOp('重启守护进程', async (call) => { const r = await call('daemon restart', 30000); toast(lastLine(r)); });
 
+// ---- restore prompt (explicit confirmation only; never auto-restores) ----
+let restoreLatest = '';
+async function checkRestorePrompt() {
+  const r = await hsp('restore-prompt', 15000);
+  const out = (r.stdout || '').trim().split('\n');
+  const val = (k) => (out.find((l) => l.startsWith(k + '=')) || '').slice(k.length + 1);
+  if (val('prompt') !== '1') return;
+  restoreLatest = val('latest');
+  $('restoreCard').style.display = 'block';
+  $('restoreInfo').textContent = `找到 ${val('count') || '1'} 个兼容备份（${restoreLatest}）。恢复会覆盖当前配置和静态租约。`;
+}
+$('btnRestore').onclick = () => {
+  if (!restoreLatest) { toast('没有可恢复的备份'); return; }
+  runOp('恢复备份', async (call) => {
+    const r = await call(`restore ${shq(restoreLatest)} --yes`, 30000);
+    toast(r.errno === 0 ? '已恢复，正在重新加载' : (lastLine(r) || '恢复失败'));
+    if (r.errno === 0) { $('restoreCard').style.display = 'none'; await loadConfig(); }
+  });
+};
+$('btnRestoreDismiss').onclick = async () => {
+  await hsp('restore-dismiss', 10000);
+  $('restoreCard').style.display = 'none';
+};
+
 // ---- init ----
 (async () => {
   await refreshStatus();
   await loadConfig();
+  checkRestorePrompt();
   refreshClients();
   setInterval(() => { if (!busy && !document.hidden) refreshStatus(); }, 6000);
   setInterval(() => { if ($('autoRef').checked && !document.hidden && lastStatus && lastStatus.ap) refreshClients(); }, 5000);

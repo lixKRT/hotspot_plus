@@ -9,6 +9,7 @@
 #   config --json                      输出配置 + 静态租约 (WebUI 用)
 #   set KEY=VALUE [KEY=VALUE ...]      修改配置（带校验）
 #   lease list | add <MAC> <IP> [备注] | del <MAC> | import <base64>
+#   backup [list|export DIR] | restore DIR [--yes] | restore-prompt | restore-dismiss
 #   log [N]  | diag | daemon start|stop|restart|status | hsctl <args>
 #   unstick                            清除卡住的操作（结束残留 hsp/hsctl 进程并删除操作锁）
 MODDIR=${0%/*}; MODDIR=${MODDIR%/bin}
@@ -23,6 +24,7 @@ export HSP_BB=1 MODDIR
 TAG=hsp
 # shellcheck source=../lib/common.sh
 . "$MODDIR/lib/common.sh"
+[ -f "$MODDIR/lib/backup.sh" ] && . "$MODDIR/lib/backup.sh"
 load_config
 
 wait_ap() { # wait_ap up|down seconds
@@ -591,6 +593,8 @@ do_set() {
     gateway_dhcp_valid "$GATEWAY" "$PREFIX" "$DHCP_START" "$DHCP_END" ||
         { echo "DHCP 范围 $DHCP_START-$DHCP_END 不在 $GATEWAY/$PREFIX 内或包含网关"; return 1; }
     for _kv in "$@"; do conf_set_raw "${_kv%%=*}" "${_kv#*=}"; done
+    # The config is no longer the installer default: a fresh-install restore prompt must not appear.
+    [ -n "${BACKUP_DEFAULT_MARKER:-}" ] && rm -f "$BACKUP_DEFAULT_MARKER"
     log "config updated: $*"
     echo "已保存"
 }
@@ -784,6 +788,34 @@ daemon_ctl() {
     esac
 }
 
+do_backup() {
+    _sub=${1:-}
+    case "$_sub" in
+        create|"")
+            backup_create_retry "$BACKUP_RETRIES" || return 1 ;;
+        list)
+            backup_list ;;
+        export)
+            [ -n "${2:-}" ] || { echo "用法: hsp backup export <备份目录> [输出目录]"; return 1; }
+            backup_export "$2" "${3:-}" ;;
+        *) echo "用法: hsp backup [create|list|export DIR [OUTDIR]]"; return 1 ;;
+    esac
+}
+
+do_restore() {
+    _bd=${1:-}
+    _yes=0
+    [ "${2:-}" = --yes ] && _yes=1
+    [ -n "$_bd" ] || { echo "用法: hsp restore <备份目录> --yes"; return 1; }
+    backup_validate "$_bd" || return 1
+    if [ "$_yes" != 1 ]; then
+        echo "恢复会覆盖当前配置和静态租约。确认请加 --yes:"
+        echo "  hsp restore $_bd --yes"
+        return 1
+    fi
+    backup_restore "$_bd"
+}
+
 cmd=$1; [ $# -gt 0 ] && shift
 case "$cmd" in
     on|start)
@@ -819,6 +851,10 @@ case "$cmd" in
     config) do_config_json ;;
     set) do_set "$@" ;;
     lease|leases) do_lease "$@" ;;
+    backup) do_backup "$@" ;;
+    restore) do_restore "$@" ;;
+    restore-prompt) backup_prompt ;;
+    restore-dismiss) backup_dismiss ;;
     apply) do_apply ;;
     log) tail -n "${1:-120}" "$LOG" 2>/dev/null ;;
     diag) sh "$MODDIR/diag.sh" "$@" 9>&- ;;
