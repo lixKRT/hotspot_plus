@@ -7,8 +7,11 @@
 #   clients [--json]                   已连接设备 (IP/MAC/主机名)
 #   apply                              重新加载配置（需要时重启热点 / DHCP）
 #   config --json                      输出配置 + 静态租约 (WebUI 用)
+#   dhcp retry                         仅重试自建 DHCP，不重启热点
+#   dhcp reset                         手动清除 DHCP 连续失败窗口
 #   set KEY=VALUE [KEY=VALUE ...]      修改配置（带校验）
 #   lease list | add <MAC> <IP> [备注] | del <MAC> | import <base64>
+#   backup [list|export DIR] | restore DIR [--yes] | restore-prompt | restore-dismiss
 #   log [N]  | diag | daemon start|stop|restart|status | hsctl <args>
 #   unstick                            清除卡住的操作（结束残留 hsp/hsctl 进程并删除操作锁）
 MODDIR=${0%/*}; MODDIR=${MODDIR%/bin}
@@ -23,6 +26,7 @@ export HSP_BB=1 MODDIR
 TAG=hsp
 # shellcheck source=../lib/common.sh
 . "$MODDIR/lib/common.sh"
+[ -f "$MODDIR/lib/backup.sh" ] && . "$MODDIR/lib/backup.sh"
 load_config
 
 wait_ap() { # wait_ap up|down seconds
@@ -291,6 +295,18 @@ do_status_json() {
     _fw=false; [ -n "$_if" ] && fw_check "$_if" && _fw=true
     _dm=false; [ -n "$(daemon_pid)" ] && _dm=true
     _udh=false; bb_has udhcpd && _udh=true
+    _dd=$(dhcp_get degraded); [ -n "$_dd" ] || _dd=0
+    _dmode=$(dhcp_get state); [ -n "$_dmode" ] || _dmode=idle
+    _dreason=$(dhcp_get reason)
+    _dlerr=$(dhcp_get last_error)
+    _dretry=$(dhcp_get retry_available); [ -n "$_dretry" ] || _dretry=0
+    if [ "$_dd" = 1 ]; then
+        _dmode=degraded
+    elif [ "$_dmode" = idle ] && [ "$_dhcp" = true ]; then
+        _dmode=serving
+    fi
+    _ddf=false; [ "$_dd" = 1 ] && _ddf=true
+    _dra=false; [ "$_dretry" = 1 ] && _dra=true
     _eb=false; { [ -f "$RUN/enforce_broken" ] || [ "$(gw_status_value degraded)" = 1 ]; } && _eb=true
     _gr=$(gw_status_value result); [ -n "$_gr" ] || _gr=not_run
     _grr=$(gw_status_value reason)
@@ -327,6 +343,8 @@ do_status_json() {
     printf '"fixed_gateway":%s,"dhcp_enable":%s,"dhcp_running":%s,"fw_ok":%s,"daemon":%s,"udhcpd_available":%s,' \
         "$([ "$FIXED_GATEWAY" = 1 ] && echo true || echo false)" "$([ "$DHCP_ENABLE" = 1 ] && echo true || echo false)" \
         "$_dhcp" "$_fw" "$_dm" "$_udh"
+    printf '"dhcp_mode":"%s","dhcp_degraded":%s,"dhcp_reason":"%s","dhcp_last_error":"%s","dhcp_retry_available":%s,' \
+        "$(json_esc "$_dmode")" "$_ddf" "$(json_esc "$_dreason")" "$(json_esc "$_dlerr")" "$_dra"
     printf '"op_busy":%s,"op_name":"%s","op_pid":"%s","op_age":"%s",' "$_opb" "$H_OP" "$H_PID" "$H_AGE"
     printf '"auto_start":%s,"boot_decision":"%s","boot_result":"%s","boot_sim":"%s","boot_error":"%s","boot_at":"%s",' \
         "$([ "$AUTO_START" = 1 ] && echo true || echo false)" "$(json_esc "$_bd")" "$(json_esc "$_br")" \
@@ -353,6 +371,13 @@ do_status_text() {
     esac
     echo "配置网关: $GATEWAY/$PREFIX (固定=$FIXED_GATEWAY 强制=$ENFORCE_GATEWAY)"
     echo "DHCP: enable=$DHCP_ENABLE running=$(dhcp_running && echo yes || echo no) udhcpd=$(bb_has udhcpd && echo yes || echo no)"
+    if [ "$(dhcp_get degraded)" = 1 ]; then
+        echo "自建 DHCP: 已降级，系统 DHCP 接管（原因: $(dhcp_get reason)）"
+        echo "  最近错误: $(dhcp_get last_error)"
+        echo "  重试: 可用（hsp dhcp retry，不会重启热点）"
+    elif [ "$(dhcp_get state)" = serving ]; then
+        echo "自建 DHCP: 接管确认（$FW_CHAIN/OUTPUT）"
+    fi
     [ -n "$AP_IF" ] && echo "防火墙拦截系统DHCP: $(fw_check "$AP_IF" && echo yes || echo no)"
     echo "守护进程: $([ -n "$(daemon_pid)" ] && echo "运行中 pid $(daemon_pid)" || echo 未运行)"
     if lock_busy; then lock_holder_info; echo "操作锁: 被占用 ${H_OP:-?} pid=${H_PID:-?} ${H_AGE:-?}s"; else echo "操作锁: 空闲"; fi
@@ -591,6 +616,8 @@ do_set() {
     gateway_dhcp_valid "$GATEWAY" "$PREFIX" "$DHCP_START" "$DHCP_END" ||
         { echo "DHCP 范围 $DHCP_START-$DHCP_END 不在 $GATEWAY/$PREFIX 内或包含网关"; return 1; }
     for _kv in "$@"; do conf_set_raw "${_kv%%=*}" "${_kv#*=}"; done
+    # The config is no longer the installer default: a fresh-install restore prompt must not appear.
+    [ -n "${BACKUP_DEFAULT_MARKER:-}" ] && rm -f "$BACKUP_DEFAULT_MARKER"
     log "config updated: $*"
     echo "已保存"
 }
@@ -817,6 +844,18 @@ do_apply() {
     fi
 }
 
+do_dhcp_retry() {
+    if ! ap_detect_fast; then
+        echo "重试失败：热点未开启"
+        return 1
+    fi
+    dhcp_retry "$AP_IF" "$AP_ADDR"
+}
+
+do_dhcp_reset() {
+    dhcp_reset
+}
+
 daemon_ctl() {
     case "$1" in
         start)
@@ -829,6 +868,34 @@ daemon_ctl() {
         restart) daemon_ctl stop; daemon_ctl start ;;
         *) [ -n "$(daemon_pid)" ] && echo "running $(daemon_pid)" || echo "stopped" ;;
     esac
+}
+
+do_backup() {
+    _sub=${1:-}
+    case "$_sub" in
+        create|"")
+            backup_create_retry "$BACKUP_RETRIES" || return 1 ;;
+        list)
+            backup_list ;;
+        export)
+            [ -n "${2:-}" ] || { echo "用法: hsp backup export <备份目录> [输出目录]"; return 1; }
+            backup_export "$2" "${3:-}" ;;
+        *) echo "用法: hsp backup [create|list|export DIR [OUTDIR]]"; return 1 ;;
+    esac
+}
+
+do_restore() {
+    _bd=${1:-}
+    _yes=0
+    [ "${2:-}" = --yes ] && _yes=1
+    [ -n "$_bd" ] || { echo "用法: hsp restore <备份目录> --yes"; return 1; }
+    backup_validate "$_bd" || return 1
+    if [ "$_yes" != 1 ]; then
+        echo "恢复会覆盖当前配置和静态租约。确认请加 --yes:"
+        echo "  hsp restore $_bd --yes"
+        return 1
+    fi
+    backup_restore "$_bd"
 }
 
 cmd=$1; [ $# -gt 0 ] && shift
@@ -866,6 +933,18 @@ case "$cmd" in
     config) do_config_json ;;
     set) do_set "$@" ;;
     lease|leases) do_lease "$@" ;;
+    dhcp)
+        case "$1" in
+            retry) : ;;
+            reset) lock dhcp-reset; do_dhcp_reset; exit $? ;;
+            *) echo "用法: hsp dhcp retry|reset"; exit 1 ;;
+        esac
+        lock dhcp-retry
+        do_dhcp_retry ;;
+    backup) do_backup "$@" ;;
+    restore) do_restore "$@" ;;
+    restore-prompt) backup_prompt ;;
+    restore-dismiss) backup_dismiss ;;
     apply) do_apply ;;
     log) tail -n "${1:-120}" "$LOG" 2>/dev/null ;;
     diag) sh "$MODDIR/diag.sh" "$@" 9>&- ;;

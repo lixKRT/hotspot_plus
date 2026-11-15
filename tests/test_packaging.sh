@@ -29,15 +29,18 @@ default_subnet_is_42() {
 
 shipped_files_are_lf() {
     [ -n "$PYTHON" ] || return 1
-    "$PYTHON" - "$ROOT" <<'PY'
+    "$PYTHON" - "$ROOT" "$ROOT/tests/fixtures/shipped-files.txt" <<'PY'
 import os, re, subprocess, sys
 root = sys.argv[1]
+manifest = sys.argv[2]
 try:
     out = subprocess.check_output(["git.exe", "ls-files", "-z"], cwd=root)
-except (OSError, subprocess.CalledProcessError) as exc:
-    print("cannot list shipped files: %s" % exc, file=sys.stderr)
-    sys.exit(2)
-names = [n for n in out.decode().split("\0") if n]
+    names = [n for n in out.decode().split("\0") if n]
+except (OSError, subprocess.CalledProcessError):
+    with open(manifest, encoding="utf-8") as f:
+        names = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    if not names:
+        sys.exit(2)
 bad = []
 for name in names:
     if name == "bin/hsctl.jar":
@@ -100,7 +103,7 @@ with zipfile.ZipFile(pkgs[0]) as z:
         print("unexpected entries: " + ", ".join(leaked), file=sys.stderr)
         sys.exit(1)
     required = ["customize.sh", "module.prop", "bin/hsp", "bin/hspd", "defaults/config.conf",
-                "lib/common.sh", "META-INF/com/google/android/update-binary"]
+                "lib/common.sh", "lib/backup.sh", "META-INF/com/google/android/update-binary"]
     missing = [n for n in required if n not in names]
     if missing:
         print("missing entries: " + ", ".join(missing), file=sys.stderr)
