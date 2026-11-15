@@ -44,11 +44,10 @@ MAC，仅在本机命令中传入；本文以 `CLIENT-A`（原地址 `.145`）�
 
 ### 真机观察与限制
 
-- 添加租约时 `_lease_apply_if_running` 会短暂停止 `udhcpd`；本次 daemon 记录
-  一次 `udhcpd 进程已退出` 并把摘要置为 degraded。off/on 后 `dhcp.state` 仍残留
-  `degraded=1`（摘要 `dhcp_degraded:true` 但 `reason`/`last_error` 为空），
-  `hsp dhcp reset` 不清理该位；`hsp dhcp retry` 可恢复为 serving。此项是本次真机观察，
-  未在本次改动范围内修复。
+- 添加/删除租约时 `_lease_apply_if_running` 会短暂重载 `udhcpd`。早期构建曾把
+  这次预期重载误判为崩溃并残留 degraded；已在 `6a42a22` 修复，最终构建真机回归：
+  增删租约后均保持 `dhcp_mode=serving`、`dhcp_degraded=false`。模块主动重载使用
+  显式标记，不再计入崩溃；健康 serving 与 `hsp dhcp reset` 都会清除残留降级。
 - 静态租约测试需要客户端执行 release/renew；仅 off/on 热点不会强制客户端重新 DHCP。
   本次由同一工作站作为 `CLIENT-A` 完成 release/renew，未出现无法重连的情况。
 - 卸载/重装测试触发了 2 次重启；测试期间旧模块始终保持 `/data/adb/modules/oneplus8t_fixed_hotspot/disable`。
