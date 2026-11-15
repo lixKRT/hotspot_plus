@@ -699,7 +699,10 @@ dhcp_set() { # key value
     mv -f "$_dtmp" "$DHCPSTATE"
 }
 dhcp_fail_limit() {
-    case "${HSP_DHCP_FAIL_LIMIT:-3}" in ''|*[!0-9]*|0) echo 3 ;; *) echo "$HSP_DHCP_FAIL_LIMIT" ;; esac
+    _dl=${HSP_DHCP_FAIL_LIMIT:-3}
+    case "$_dl" in ''|*[!0-9]*) _dl=3 ;; esac
+    [ "$_dl" -gt 0 ] 2>/dev/null || _dl=3
+    echo "$_dl"
 }
 dhcp_session_begin() {
     mkdir -p "$RUN" 2>/dev/null

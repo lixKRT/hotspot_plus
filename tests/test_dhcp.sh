@@ -194,9 +194,14 @@ udhcpd_start_failure_installs_no_takeover() {
         sh -c '. "$MODDIR/lib/common.sh"; load_config; dhcp_session_begin; dhcp_takeover wlan2 192.168.42.1/24; exit $?'
     _dc_rc=$?
     [ "$_dc_rc" = 1 ] || return 1
-    [ "$(_dhcp_state serving)" = 0 ] &&
-        [ "$(_dhcp_state failures)" = 1 ] &&
-        [ "$(_dhcp_state degraded)" = 0 ] &&
+    _rs=$(_dhcp_state reason)
+    _sv=$(_dhcp_state serving)
+    _fl=$(_dhcp_state failures)
+    _dg=$(_dhcp_state degraded)
+    [ "$_sv" = 0 ] &&
+        [ "$_fl" = 1 ] &&
+        [ "$_dg" = 0 ] &&
+        [ "$_rs" = "udhcpd 启动失败" ] &&
         ! grep -q ' -N hsp_dhcp' "$_dt/iptables.log" &&
         ! grep -q 'OUTPUT 1 -j hsp_dhcp' "$_dt/iptables.log" &&
         [ ! -f "$_dt/data/run/udhcpd.pid" ]
@@ -215,11 +220,13 @@ firewall_failure_removes_jump_before_stopping_udhcpd() {
     _d=$(grep -n 'ipt .* -D OUTPUT -j hsp_dhcp' "$_dt/actions.log" | tail -n1 | cut -d: -f1)
     _x=$(grep -nE 'ipt .* -X[[:space:]]+hsp_dhcp' "$_dt/actions.log" | tail -n1 | cut -d: -f1)
     _s=$(grep -n '^udhcpd-stop$' "$_dt/actions.log" | tail -n1 | cut -d: -f1)
-    [ "$(_dhcp_state serving)" = 0 ] &&
+    _sv=$(_dhcp_state serving)
+    _rs=$(_dhcp_state reason)
+    [ "$_sv" = 0 ] &&
         [ -n "$_d" ] && [ -n "$_x" ] && [ -n "$_s" ] &&
         [ "$_d" -lt "$_s" ] && [ "$_x" -lt "$_s" ] &&
         [ ! -f "$_dt/data/run/udhcpd.pid" ] &&
-        [ "$(_dhcp_state reason)" = "iptables 接管规则安装失败" ]
+        [ "$_rs" = "iptables 接管规则安装失败" ]
 }
 
 repeated_crashes_enter_visible_degraded_mode() {
