@@ -32,7 +32,9 @@ public final class App extends Application {
         java.util.List<String> argv = java.util.Arrays.asList(HSP, "toggle");
         shell().execArgv(argv, r -> {
             if (r.code == RootShell.EACCES) toast(c, RootShell.DENIED_MSG);
-            else toast(c, r.lastLine().isEmpty() ? (r.code == 0 ? "完成" : "失败 (" + r.code + ")") : r.lastLine());
+            else toast(c, r.lastLine().isEmpty()
+                    ? (r.code == 0 ? "操作完成" : "操作失败（退出码 " + r.code + "）")
+                    : r.lastLine());
             if (done != null) done.onResult(r);
         });
     }

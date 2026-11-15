@@ -24,7 +24,7 @@ public final class RootShell {
 
     public static final int EACCES = 13;
     public static final String DENIED_MSG =
-            "未获得 root 权限：请打开 KernelSU 管理器 →「超级用户」，找到「热点增强」并允许 root，然后回到本应用点「重试」。";
+            "未获得 root 权限：请打开 Magisk 应用 →「超级用户」，找到「热点增强」并允许 root，然后回到本应用点「重试」。";
 
     public static final class Result {
         public final int code;
@@ -130,7 +130,7 @@ public final class RootShell {
                     denied = true;
                     return new Result(EACCES, "", DENIED_MSG + "\n(" + e.getMessage() + ")", true);
                 } catch (IOException e) {
-                    return new Result(1, "", "无法启动 root shell: " + e.getMessage(), false);
+                    return new Result(1, "", "无法启动 root 权限通道：" + e.getMessage(), false);
                 }
             }
             denied = false;
@@ -139,14 +139,14 @@ public final class RootShell {
             } catch (WriteFailed e) {
                 s.close();
                 local.remove();
-                if (attempt == 1) return new Result(1, "", "root shell 异常: " + e.getMessage(), false);
+                if (attempt == 1) return new Result(1, "", "root 权限通道异常：" + e.getMessage(), false);
             } catch (IOException e) {
                 s.close();
                 local.remove();
-                return new Result(1, "", "root shell 在执行中退出: " + e.getMessage(), false);
+                return new Result(1, "", "root 权限通道意外退出：" + e.getMessage(), false);
             }
         }
-        return new Result(1, "", "unreachable", false);
+        return new Result(1, "", "未知执行错误", false);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -262,7 +262,7 @@ public final class RootShell {
             try {
                 p = new ProcessBuilder(suCmd).start();
             } catch (IOException e) {
-                // KernelSU: an app without root grant cannot even see/exec "su" (ENOENT/EACCES)
+                // A denied su launch may surface as ENOENT/EACCES.
                 throw new DeniedException("su: " + e.getMessage());
             }
             stdin = p.getOutputStream();
@@ -374,7 +374,7 @@ public final class RootShell {
         return n != null && n.matches("[A-Za-z_$][A-Za-z0-9_$]*");
     }
 
-    /** JS that invokes window[cb](errno, stdout, stderr) exactly like KernelSU's WebUI does. */
+    /** JS that invokes window[cb](errno, stdout, stderr) through the WebUI bridge. */
     public static String callbackJs(String cb, Result r) {
         return "(function(){var f=window[" + jsString(cb) + "];if(typeof f==='function')f(" + r.code + ","
                 + jsString(r.out) + "," + jsString(r.err) + ");})();";

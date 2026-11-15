@@ -43,7 +43,7 @@ public final class HspTileService extends TileService {
             String sub;
             if (r.code == RootShell.EACCES) {
                 st = Tile.STATE_INACTIVE;
-                sub = "未授权 root";
+                sub = "需 Magisk 授权";
             } else {
                 try {
                     String o = r.out.trim();
