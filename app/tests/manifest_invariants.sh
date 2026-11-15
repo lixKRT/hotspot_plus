@@ -30,6 +30,6 @@ grep -q 'android:targetPackage="com.lixkrt.hotspotplus"' "$SHORTCUTS" || fail 's
 grep -q 'android:targetClass="com.lixkrt.hotspotplus.ToggleActivity"' "$SHORTCUTS" || fail 'shortcut class'
 
 grep -q "typeof window\.ksu\.exec === 'function'" "$WEB" || fail 'bridge feature detection'
-grep -q 'LOCK_WAIT=20 sh ${HSP}' "$WEB" || fail 'fixed hsp command surface'
+grep -q 'exec(`sh ${HSP} ${args}`' "$WEB" || fail 'fixed hsp command surface'
 grep -q '薄壳桥不可用' "$WEB" || fail 'degraded bridge copy'
 ! grep -q 'KernelSU WebUI 环境' "$WEB" || fail 'stale bridge fallback copy'

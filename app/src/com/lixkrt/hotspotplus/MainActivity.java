@@ -20,11 +20,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
-import org.json.JSONObject;
-
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Hosts the module's own WebUI (single source of truth: /data/adb/modules/hotspot_plus/webroot/index.html,
@@ -153,7 +150,11 @@ public final class MainActivity extends Activity {
     /** Read the module's index.html via su. Missing/disabled module pages get an explicit degraded page. */
     void load() {
         showHtml(page("正在获取 root 权限…", "", false));
-        App.shell().exec("test ! -f " + App.MODDIR + "/disable && cat " + App.MODDIR + "/webroot/index.html", null, null, r -> {
+        List<String> read = new ArrayList<>();
+        read.add("sh");
+        read.add("-c");
+        read.add("[ ! -f " + App.MODDIR + "/disable ] && cat " + App.MODDIR + "/webroot/index.html");
+        App.shell().execArgv(read, r -> {
             if (r.code == RootShell.EACCES) {
                 showHtml(page("需要 root 权限", RootShell.DENIED_MSG, true));
                 return;
@@ -229,7 +230,8 @@ public final class MainActivity extends Activity {
             if (!RootShell.validCallbackName(callback)) return;
             final boolean trusted = trustedDocument;
             if (!trusted) return;
-            if (!CommandPolicy.allowed(cmd, true)) {
+            List<String> argv = CommandPolicy.parse(cmd);
+            if (argv == null) {
                 App.ui(() -> {
                     if (trustedDocument) {
                         web.evaluateJavascript(RootShell.callbackJs(callback,
@@ -238,31 +240,69 @@ public final class MainActivity extends Activity {
                 });
                 return;
             }
-            String cwd = null;
-            Map<String, String> env = null;
+            List<List<String>> runs;
             try {
-                if (options != null && !options.isEmpty()) {
-                    JSONObject o = new JSONObject(options);
-                    cwd = o.optString("cwd", null);
-                    JSONObject e = o.optJSONObject("env");
-                    if (e != null) {
-                        env = new HashMap<>();
-                        for (Iterator<String> it = e.keys(); it.hasNext(); ) {
-                            String k = it.next();
-                            env.put(k, e.optString(k));
-                        }
-                    }
-                }
-            } catch (Exception ignored) {
+                runs = expandLeaseImport(argv);
+            } catch (RuntimeException e) {
+                runs = null;
             }
-            App.shell().exec(cmd == null ? "" : cmd, cwd, env, r -> {
-                final String js = RootShell.callbackJs(callback, r);
+            if (runs == null) {
                 App.ui(() -> {
-                    if (!isDestroyed() && trustedDocument && trusted == trustedDocument) {
-                        web.evaluateJavascript(js, null);
+                    if (trustedDocument) {
+                        web.evaluateJavascript(RootShell.callbackJs(callback,
+                                new RootShell.Result(126, "", "静态租约数据无效", false)), null);
                     }
                 });
+                return;
+            }
+            runArgvSequential(runs, 0, callback, trusted);
+        }
+
+        private void runArgvSequential(List<List<String>> runs, int index, String callback, boolean trusted) {
+            if (index >= runs.size()) return;
+            App.shell().execArgv(runs.get(index), r -> {
+                if (r.code != 0 || index + 1 >= runs.size()) {
+                    final String js = RootShell.callbackJs(callback, r);
+                    App.ui(() -> {
+                        if (!isDestroyed() && trustedDocument && trusted == trustedDocument) {
+                            web.evaluateJavascript(js, null);
+                        }
+                    });
+                    return;
+                }
+                runArgvSequential(runs, index + 1, callback, trusted);
             });
+        }
+
+        private List<List<String>> expandLeaseImport(List<String> argv) {
+            List<List<String>> runs = new ArrayList<>();
+            if (argv.size() >= 5 && "lease".equals(argv.get(2)) && "import".equals(argv.get(3))) {
+                String leases = "/data/adb/hotspot_plus/leases.conf";
+                runs.add(java.util.Arrays.asList("sh", "-c",
+                        "{ echo '# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)'; } > "
+                                + leases + ".new"));
+                List<String> lines = new ArrayList<>();
+                for (int i = 4; i < argv.size(); i++) {
+                    String text = CommandPolicy.decodeImport(argv.get(i));
+                    for (String line : text.substring(0, text.length() - 1).split("\n")) lines.add(line);
+                }
+                java.util.Collections.sort(lines);
+                for (String line : lines) {
+                    List<String> add = new ArrayList<>();
+                    add.add("sh");
+                    add.add("-c");
+                    add.add("printf '%s\\n' \"$1\" >> " + leases + ".new");
+                    add.add("hsp-import");
+                    String[] f = line.split(" ", 3);
+                    add.add(f[0] + " " + f[1] + (f.length == 3 ? " " + f[2] : ""));
+                    runs.add(add);
+                }
+                runs.add(java.util.Arrays.asList("sh", "-c",
+                        "mv " + leases + ".new " + leases));
+                return runs;
+            }
+            runs.add(argv);
+            return runs;
         }
 
         @JavascriptInterface

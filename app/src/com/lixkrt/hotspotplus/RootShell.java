@@ -6,11 +6,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -96,22 +93,22 @@ public final class RootShell {
         return denied;
     }
 
-    /** Run asynchronously; callback is invoked on a pool thread. */
-    public void exec(String cmd, String cwd, Map<String, String> env, Callback cb) {
-        pool.execute(() -> cb.onResult(doRun(cmd, cwd, env)));
+    /**
+     * Run a validated argv without eval. Each argument is single-quoted, so no argument can
+     * introduce shell syntax or command substitution.
+     */
+    public void execArgv(List<String> argv, Callback cb) {
+        pool.execute(() -> cb.onResult(doArgv(argv)));
     }
 
-    /** Blocking helper; never call from a pool callback. */
-    public Result run(String cmd) {
-        Future<Result> f = pool.submit(() -> doRun(cmd, null, null));
-        try {
-            return f.get();
-        } catch (Exception e) {
-            return new Result(1, "", String.valueOf(e), false);
+    private Result doArgv(List<String> argv) {
+        if (argv == null || argv.isEmpty()) return new Result(126, "", "empty argv", false);
+        for (String arg : argv) {
+            if (arg == null || unsafeArg(arg)) {
+                return new Result(126, "", "unsafe argv", false);
+            }
         }
-    }
-
-    private Result doRun(String cmd, String cwd, Map<String, String> env) {
+        String line = argvLine(argv);
         for (int attempt = 0; attempt < 2; attempt++) {
             Shell s = local.get();
             if (s == null || !s.alive()) {
@@ -129,13 +126,12 @@ public final class RootShell {
             }
             denied = false;
             try {
-                return s.run(cmd, cwd, env, 0);
+                return s.runArgv(line, 0);
             } catch (WriteFailed e) {
                 s.close();
                 local.remove();
                 if (attempt == 1) return new Result(1, "", "root shell 异常: " + e.getMessage(), false);
             } catch (IOException e) {
-                // shell died while the command was running: do NOT re-run it (could toggle twice)
                 s.close();
                 local.remove();
                 return new Result(1, "", "root shell 在执行中退出: " + e.getMessage(), false);
@@ -150,28 +146,29 @@ public final class RootShell {
         return "'" + s.replace("'", "'\\''") + "'";
     }
 
-    static boolean validEnvKey(String k) {
-        return k != null && k.matches("[A-Za-z_][A-Za-z0-9_]*");
+    static boolean unsafeArg(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x20 || c == 0x7f || ";|&`$<>()\\\"'".indexOf(c) >= 0) return true;
+        }
+        return false;
     }
 
-    /** Shell text sent to the persistent shell for one command. Package-private for tests. */
-    static String frame(String cmd, String cwd, Map<String, String> env, String marker) {
-        String b64 = Base64.getEncoder().encodeToString(cmd.getBytes(StandardCharsets.UTF_8));
-        StringBuilder sb = new StringBuilder(b64.length() + 256);
-        sb.append("__hsp_c=$(printf '%s' '").append(b64).append("' | base64 -d)\n");
-        sb.append("( ");
-        if (cwd != null && !cwd.isEmpty()) sb.append("cd ").append(sq(cwd)).append(" || exit 1; ");
-        if (env != null) {
-            for (Map.Entry<String, String> e : env.entrySet()) {
-                if (validEnvKey(e.getKey())) {
-                    sb.append("export ").append(e.getKey()).append('=').append(sq(String.valueOf(e.getValue()))).append("; ");
-                }
-            }
+    /** Build a shell line from already-validated argv using single-quote escaping only. */
+    static String argvLine(List<String> argv) {
+        StringBuilder sb = new StringBuilder();
+        for (String arg : argv) {
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(sq(arg));
         }
-        sb.append("eval \"$__hsp_c\"\n) </dev/null\n");
-        sb.append("__hsp_rc=$?; printf '\\n%s %d\\n' ").append(marker).append(" \"$__hsp_rc\"; printf '\\n%s\\n' ")
-                .append(marker).append(" >&2\n");
         return sb.toString();
+    }
+
+    /** Frame a single-quoted argv command without eval. */
+    static String frameArgv(String argvLine, String marker) {
+        return "( " + argvLine + "\n) </dev/null\n"
+                + "__hsp_rc=$?; printf '\\n%s %d\\n' " + marker + " \"$__hsp_rc\"; printf '\\n%s\\n' "
+                + marker + " >&2\n";
     }
 
     /** Join lines received before the marker (the marker was preceded by an injected "\n"). */
@@ -253,7 +250,7 @@ public final class RootShell {
             errQ = new LineQueue(p.getErrorStream(), "su-err");
             Result r;
             try {
-                r = run("id -u", null, null, 60000); // generous: Magisk-style prompts
+                r = runArgv("id", 60000);
             } catch (IOException e) {
                 close();
                 throw new DeniedException("su 已退出 (" + e.getMessage() + ")");
@@ -273,15 +270,19 @@ public final class RootShell {
             }
         }
 
-        Result run(String cmd, String cwd, Map<String, String> env, long timeoutMs) throws IOException {
+        Result runArgv(String argvLine, long timeoutMs) throws IOException {
             String marker = "__HSP_END_" + UUID.randomUUID().toString().replace("-", "");
             if (!alive()) throw new WriteFailed("shell not running");
             try {
-                stdin.write(frame(cmd, cwd, env, marker).getBytes(StandardCharsets.UTF_8));
+                stdin.write(frameArgv(argvLine, marker).getBytes(StandardCharsets.UTF_8));
                 stdin.flush();
             } catch (IOException e) {
                 throw new WriteFailed(e.getMessage());
             }
+            return readResult(marker, timeoutMs);
+        }
+
+        private Result readResult(String marker, long timeoutMs) throws IOException {
             List<String> out = new ArrayList<>();
             int code;
             while (true) {

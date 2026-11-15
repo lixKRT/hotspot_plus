@@ -12,9 +12,14 @@ mkdir -p "$OUT"
 "$JAVAC" -encoding UTF-8 -d "$OUT" \
     "$APP/src/com/lixkrt/hotspotplus/WebPolicy.java" \
     "$APP/src/com/lixkrt/hotspotplus/CommandPolicy.java" \
+    "$APP/src/com/lixkrt/hotspotplus/RootShell.java" \
     "$HERE/policy/WebPolicyTest.java" \
-    "$HERE/policy/CommandPolicyTest.java"
+    "$HERE/policy/CommandPolicyTest.java" \
+    "$HERE/policy/BridgeDispatchTest.java" \
+    "$HERE/policy/RootShellFramingTest.java"
 "$JAVA" -cp "$OUT" com.lixkrt.hotspotplus.WebPolicyTest
 "$JAVA" -cp "$OUT" com.lixkrt.hotspotplus.CommandPolicyTest
+"$JAVA" -cp "$OUT" com.lixkrt.hotspotplus.BridgeDispatchTest
+"$JAVA" -cp "$OUT" com.lixkrt.hotspotplus.RootShellFramingTest
 sh "$HERE/manifest_invariants.sh"
 sh "$HERE/build_policy.sh"

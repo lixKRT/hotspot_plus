@@ -29,7 +29,8 @@ public final class App extends Application {
 
     /** Toggle the hotspot via the module CLI (used by the tile and the launcher shortcut). */
     public static void toggle(Context c, RootShell.Callback done) {
-        shell().exec("LOCK_WAIT=20 " + HSP + " toggle", null, null, r -> {
+        java.util.List<String> argv = java.util.Arrays.asList("LOCK_WAIT=20", "sh", HSP, "toggle");
+        shell().execArgv(argv, r -> {
             if (r.code == RootShell.EACCES) toast(c, RootShell.DENIED_MSG);
             else toast(c, r.lastLine().isEmpty() ? (r.code == 0 ? "完成" : "失败 (" + r.code + ")") : r.lastLine());
             if (done != null) done.onResult(r);
