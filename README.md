@@ -168,6 +168,10 @@ su -c "$H set GATEWAY=192.168.42.1 PREFIX=24 DHCP_START=192.168.42.100 DHCP_END=
 su -c "$H lease add aa:bb:cc:dd:ee:ff 192.168.42.10 我的笔记本"
 su -c "$H lease del aa:bb:cc:dd:ee:ff"
 su -c "$H lease apply"   # 立即重算 udhcpd.conf（热点开启时）
+su -c "$H backup"        # 创建备份到 /data/adb/hotspot_plus_backups/
+su -c "$H backup list"   # 列出有效备份包
+su -c "$H restore <备份目录> --yes"   # 显式确认后恢复配置和静态租约
+su -c "$H backup export <备份目录>"   # 显式导出 tar.gz 到 /sdcard/Download
 su -c "$H apply"         # 应用配置
 su -c "$H log 200"
 su -c "$H diag"          # 生成诊断文件
@@ -222,7 +226,8 @@ su -c "$H unstick"       # 清除卡住的操作（结束残留 hsp/hsctl 进程
 
 ### 卸载 / 回滚
 
-- 在当前模块管理器里移除模块并重启即可。iptables 规则和 udhcpd 本来就不会跨重启保留；`uninstall.sh` 会清理规则，并删除 `/data/adb/hotspot_plus`。
+- 在当前模块管理器里移除模块并重启即可。iptables 规则和 udhcpd 本来就不会跨重启保留。`uninstall.sh` 会先尝试把 `config.conf` 和 `leases.conf` 备份到 `/data/adb/hotspot_plus_backups/`（默认 3 次重试）；若仍失败，会醒目记录错误和日志路径后**继续卸载**（ADR-0008）。随后清理规则并删除 `/data/adb/hotspot_plus`。
+- 备份包仅 root 可读，含配置（包括 `FALLBACK_SSID/FALLBACK_PASS`）、静态租约、来源信息（时间、模块版本、Android 构建）和 SHA-256 校验和；不含运行时租约、进程状态或日志。重装后只在全新安装（无用户配置，或仅有安装器默认配置）时于 WebUI 显示恢复提示，绝不自动恢复；无效或不兼容的包会被拒绝且不覆盖现有配置。
 - 不重启的紧急回滚：
   ```sh
   su -c "/data/adb/modules/hotspot_plus/bin/hsp daemon stop"   # 停 udhcpd + 删除拦截规则

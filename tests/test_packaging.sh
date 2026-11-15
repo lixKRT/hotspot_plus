@@ -100,7 +100,7 @@ with zipfile.ZipFile(pkgs[0]) as z:
         print("unexpected entries: " + ", ".join(leaked), file=sys.stderr)
         sys.exit(1)
     required = ["customize.sh", "module.prop", "bin/hsp", "bin/hspd", "defaults/config.conf",
-                "lib/common.sh", "META-INF/com/google/android/update-binary"]
+                "lib/common.sh", "lib/backup.sh", "META-INF/com/google/android/update-binary"]
     missing = [n for n in required if n not in names]
     if missing:
         print("missing entries: " + ", ".join(missing), file=sys.stderr)

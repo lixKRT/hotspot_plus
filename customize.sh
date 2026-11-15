@@ -41,10 +41,25 @@ fi
 
 HSP_DATA=${HSP_DATA:-$DATA}
 mkdir -p "$HSP_DATA/run" "$HSP_DATA/logs"
+# Upgrade: keep user assets (config + static leases) and drop runtime-only state (ADR-0008).
+rm -f "$HSP_DATA/udhcpd.leases" "$HSP_DATA/udhcpd.leases.old" 2>/dev/null
+rm -rf "$HSP_DATA/run/op.lockdir" "$HSP_DATA/socket" 2>/dev/null
+rm -f "$HSP_DATA"/logs/*.log "$HSP_DATA"/logs/*.log.[0-9] "$HSP_DATA"/logs/*.tmp 2>/dev/null
+rm -f "$HSP_DATA"/*.tmp 2>/dev/null
+if [ -d "$HSP_DATA/run" ]; then
+    for _rf in "$HSP_DATA"/run/*; do
+        [ -e "$_rf" ] || continue
+        case "${_rf##*/}" in *.pid|*.lock|*.sock|*.tmp|state|state.tmp.*) rm -f "$_rf" ;; esac
+    done
+fi
 if [ ! -f "$HSP_DATA/config.conf" ]; then
     cp "$MODPATH/defaults/config.conf" "$HSP_DATA/config.conf"
+    : > "$HSP_DATA/.config_default"
+    chmod 600 "$HSP_DATA/.config_default" 2>/dev/null
     ui_print "- 已创建默认配置 $HSP_DATA/config.conf (网关 192.168.42.1/24)"
+    ui_print "  仅在此时显示恢复提示；已有用户配置不会自动提示"
 else
+    rm -f "$HSP_DATA/.config_default"
     ui_print "- 保留已有配置 $HSP_DATA/config.conf（不改写用户设置）"
 fi
 if [ ! -f "$HSP_DATA/leases.conf" ]; then
@@ -54,6 +69,15 @@ else
     ui_print "- 保留已有静态租约 $HSP_DATA/leases.conf"
 fi
 chmod 700 "$HSP_DATA"
+
+_hsp_backup_dir=${HSP_BACKUP_DIR:-/data/adb/hotspot_plus_backups}
+if [ -d "$_hsp_backup_dir" ]; then
+    _hsp_n=0
+    for _hsp_b in "$_hsp_backup_dir"/*; do
+        [ -d "$_hsp_b" ] && [ -f "$_hsp_b/manifest" ] && _hsp_n=$((_hsp_n + 1))
+    done
+    [ "$_hsp_n" -gt 0 ] && ui_print "- 检测到 $_hsp_n 个备份包（$_hsp_backup_dir）；安装器不会自动恢复，首次打开界面可确认恢复"
+fi
 
 # ---------------------------------------------------------------- launcher app 「热点增强」
 install_app() {
