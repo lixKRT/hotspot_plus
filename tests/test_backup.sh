@@ -232,6 +232,7 @@ upgrade_clears_runtime_only() {
     printf 'stale tmp\n' > "$_bt/data/run/hsctl.tmp"
     printf 'lock\n' > "$_bt/data/run/session.lock"
     printf 'sock\n' > "$_bt/data/run/hspd.sock"
+    printf '1700000000\n' > "$_bt/data/boot.done"
     _before_c=$(cksum "$_bt/data/config.conf")
     _before_l=$(cksum "$_bt/data/leases.conf")
     _out=$(HSP_DATA="$_bt/data" MODPATH="$_bt/mod" HSP_INSTALLER_DRY_RUN=1 \
@@ -249,7 +250,28 @@ upgrade_clears_runtime_only() {
         [ ! -e "$_bt/data/run/hsctl.tmp" ] &&
         [ ! -e "$_bt/data/run/session.lock" ] &&
         [ ! -e "$_bt/data/run/hspd.sock" ] &&
+        [ ! -e "$_bt/data/boot.done" ] &&
         [ -d "$_bt/data/run" ] && [ -d "$_bt/data/logs" ]
+}
+
+upgrade_clears_stale_boot_marker() {
+    _backup_env bootmarker
+    mkdir -p "$_bt/mod/defaults"
+    cp "$ROOT/defaults/config.conf" "$_bt/mod/defaults/config.conf"
+    cp "$ROOT/defaults/leases.conf" "$_bt/mod/defaults/leases.conf"
+    cp "$ROOT/module.prop" "$_bt/mod/module.prop"
+    cp "$ROOT/customize.sh" "$_bt/mod/customize.sh"
+    printf '1700000000\n' > "$_bt/data/boot.done"
+    _before_c=$(cksum "$_bt/data/config.conf")
+    _before_l=$(cksum "$_bt/data/leases.conf")
+    _out=$(HSP_DATA="$_bt/data" MODPATH="$_bt/mod" HSP_INSTALLER_DRY_RUN=1 \
+        sh -c 'ui_print() { printf "%s\n" "$*"; }; abort() { printf "%s\n" "$*"; }; set_perm() { :; }; set_perm_recursive() { :; }; . "$MODPATH/customize.sh"' 2>&1) ||
+        { printf '%s\n' "$_out"; return 1; }
+    [ ! -e "$_bt/data/boot.done" ] &&
+        [ "$(cksum "$_bt/data/config.conf")" = "$_before_c" ] &&
+        [ "$(cksum "$_bt/data/leases.conf")" = "$_before_l" ] &&
+        grep -q '^GATEWAY="192.168.42.1"$' "$_bt/data/config.conf" &&
+        grep -q 'laptop' "$_bt/data/leases.conf"
 }
 
 installer_marks_only_default_config() {
@@ -318,6 +340,7 @@ run_case "backup dir must be outside data" backup_refuses_storage_inside_data
 run_case "uninstall retries then continues loudly" uninstall_retries_then_continues_with_loud_error
 run_case "uninstall backs up before deleting data" uninstall_creates_backup_before_removing_data
 run_case "upgrade preserves user assets only" upgrade_clears_runtime_only
+run_case "upgrade clears stale boot.done marker" upgrade_clears_stale_boot_marker
 run_case "installer marks default config distinctly" installer_marks_only_default_config
 run_case "config marker lifecycle: default/set/restore" config_marker_lifecycle
 run_case "clean install is restore-prompt eligible" clean_install_is_prompt_eligible

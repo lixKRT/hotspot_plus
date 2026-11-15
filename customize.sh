@@ -45,7 +45,7 @@ case "$HSP_DATA" in ''|/) abort "! 无效数据目录: $HSP_DATA" ;; esac
 mkdir -p "$HSP_DATA" 2>/dev/null
 rm -rf "$HSP_DATA/logs" "$HSP_DATA/run" 2>/dev/null
 rm -f "$HSP_DATA/udhcpd.leases" "$HSP_DATA/udhcpd.leases.old" \
-    "$HSP_DATA"/*.tmp "$HSP_DATA/socket" 2>/dev/null
+    "$HSP_DATA"/*.tmp "$HSP_DATA/socket" "$HSP_DATA/boot.done" 2>/dev/null
 mkdir -p "$HSP_DATA/run" "$HSP_DATA/logs"
 if [ ! -f "$HSP_DATA/config.conf" ]; then
     cp "$MODPATH/defaults/config.conf" "$HSP_DATA/config.conf"
