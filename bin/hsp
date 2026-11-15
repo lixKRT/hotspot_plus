@@ -253,6 +253,7 @@ do_boot_auto() {
 do_status_json() {
     _ap=false; _if=""; _addr=""
     ap_detect_fast && { _ap=true; _if=$AP_IF; _addr=$AP_ADDR; }
+    subnet_setup "$_addr"
     _gwok=false; [ "${_addr%/*}" = "$GATEWAY" ] && _gwok=true
     _dhcp=false; dhcp_running && _dhcp=true
     _fw=false; [ -n "$_if" ] && fw_check "$_if" && _fw=true
@@ -284,13 +285,19 @@ do_status_json() {
         "$(json_esc "$_bs")" "$(json_esc "$_be")" "$(json_esc "$_ba")"
     printf '"last_action":"%s","last_result":"%s","last_error":"%s","last_at":"%s",' \
         "$(json_esc "$_la")" "$(json_esc "$_lr")" "$(json_esc "$_le")" "$(json_esc "$_lat")"
-    printf '"enforce_broken":%s,"sdk":"%s","release":"%s","hyperos":"%s","version":"%s","busybox":"%s","last_issue":"%s"}\n' \
+    printf '"subnet":{"status":"%s","configured":"%s","actual":"%s","example_mapping":"%s"},"enforce_broken":%s,"sdk":"%s","release":"%s","hyperos":"%s","version":"%s","busybox":"%s","last_issue":"%s"}\n' \
+        "$SUBNET_STATUS" "$SUBNET_CFG_CIDR" "$SUBNET_ACTUAL_CIDR" "$(json_esc "$SUBNET_EXAMPLE")" \
         "$_eb" "$SDK" "$RELEASE" "$(json_esc "$HYPEROS")" "$_ver" "$BB" "$(json_esc "$_last")"
 }
 
 do_status_text() {
     echo "hotspot_plus $(sed -n 's/^version=//p' "$MODDIR/module.prop")  Android $RELEASE (SDK $SDK)  $HYPEROS"
     if ap_detect; then echo "热点: 开启  接口=$AP_IF  地址=$AP_ADDR"; else echo "热点: 关闭"; fi
+    subnet_setup "${AP_ADDR:-}"
+    case "$SUBNET_STATUS" in
+        configured) echo "子网: $SUBNET_CFG_CIDR（与配置一致）" ;;
+        mapped) echo "子网: 实际 $SUBNET_ACTUAL_CIDR，配置 $SUBNET_CFG_CIDR；静态租约按主机号映射${SUBNET_EXAMPLE:+（$SUBNET_EXAMPLE）}" ;;
+    esac
     echo "配置网关: $GATEWAY/$PREFIX (固定=$FIXED_GATEWAY 强制=$ENFORCE_GATEWAY)"
     echo "DHCP: enable=$DHCP_ENABLE running=$(dhcp_running && echo yes || echo no) udhcpd=$(bb_has udhcpd && echo yes || echo no)"
     [ -n "$AP_IF" ] && echo "防火墙拦截系统DHCP: $(fw_check "$AP_IF" && echo yes || echo no)"
@@ -303,78 +310,184 @@ do_status_text() {
     echo "AP 状态(IWifiManager): $(hsctl state 2>/dev/null | sed -n 's/^ap_state_name=//p')"
 }
 
-# clients: merge ip neigh + udhcpd leases + static lease names (+ Wi-Fi association count)
-do_clients_json() {
-    if ! ap_detect_fast; then echo '{"ap":false,"clients":[]}'; return 0; fi
-    _tmp=$RUN/clients.$$
+# clients: one normalized stream from ip neigh + udhcpd leases + static leases.
+# Fields are tab-separated: mac ip ip6 hostname remark static_ip state online lease.
+# Missing data stays empty; nothing is synthesized except explicit state labels.
+clients_collect() { # outfile
+    _co=$1
+    : > "$_co"
+    _dp=$(dhcp_pid)
+    if [ -n "$_dp" ]; then kill -USR1 "$_dp" 2>/dev/null && sleep 0.3; fi
     {
-        $IPB -4 neigh show dev "$AP_IF" 2>/dev/null | awk '{ip=$1; mac=""; st=$NF; for(i=2;i<=NF;i++) if($i=="lladdr") mac=$(i+1); if(mac!="") print "N", tolower(mac), ip, st}'
-        $IPB -6 neigh show dev "$AP_IF" 2>/dev/null | awk '{ip=$1; mac=""; st=$NF; for(i=2;i<=NF;i++) if($i=="lladdr") mac=$(i+1); if(mac!="" && ip !~ /^fe80/) print "S", tolower(mac), ip, st}'
-        # SIGUSR1 makes udhcpd flush its in-memory leases to the lease file right now
-        _dp=$(dhcp_pid); [ -n "$_dp" ] && kill -USR1 "$_dp" 2>/dev/null && sleep 0.3
-        if [ -s "$LEASE_DB" ] && bb_has dumpleases; then
-            "$BB" dumpleases -f "$LEASE_DB" 2>/dev/null | awk 'NR>1 && length($0)>=36 {
-                mac=substr($0,1,17); ip=substr($0,19,16); host=substr($0,35,20); ex=substr($0,55);
-                gsub(/ +$/,"",ip); gsub(/^ +| +$/,"",host); gsub(/^ +| +$/,"",ex); gsub(/ /,"_",ex);
-                if (host=="") host="-"; gsub(/[ \t]/,"_",host);
-                print "L", tolower(mac), ip, ex, host }'
-        fi
-        [ -f "$LEASES" ] && awk '!/^#/ && NF>=2 {n=""; for(i=3;i<=NF;i++) n=n (i>3?" ":"") $i; print "T", tolower($1), $2, n}' "$LEASES"
-    } > "$_tmp"
-    # Wi-Fi association count from SoftApManager dump (dumpsys wifi is heavy: cache 30s)
+        $IPB -4 neigh show dev "$AP_IF" 2>/dev/null
+        $IPB -6 neigh show dev "$AP_IF" 2>/dev/null
+    } | awk '
+        {
+            if (seen[$0]++) next
+            if ($1 ~ /:/ && $1 !~ /^fe80:/) {
+                for (i = 2; i <= NF; i++) if ($i == "lladdr" && $(i + 1) ~ /^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$/) {
+                    print "V\t" tolower($(i + 1)) "\t" $1
+                    next
+                }
+            }
+            ip = $1; mac = ""; st = $NF
+            for (i = 2; i <= NF; i++) if ($i == "lladdr") mac = tolower($(i + 1))
+            if (mac !~ /^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$/) next
+            if (ip ~ /^fe80:/) next
+            if (ip ~ /:/) print "V\t" mac "\t" ip
+            else print "N\t" mac "\t" ip "\t" st
+        }' >> "$_co"
+    if [ -s "$LEASE_DB" ] && bb_has dumpleases; then
+        "$BB" dumpleases -f "$LEASE_DB" 2>/dev/null | awk 'NR > 1 {
+            mac = tolower($1)
+            if (mac !~ /^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$/) next
+            ip = $2; host = $3; remain = $4 " " $5
+            gsub(/ /, "_", remain); gsub(/^_+|_+$/, "", host)
+            if (remain == "expired") next
+            print "L\t" mac "\t" ip "\t" remain "\t" host
+        }' >> "$_co"
+    fi
+    if [ -f "$LEASES" ]; then
+        while read -r _smac _sip _srest; do
+            case "$_smac" in ''|'#'*) continue ;; esac
+            _sv=$(lease_validate_line "$_smac" "$_sip" "${_srest:-}") || continue
+            _sm=${_sv%% *}; _sv=${_sv#* }
+            _si=${_sv%% *}; _sr=${_sv#* }
+            printf 'T\t%s\t%s\t%s\n' "$_sm" "$_si" "$_sr" >> "$_co"
+        done < "$LEASES"
+    fi
+}
+
+clients_model() { # normalized file -> tab-separated model rows
+    subnet_setup "${AP_ADDR:-}"
+    awk -F '\t' -v status="$SUBNET_STATUS" -v cfgnet="$SUBNET_CFG_NET" -v cfgcidr="$SUBNET_CFG_CIDR" \
+        -v actnet="$SUBNET_ACTUAL_NET" -v actsize="$SUBNET_ACTUAL_SIZE" '
+    function add(m) { if (!(m in seen)) { seen[m] = 1; order[++n] = m } }
+    function ip2int(s, a) { split(s, a, "."); return (a[1] * 16777216) + (a[2] * 65536) + (a[3] * 256) + a[4] }
+    function int2ip(n) { return int(n / 16777216) % 256 "." int(n / 65536) % 256 "." int(n / 256) % 256 "." n % 256 }
+    $1 == "N" { add($2); ip[$2] = $3; st[$2] = $4 }
+    $1 == "V" { add($2); v6[$2] = (v6[$2] == "" ? $3 : v6[$2] " " $3) }
+    $1 == "L" { add($2); lip[$2] = $3; lexp[$2] = $4; if ($5 != "" && !($2 in host)) host[$2] = $5 }
+    $1 == "T" { add($2); tip[$2] = $3; if ($4 != "") remark[$2] = $4 }
+    END {
+        for (i = 1; i <= n; i++) {
+            m = order[i]
+            old = 0
+            state = (m in st) ? st[m] : ((m in lexp) ? "LEASE_ONLY" : "STATIC_ONLY")
+            online = (state == "REACHABLE" || state == "STALE" || state == "DELAY" || state == "PROBE" || state == "PERMANENT")
+            cip = (m in ip) ? ip[m] : ""
+            lease_ip = (m in lip) ? lip[m] : ""
+            static_ip = (m in tip) ? tip[m] : ""
+            if (static_ip != "" && status == "mapped") {
+                off = ip2int(static_ip) - cfgnet
+                if (off > 0 && off < actsize) static_ip = int2ip(actnet + off)
+            }
+            # A lease/neighbor address outside the current configured subnet is an old binding.
+            if (cip != "" && status == "mapped") {
+                addr = cip; sub(/\/.*/, "", addr); v = ip2int(addr)
+                if (v < actnet || v >= actnet + actsize) {
+                    cip = ""; old = 1; online = 0
+                    if (lease_ip == addr) { lease_ip = ""; lexp[m] = "" }
+                    if (host[m] == "" && (m in host)) delete host[m]
+                    state = "STALE_ADDR"
+                }
+            }
+            if (cip == "" && lease_ip != "" && !old) { cip = lease_ip; lease_ip = ""; state = "LEASE_ONLY" }
+            if (cip == "" && static_ip != "" && !old) state = "STATIC_ONLY"
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", m, cip, v6[m], host[m], remark[m], static_ip, state, (online ? "true" : "false"), lexp[m]
+        }
+    }' "$1"
+}
+
+clients_assoc_count() {
+    if [ -n "${HSP_ASSOC_COUNT:-}" ]; then
+        printf '%s\n' "$HSP_ASSOC_COUNT"
+        return 0
+    fi
     _ac=$RUN/assoc.cache
     if [ -f "$_ac" ] && [ $(( $(date +%s) - $(stat -c %Y "$_ac" 2>/dev/null || echo 0) )) -lt 30 ]; then
-        _assoc=$(cat "$_ac")
+        cat "$_ac"
     else
         _assoc=$(tmo 8 "dumpsys wifi" dumpsys wifi 2>/dev/null | sed -n 's/.*getConnectedClientList().size(): *\([0-9]*\).*/\1/p' | head -n1)
         echo "$_assoc" > "$_ac"
+        echo "$_assoc"
     fi
-    awk -v iface="$AP_IF" -v addr="$AP_ADDR" -v assoc="${_assoc:-null}" '
-    function esc(s) { gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); return s }
-    function add(m) { if (!(m in seen)) { seen[m]=1; order[++n]=m } }
-    $1=="N" { add($2); ip[$2]=$3; st[$2]=$4 }
-    $1=="S" { add6[$2]=(add6[$2]=="" ? $3 : add6[$2] " " $3) }
-    $1=="L" { if ($4!="expired") { add($2); lip[$2]=$3; lexp[$2]=$4; if ($5!="-") host[$2]=$5 } }
-    $1=="T" { tip[$2]=$3; s=$0; sub(/^T [^ ]+ [^ ]+ ?/,"",s); tname[$2]=s }
-    END {
-        printf "{\"ap\":true,\"iface\":\"%s\",\"addr\":\"%s\",\"assoc\":%s,\"clients\":[", iface, addr, assoc
-        first=1
-        for (i=1;i<=n;i++) { m=order[i]
-            state = (m in st) ? st[m] : "NOLEASE"
-            if (state=="FAILED" || state=="INCOMPLETE") { if (!(m in lip)) continue }
-            online = (state ~ /REACHABLE|STALE|DELAY|PROBE|PERMANENT/) ? "true" : "false"
-            cip = (m in ip) ? ip[m] : lip[m]
-            if (!first) printf ","; first=0
-            printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"hostname\":\"%s\",\"remark\":\"%s\",\"static_ip\":\"%s\",\"state\":\"%s\",\"online\":%s,\"lease\":\"%s\"}",
-                m, cip, add6[m], esc(host[m]), esc(tname[m]), tip[m], state, online, lexp[m]
-        }
-        print "]}"
-    }' "$_tmp"
-    rm -f "$_tmp"
+}
+
+do_clients_json() {
+    _tmp=$RUN/clients.$$.raw
+    _model=$RUN/clients.$$.model
+    if ! ap_detect_fast; then
+        echo '{"ap":false,"clients":[]}'
+        return 0
+    fi
+    clients_collect "$_tmp"
+    clients_model "$_tmp" > "$_model"
+    _assoc=$(clients_assoc_count)
+    subnet_setup "$AP_ADDR"
+    awk -F '\t' -v iface="$AP_IF" -v addr="$AP_ADDR" -v assoc="${_assoc:-null}" \
+        -v sstatus="$SUBNET_STATUS" -v scfg="$SUBNET_CFG_CIDR" -v sactual="$SUBNET_ACTUAL_CIDR" '
+    function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+    BEGIN {
+        printf "{\"ap\":true,\"iface\":\"%s\",\"addr\":\"%s\",\"assoc\":%s,", iface, addr, assoc
+        printf "\"subnet\":{\"status\":\"%s\",\"configured\":\"%s\",\"actual\":\"%s\"},", sstatus, scfg, sactual
+        printf "\"clients\":["
+        first = 1
+    }
+    {
+        if (!first) printf ","
+        first = 0
+        printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"ip6\":\"%s\",\"hostname\":\"%s\",\"remark\":\"%s\",\"static_ip\":\"%s\",\"state\":\"%s\",\"online\":%s,\"lease\":\"%s\"}", \
+            $1, $2, $3, esc($4), esc($5), $6, $7, $8, $9
+    }
+    END { print "]}" }' "$_model"
+    rm -f "$_tmp" "$_model"
 }
 
 do_clients_text() {
-    do_clients_json | awk '
-      { s=$0; gsub(/.*"clients":\[/,"",s); gsub(/\]\}$/,"",s); n=split(s,a,/\},\{/);
-        printf "%-17s  %-15s  %-18s  %-10s  %s\n", "MAC", "IP", "主机名/备注", "状态", "租约剩余";
-        for(i=1;i<=n;i++){ r=a[i]; m=f(r,"mac"); if(m=="") continue;
-          nm=f(r,"remark"); if(nm=="") nm=f(r,"hostname");
-          printf "%-17s  %-15s  %-18s  %-10s  %s\n", m, f(r,"ip"), nm, f(r,"state"), f(r,"lease") } }
-      function f(r,k,  t){ t=r; if (!match(t,"\"" k "\":\"[^\"]*\"")) return ""; t=substr(t,RSTART+length(k)+4,RLENGTH-length(k)-5); return t }'
+    _tmp=$RUN/clients.$$.raw
+    _model=$RUN/clients.$$.model
+    if ! ap_detect_fast; then
+        echo "热点未开启"
+        return 0
+    fi
+    clients_collect "$_tmp"
+    clients_model "$_tmp" > "$_model"
+    printf '%-17s  %-15s  %-18s  %-12s  %s\n' "MAC" "IP" "主机名/备注" "状态" "租约剩余"
+    awk -F '\t' '{
+        name = ($5 != "" ? $5 : $4)
+        state = $7
+        if (state == "STALE_ADDR") state = "STALE_ADDR(旧绑定)"
+        else if (state == "STATIC_ONLY") state = "STATIC_ONLY(离线)"
+        else if (state == "LEASE_ONLY") state = "LEASE_ONLY"
+        printf "%-17s  %-15s  %-18s  %-12s  %s\n", $1, $2, name, state, $9
+    }' "$_model"
+    rm -f "$_tmp" "$_model"
 }
 
 do_config_json() {
     printf '{"FIXED_GATEWAY":"%s","GATEWAY":"%s","PREFIX":"%s","DHCP_ENABLE":"%s","DHCP_START":"%s","DHCP_END":"%s",' \
         "$FIXED_GATEWAY" "$GATEWAY" "$PREFIX" "$DHCP_ENABLE" "$DHCP_START" "$DHCP_END"
-    printf '"LEASE_TIME":"%s","DNS":"%s","ENFORCE_GATEWAY":"%s","AUTO_START":"%s","AP_IFACE":"%s","METERED":"%s","leases":[' \
+    if ap_detect_fast; then subnet_setup "$AP_ADDR"; else subnet_setup ""; fi
+    printf '"LEASE_TIME":"%s","DNS":"%s","ENFORCE_GATEWAY":"%s","AUTO_START":"%s","AP_IFACE":"%s","METERED":"%s",' \
         "$LEASE_TIME" "$(json_esc "$DNS")" "$ENFORCE_GATEWAY" "$AUTO_START" "$(json_esc "$AP_IFACE")" "$METERED"
+    printf '"subnet":{"status":"%s","configured":"%s","actual":"%s"},"leases":[' \
+        "$SUBNET_STATUS" "$SUBNET_CFG_CIDR" "$SUBNET_ACTUAL_CIDR"
     _first=1
     if [ -f "$LEASES" ]; then
-        while read -r _mac _ip _rest; do
-            case "$_mac" in ''|'#'*) continue ;; esac
+        while read -r _cmac _cip _crest; do
+            case "$_cmac" in ''|'#'*) continue ;; esac
+            _cv=$(lease_validate_line "$_cmac" "$_cip" "${_crest:-}") || continue
+            _cmac=${_cv%% *}; _cv=${_cv#* }
+            _cip=${_cv%% *}; _crest=${_cv#* }
+            _eff=$_cip
+            if [ "$SUBNET_STATUS" = mapped ]; then
+                _eff=$(map_ip "$_cip" "$SUBNET_CFG_NET" "$SUBNET_ACTUAL_NET" "$SUBNET_ACTUAL_SIZE") || _eff=""
+            fi
             [ $_first = 1 ] || printf ','
             _first=0
-            printf '{"mac":"%s","ip":"%s","name":"%s"}' "$(json_esc "$_mac")" "$(json_esc "$_ip")" "$(json_esc "$_rest")"
+            printf '{"mac":"%s","ip":"%s","effective_ip":"%s","name":"%s"}' \
+                "$(json_esc "$_cmac")" "$(json_esc "$_cip")" "$(json_esc "$_eff")" "$(json_esc "$_crest")"
         done < "$LEASES"
     fi
     printf ']}\n'
@@ -432,50 +545,155 @@ do_set() {
     echo "已保存"
 }
 
-lease_validate_line() { # mac ip name -> normalized line or error
-    is_mac "$1" || { echo "ERR 无效 MAC: $1"; return 1; }
-    is_ipv4 "$2" || { echo "ERR 无效 IP: $2"; return 1; }
-    _nm=$(echo "$3" | tr -d '"$`\\\t\r' | cut -c1-64)
-    echo "$(lc "$1") $2${_nm:+ $_nm}"
-}
 do_lease() {
     _sub=$1; shift
     case "$_sub" in
         list|"") [ -f "$LEASES" ] && grep -vE '^[[:space:]]*(#|$)' "$LEASES" ;;
         add)
-            _line=$(lease_validate_line "$1" "$2" "$3") || { echo "$_line"; return 1; }
+            [ $# -ge 2 ] || { echo "用法: hsp lease add MAC IP [备注]"; return 1; }
+            _line=$(lease_validate_line "$1" "$2" "${3:-}") || { echo "$_line"; return 1; }
+            _mac=${_line%% *}; _rest=${_line#* }
+            _ip=${_rest%% *}
+            touch "$LEASES"
+            if awk -v m="$_mac" '
+                /^[[:space:]]*(#|$)/ { next }
+                { x = tolower($1); gsub(/-/, ":", x); if (x == m) found = 1 }
+                END { exit !found }' "$LEASES"; then
+                echo "MAC 已存在: $_mac（修改地址请用 lease import 或先 del）"
+                return 1
+            fi
+            # An edit may keep the MAC's own address, but another MAC's address is always rejected.
+            _holder=$(awk -v want_ip="$_ip" '
+                /^[[:space:]]*(#|$)/ { next }
+                { mac = tolower($1); gsub(/-/, ":", mac) }
+                mac != "'"$_mac"'" && $2 == want_ip { print mac; exit }
+            ' "$LEASES")
+            if [ -n "$_holder" ]; then
+                echo "IP $_ip 已被其他 MAC 使用: $_holder"
+                return 1
+            fi
+            _staging=$RUN/leases.add.$$
+            {
+                while IFS= read -r _l; do
+                    case "$_l" in ''|'#'*) echo "$_l"; continue ;; esac
+                    _lm=${_l%% *}
+                    [ "$(lc "$_lm")" = "$_mac" ] && continue
+                    echo "$_l"
+                done < "$LEASES"
+                echo "$_line"
+            } > "$_staging"
+            mv -f "$_staging" "$LEASES"
+            log "lease add: $_line"
+            echo "已添加: $_line"
+            _lease_apply_if_running ;;
+        del)
+            [ $# -ge 1 ] || { echo "用法: hsp lease del MAC"; return 1; }
+            is_mac "$1" || { echo "无效 MAC: $1"; return 1; }
             _mac=$(lc "$1")
             touch "$LEASES"
-            if grep -v "^#" "$LEASES" | awk -v ip="$2" -v m="$_mac" '$2==ip && tolower($1)!=m {f=1} END{exit !f}'; then
-                echo "IP $2 已被其他 MAC 使用"; return 1
-            fi
-            { grep -vi "^$_mac " "$LEASES"; echo "$_line"; } > "$LEASES.tmp" && mv -f "$LEASES.tmp" "$LEASES"
-            log "lease add: $_line"; echo "已添加: $_line" ;;
-        del)
-            _mac=$(lc "$1"); is_mac "$_mac" || { echo "无效 MAC"; return 1; }
-            grep -vi "^$_mac " "$LEASES" > "$LEASES.tmp"; mv -f "$LEASES.tmp" "$LEASES"
-            log "lease del: $_mac"; echo "已删除 $_mac" ;;
+            _staging=$RUN/leases.del.$$
+            {
+                while IFS= read -r _l; do
+                    case "$_l" in ''|'#'*) echo "$_l"; continue ;; esac
+                    _lm=${_l%% *}
+                    [ "$(lc "$_lm")" = "$_mac" ] && continue
+                    echo "$_l"
+                done < "$LEASES"
+            } > "$_staging"
+            mv -f "$_staging" "$LEASES"
+            log "lease del: $_mac"
+            echo "已删除 $_mac"
+            _lease_apply_if_running ;;
         import)
-            # base64 of UTF-8 text, one "MAC IP [备注]" per line (WebUI saves the whole table this way)
-            _txt=$(echo "$1" | base64 -d 2>/dev/null) || { echo "base64 解码失败"; return 1; }
-            _out=$LEASES.new; : > "$_out"
-            _err=$(echo "$_txt" | while read -r _m _i _n; do
-                [ -z "$_m" ] && continue
-                case "$_m" in '#'*) continue ;; esac
-                _l=$(lease_validate_line "$_m" "$_i" "$_n") || { echo "$_l"; break; }
-                echo "$_l" >> "$_out"
-            done)
-            [ -n "$_err" ] && { rm -f "$_out"; echo "$_err"; return 1; }
-            _dup=$(awk '{print $1}' "$_out" | sort | uniq -d | head -n1)
-            [ -n "$_dup" ] && { rm -f "$_out"; echo "MAC 重复: $_dup"; return 1; }
-            _dup=$(awk '{print $2}' "$_out" | sort | uniq -d | head -n1)
-            [ -n "$_dup" ] && { rm -f "$_out"; echo "IP 重复: $_dup"; return 1; }
-            { echo "# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)"; cat "$_out"; } > "$LEASES.tmp" && mv -f "$LEASES.tmp" "$LEASES"
-            rm -f "$_out"
+            [ $# -ge 1 ] || { echo "用法: hsp lease import BASE64"; return 1; }
+            _b64=$(printf '%s' "$1" | tr -d '\r\n')
+            case "$_b64" in ''|*[!A-Za-z0-9+/=]*) echo "导入内容必须是 base64 文本"; return 1 ;; esac
+            case $(( ${#_b64} % 4 )) in 0) ;; *) echo "base64 长度无效"; return 1 ;; esac
+            _decoded=$RUN/leases.decode.$$
+            printf '%s' "$_b64" | base64 -d > "$_decoded" 2>/dev/null || { rm -f "$_decoded"; echo "base64 解码失败"; return 1; }
+            _txt=$(cat "$_decoded")
+            rm -f "$_decoded"
+            # Reject anything that is not plain lease text before a single byte is written.
+            printf '%s' "$_txt" | grep -q '[[:cntrl:]]' && { echo "导入内容含控制字符"; return 1; }
+            _staging=$RUN/leases.import.$$
+            : > "$_staging"
+            _lineno=0
+            _nl='
+'
+            while IFS= read -r _l || [ -n "$_l" ]; do
+                _lineno=$((_lineno + 1))
+                _l=$(printf '%s' "$_l" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                case "$_l" in ''|'#'*) continue ;; esac
+                _lm=${_l%% *}
+                _li=${_l#* }; _li=${_li%% *}
+                _lr=${_l#* * }; _lr=${_lr#* }
+                [ "$_lm" != "$_li" ] || { rm -f "$_staging"; echo "第 $_lineno 行格式错误（需要 MAC IP [备注]）"; return 1; }
+                _vl=$(lease_validate_line "$_lm" "$_li" "$_lr") || { rm -f "$_staging"; echo "第 $_lineno 行: $_vl"; return 1; }
+                echo "$_vl" >> "$_staging"
+            done <<EOF
+$_txt$_nl
+EOF
+            if [ ! -s "$_staging" ]; then
+                rm -f "$_staging"
+                echo "导入内容为空"
+                return 1
+            fi
+            _dup=$(_lease_import_conflicts "$_staging") || {
+                rm -f "$_staging"
+                echo "$_dup"
+                return 1
+            }
+            {
+                echo "# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)"
+                cat "$_staging"
+            } > "$LEASES.import.$$"
+            # Scrub against the new reservation set before publishing it, so a rebind
+            # cannot leave the old address in the dynamic lease database.
+            lease_scrub_conflicts "$LEASES" "$LEASES.import.$$"
+            mv -f "$LEASES.import.$$" "$LEASES"
+            rm -f "$_staging"
             log "leases imported: $(grep -vc '^#' "$LEASES") entries"
-            echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约" ;;
+            echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约"
+            _lease_apply_if_running ;;
+        apply)
+            if ap_detect_fast; then
+                subnet_setup "$AP_ADDR"
+            else
+                subnet_setup ""
+            fi
+            if [ -s "$LEASE_DB" ] && [ -n "$(dhcp_pid)" ]; then
+                dhcp_stop
+            fi
+            lease_scrub_conflicts
+            if [ -n "$AP_IF" ]; then
+                dhcp_write_conf "$AP_IF" "$AP_ADDR"
+                echo "静态租约已生成: $AP_IF $(grep -c '^static_lease' "$RUN/udhcpd.conf" 2>/dev/null || echo 0) 条"
+            else
+                echo "热点未开启，租约将在下次热点会话生成"
+            fi
+            [ "$SUBNET_STATUS" = mapped ] && echo "子网映射: $SUBNET_CFG_CIDR -> $SUBNET_ACTUAL_CIDR（保留主机号）"
+            return 0
+            ;;
         *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64"; return 1 ;;
     esac
+}
+
+_lease_import_conflicts() {
+    awk '
+        { if ($1 in macs) { print "MAC 重复: " $1; exit 1 }
+          if ($2 in ips) { print "IP 重复: " $2; exit 1 }
+          macs[$1] = 1; ips[$2] = 1 }
+    ' "$1"
+}
+
+_lease_apply_if_running() {
+    AP_IF=""; AP_ADDR=""
+    ap_detect_fast >/dev/null 2>&1 || return 0
+    dhcp_stop 2>/dev/null
+    lease_scrub_conflicts
+    [ -n "$AP_IF" ] && dhcp_write_conf "$AP_IF" "$AP_ADDR" >/dev/null 2>&1
+    log "static leases regenerated for $AP_IF"
+    return 0
 }
 
 do_apply() {
