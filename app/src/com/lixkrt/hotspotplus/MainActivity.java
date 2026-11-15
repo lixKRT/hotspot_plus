@@ -20,7 +20,6 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -150,21 +149,23 @@ public final class MainActivity extends Activity {
     /** Read the module's index.html via su. Missing/disabled module pages get an explicit degraded page. */
     void load() {
         showHtml(page("正在获取 root 权限…", "", false));
-        List<String> read = new ArrayList<>();
-        read.add("sh");
-        read.add("-c");
-        read.add("[ ! -f " + App.MODDIR + "/disable ] && cat " + App.MODDIR + "/webroot/index.html");
-        App.shell().execArgv(read, r -> {
-            if (r.code == RootShell.EACCES) {
-                showHtml(page("需要 root 权限", RootShell.DENIED_MSG, true));
+        App.shell().execArgv(BridgeCommands.moduleDisabled(BridgeCommands.DISABLE), disabled -> {
+            if (disabled.code == 0) {
+                showHtml(page("本地界面不可用", "模块 hotspot_plus 已被禁用。请启用模块并重启；不会加载远程页面或旧的内置副本。", true));
                 return;
             }
-            String html = r.out;
-            if (r.code != 0 || !html.contains("<html")) {
-                showHtml(page("本地界面不可用", "未找到模块 hotspot_plus 的 WebUI，或模块已被禁用。请安装/启用模块并重启；不会加载远程页面或旧的内置副本。", true));
-                return;
-            }
-            showHtml(html);
+            App.shell().execArgv(BridgeCommands.readPage(BridgeCommands.PAGE), r -> {
+                if (r.code == RootShell.EACCES) {
+                    showHtml(page("需要 root 权限", RootShell.DENIED_MSG, true));
+                    return;
+                }
+                String html = r.out;
+                if (r.code != 0 || !html.contains("<html")) {
+                    showHtml(page("本地界面不可用", "未找到模块 hotspot_plus 的 WebUI，或模块已被禁用。请安装/启用模块并重启；不会加载远程页面或旧的内置副本。", true));
+                    return;
+                }
+                showHtml(html);
+            });
         });
     }
 
@@ -240,13 +241,17 @@ public final class MainActivity extends Activity {
                 });
                 return;
             }
-            List<List<String>> runs;
-            try {
-                runs = expandLeaseImport(argv);
-            } catch (RuntimeException e) {
-                runs = null;
+            if (argv.size() == 5 && "lease".equals(argv.get(1)) && "stage".equals(argv.get(2))
+                    && argv.get(4).startsWith("import=")) {
+                stageLeaseImport(callback, trusted, argv.get(4).substring(7));
+                return;
             }
-            if (runs == null) {
+            runArgv(callback, trusted, argv);
+        }
+
+        private void stageLeaseImport(String callback, boolean trusted, String payload) {
+            String content = CommandPolicy.decodeImport(payload);
+            if (content == null) {
                 App.ui(() -> {
                     if (trustedDocument) {
                         web.evaluateJavascript(RootShell.callbackJs(callback,
@@ -255,54 +260,34 @@ public final class MainActivity extends Activity {
                 });
                 return;
             }
-            runArgvSequential(runs, 0, callback, trusted);
+            App.shell().execArgv(BridgeCommands.stageImport(BridgeCommands.HSP, BridgeCommands.LEASE_IMPORT),
+                    content, r -> {
+                        if (r.code != 0) {
+                            finish(callback, trusted, r);
+                            return;
+                        }
+                        App.shell().execArgv(BridgeCommands.importFile(BridgeCommands.HSP, BridgeCommands.LEASE_IMPORT),
+                                done -> finish(callback, trusted, done));
+                    });
         }
 
-        private void runArgvSequential(List<List<String>> runs, int index, String callback, boolean trusted) {
-            if (index >= runs.size()) return;
-            App.shell().execArgv(runs.get(index), r -> {
-                if (r.code != 0 || index + 1 >= runs.size()) {
-                    final String js = RootShell.callbackJs(callback, r);
-                    App.ui(() -> {
-                        if (!isDestroyed() && trustedDocument && trusted == trustedDocument) {
-                            web.evaluateJavascript(js, null);
-                        }
-                    });
-                    return;
+        private void finish(String callback, boolean trusted, RootShell.Result r) {
+            App.ui(() -> {
+                if (trustedDocument && trusted == trustedDocument) {
+                    web.evaluateJavascript(RootShell.callbackJs(callback, r), null);
                 }
-                runArgvSequential(runs, index + 1, callback, trusted);
             });
         }
 
-        private List<List<String>> expandLeaseImport(List<String> argv) {
-            List<List<String>> runs = new ArrayList<>();
-            if (argv.size() >= 5 && "lease".equals(argv.get(2)) && "import".equals(argv.get(3))) {
-                String leases = "/data/adb/hotspot_plus/leases.conf";
-                runs.add(java.util.Arrays.asList("sh", "-c",
-                        "{ echo '# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)'; } > "
-                                + leases + ".new"));
-                List<String> lines = new ArrayList<>();
-                for (int i = 4; i < argv.size(); i++) {
-                    String text = CommandPolicy.decodeImport(argv.get(i));
-                    for (String line : text.substring(0, text.length() - 1).split("\n")) lines.add(line);
-                }
-                java.util.Collections.sort(lines);
-                for (String line : lines) {
-                    List<String> add = new ArrayList<>();
-                    add.add("sh");
-                    add.add("-c");
-                    add.add("printf '%s\\n' \"$1\" >> " + leases + ".new");
-                    add.add("hsp-import");
-                    String[] f = line.split(" ", 3);
-                    add.add(f[0] + " " + f[1] + (f.length == 3 ? " " + f[2] : ""));
-                    runs.add(add);
-                }
-                runs.add(java.util.Arrays.asList("sh", "-c",
-                        "mv " + leases + ".new " + leases));
-                return runs;
-            }
-            runs.add(argv);
-            return runs;
+        private void runArgv(String callback, boolean trusted, List<String> argv) {
+            App.shell().execArgv(argv, r -> {
+                final String js = RootShell.callbackJs(callback, r);
+                App.ui(() -> {
+                    if (!isDestroyed() && trustedDocument && trusted == trustedDocument) {
+                        web.evaluateJavascript(js, null);
+                    }
+                });
+            });
         }
 
         @JavascriptInterface

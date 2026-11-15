@@ -21,21 +21,21 @@ public final class BridgeDispatchTest {
         check("executor has eval guard", root.contains("unsafeArg(") && root.contains("argvLine("));
         check("executor uses single quotes", root.contains("sq(arg)"));
 
-        List<String> argv = CommandPolicy.parse("lease import " + b64(
+        List<String> argv = CommandPolicy.parse(CommandPolicy.CLI + " lease import " + b64(
                 "aa:bb:cc:dd:ee:ff 192.168.42.10 phone\n"));
-        check("import parses", argv != null && argv.get(2).equals("lease") && argv.get(3).equals("import"));
+        check("import parses", argv != null && argv.get(1).equals("lease") && argv.get(2).equals("import"));
         if (argv != null) {
-            String text = CommandPolicy.decodeImport(argv.get(4));
+            String text = CommandPolicy.decodeImport(argv.get(3));
             check("import is canonical", text.equals("aa:bb:cc:dd:ee:ff 192.168.42.10 phone\n"));
         }
-        check("injected lease rejected", CommandPolicy.parse("lease import " + b64(
+        check("injected lease rejected", CommandPolicy.parse(CommandPolicy.CLI + " lease import " + b64(
                 "aa:bb:cc:dd:ee:ff 192.168.42.10 ok\n$(touch /tmp/hsp-pwned)\n")) == null);
-        List<String> status = CommandPolicy.parse("status --json");
-        check("valid status argv", status != null && status.size() == 4
-                && status.get(0).equals("sh") && status.get(1).equals(CommandPolicy.CLI)
-                && status.get(2).equals("status") && status.get(3).equals("--json"));
+        List<String> status = CommandPolicy.parse(CommandPolicy.CLI + " status --json");
+        check("valid status argv", status != null && status.size() == 3
+                && status.get(0).equals(CommandPolicy.CLI)
+                && status.get(1).equals("status") && status.get(2).equals("--json"));
         check("valid lease add argv", CommandPolicy.parse(
-                "lease add aa:bb:cc:dd:ee:ff 192.168.42.10 phone") != null);
+                CommandPolicy.CLI + " lease add aa:bb:cc:dd:ee:ff 192.168.42.10 phone") != null);
         System.out.println("bridge dispatch: " + (failures == 0 ? "ok" : failures + " failed"));
         if (failures != 0) System.exit(1);
     }

@@ -17,8 +17,8 @@ import java.util.regex.Pattern;
  * rejected before any root operation.</p>
  */
 public final class CommandPolicy {
-    public static final String INTERPRETER = "sh";
     public static final String CLI = "/data/adb/modules/hotspot_plus/bin/hsp";
+    public static final String IMPORT_FILE = BridgeCommands.LEASE_IMPORT;
 
     private static final Pattern IPV4 = Pattern.compile(
             "(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)(?:\\.(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)){3}");
@@ -48,15 +48,9 @@ public final class CommandPolicy {
 
         List<String> out = new ArrayList<>();
         int i = 0;
-        if ("LOCK_WAIT=20".equals(words.get(i))) {
-            i++;
-            if (i + 2 >= words.size() || !INTERPRETER.equals(words.get(i))
-                    || !CLI.equals(words.get(i + 1))) return null;
-            i += 2;
-        } else {
-            out.add(INTERPRETER);
-            out.add(CLI);
-        }
+        if (i >= words.size() || !CLI.equals(words.get(i))) return null;
+        i++;
+        out.add(CLI);
         if (i >= words.size()) return null;
         String sub = words.get(i++);
         if (!allowedSubcommand(sub, words, i)) return null;
@@ -147,6 +141,14 @@ public final class CommandPolicy {
                     && (args.size() == 3 || validRemark(args.get(3)));
         }
         if ("del".equals(op)) return args.size() == 2 && validMac(args.get(1));
+        if ("import-file".equals(op)) {
+            return args.size() == 2 && IMPORT_FILE.equals(args.get(1));
+        }
+        if ("stage".equals(op)) {
+            if (args.size() == 2 && IMPORT_FILE.equals(args.get(1))) return true;
+            return args.size() == 3 && IMPORT_FILE.equals(args.get(1))
+                    && args.get(2).startsWith("import=") && decodeImport(args.get(2).substring(7)) != null;
+        }
         if (!"import".equals(op) || args.size() < 2) return false;
         Set<String> macs = new LinkedHashSet<>();
         for (int i = 1; i < args.size(); i++) {

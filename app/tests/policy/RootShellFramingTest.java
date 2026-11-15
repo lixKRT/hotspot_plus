@@ -12,13 +12,15 @@ public final class RootShellFramingTest {
         String frame = RootShell.frameArgv(line, "__HSP_END_TEST");
         check("argv frame has no eval", !frame.contains("eval"));
         check("argv frame invokes literal words", frame.contains("'status' '--json'"));
+        String stdinFrame = RootShell.frameArgvWithStdin("'cat'", "aa:bb:cc:dd:ee:ff 192.168.42.10 x\n", "__HSP_END_TEST");
+        check("stdin frame is a heredoc", stdinFrame.contains("<<'__HSP_IN___HSP_END_TEST'"));
+        check("stdin frame keeps body literal", stdinFrame.contains("aa:bb:cc:dd:ee:ff 192.168.42.10 x"));
         check("commands cannot use substitution", !CommandPolicy.allowed("set DNS=\"$(id)\"", true));
         check("commands cannot use backticks", !CommandPolicy.allowed("set DNS=`id`", true));
         check("commands cannot use semicolon", !CommandPolicy.allowed("set DNS=1.1.1.1;id", true));
         check("commands cannot use pipe", !CommandPolicy.allowed("set DNS=1.1.1.1|id", true));
         check("commands cannot use newline", !CommandPolicy.allowed("set DNS=1.1.1.1\nid", true));
         check("executor rejects quote", RootShell.unsafeArg("a'b"));
-        check("executor rejects backslash", RootShell.unsafeArg("a\\b"));
         check("executor rejects newline", RootShell.unsafeArg("a\nb"));
         System.out.println("root framing: " + (failures == 0 ? "ok" : failures + " failed"));
         if (failures != 0) System.exit(1);

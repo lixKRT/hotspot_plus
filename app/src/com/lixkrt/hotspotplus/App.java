@@ -8,7 +8,7 @@ import android.widget.Toast;
 
 public final class App extends Application {
     public static final String MODDIR = "/data/adb/modules/hotspot_plus";
-    public static final String HSP = "sh " + MODDIR + "/bin/hsp";
+    public static final String HSP = MODDIR + "/bin/hsp";
     private static RootShell shell;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
@@ -29,7 +29,7 @@ public final class App extends Application {
 
     /** Toggle the hotspot via the module CLI (used by the tile and the launcher shortcut). */
     public static void toggle(Context c, RootShell.Callback done) {
-        java.util.List<String> argv = java.util.Arrays.asList("LOCK_WAIT=20", "sh", HSP, "toggle");
+        java.util.List<String> argv = java.util.Arrays.asList(HSP, "toggle");
         shell().execArgv(argv, r -> {
             if (r.code == RootShell.EACCES) toast(c, RootShell.DENIED_MSG);
             else toast(c, r.lastLine().isEmpty() ? (r.code == 0 ? "完成" : "失败 (" + r.code + ")") : r.lastLine());

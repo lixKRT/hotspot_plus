@@ -438,6 +438,55 @@ lease_validate_line() { # mac ip name -> normalized line or error
     _nm=$(echo "$3" | tr -d '"$`\\\t\r' | cut -c1-64)
     echo "$(lc "$1") $2${_nm:+ $_nm}"
 }
+lease_import_file() { # path -> replace leases from canonical "MAC IP [备注]" lines
+    _src=$1
+    [ -f "$_src" ] || { echo "导入文件不存在: $_src"; return 1; }
+    _out=$LEASES.new
+    : > "$_out"
+    _err=$(awk '
+        /^[[:space:]]*$/ { next }
+        /^#/ { next }
+        {
+            if (NF < 2 || NF > 3) { print "ERR 每行需为 MAC IP [备注]"; exit 1 }
+            if ($1 !~ /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/) { print "ERR 无效 MAC: " $1; exit 1 }
+            if ($2 !~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) { print "ERR 无效 IP: " $2; exit 1 }
+            if ($3 ~ /["$`\\\t\r]/) { print "ERR 无效备注"; exit 1 }
+            if (seen[$1]++) { print "ERR MAC 重复: " $1; exit 1 }
+            print tolower($1) " " $2 ($3 == "" ? "" : " " $3)
+        }' "$_src" > "$_out")
+    _rc=$?
+    if [ "$_rc" -ne 0 ] || [ -n "$_err" ]; then
+        rm -f "$_out"
+        echo "${_err:-导入失败}"
+        return 1
+    fi
+    { echo "# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)"; cat "$_out"; } > "$LEASES.tmp" \
+        && mv -f "$LEASES.tmp" "$LEASES"
+    rm -f "$_out"
+    log "leases imported from file: $(grep -vc '^#' "$LEASES") entries"
+    echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约"
+}
+lease_stage_stdin() { # write canonical stdin to fixed import path; do not replace leases yet
+    _dst=$1
+    _src=$(mktemp 2>/dev/null || echo "$DATA/stage.$$")
+    [ "$_dst" = "$LEASE_IMPORT" ] || { echo "无效导入暂存路径"; return 1; }
+    cat > "$_src" || { rm -f "$_src"; echo "读取暂存数据失败"; return 1; }
+    _err=$(awk '
+        /^[[:space:]]*$/ { next }
+        /^#/ { next }
+        {
+            if (NF < 2 || NF > 3) { print "ERR 每行需为 MAC IP [备注]"; exit 1 }
+            if ($1 !~ /^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/) { print "ERR 无效 MAC: " $1; exit 1 }
+            if ($2 !~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) { print "ERR 无效 IP: " $2; exit 1 }
+            if ($3 ~ /["$`\\\t\r]/) { print "ERR 无效备注"; exit 1 }
+            if (seen[tolower($1)]++) { print "ERR MAC 重复: " $1; exit 1 }
+        }' "$_src")
+    if [ -n "$_err" ]; then rm -f "$_src"; echo "$_err"; return 1; fi
+    _n=$(grep -vcE '^[[:space:]]*(#|$)' "$_src" 2>/dev/null || true)
+    [ "$_n" -gt 0 ] || { rm -f "$_src"; echo "未提供静态租约"; return 1; }
+    mv -f "$_src" "$_dst" || { rm -f "$_src"; echo "写入暂存文件失败"; return 1; }
+    echo "已暂存 $_n 条静态租约"
+}
 do_lease() {
     _sub=$1; shift
     case "$_sub" in
@@ -474,7 +523,11 @@ do_lease() {
             rm -f "$_out"
             log "leases imported: $(grep -vc '^#' "$LEASES") entries"
             echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约" ;;
-        *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64"; return 1 ;;
+        import-file)
+            lease_import_file "$1" ;;
+        stage)
+            lease_stage_stdin "$1" ;;
+        *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64|import-file PATH|stage PATH"; return 1 ;;
     esac
 }
 

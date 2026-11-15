@@ -38,7 +38,7 @@ public final class HspTileService extends TileService {
     }
 
     private void refresh() {
-        App.shell().execArgv(java.util.Arrays.asList("sh", App.HSP, "status", "--json"), r -> {
+        App.shell().execArgv(java.util.Arrays.asList(App.HSP, "status", "--json"), r -> {
             int st;
             String sub;
             if (r.code == RootShell.EACCES) {

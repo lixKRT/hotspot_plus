@@ -143,6 +143,7 @@ details summary{cursor:pointer;color:var(--sub)}
 <script>
 'use strict';
 const HSP = '/data/adb/modules/hotspot_plus/bin/hsp';
+const LEASE_IMPORT = '/data/adb/modules/hotspot_plus/webroot/lease-import.conf';
 const $ = (id) => document.getElementById(id);
 const hasKsu = !!(window.ksu && typeof window.ksu.exec === 'function');
 if (!hasKsu) $('banner').style.display = 'block';
@@ -162,7 +163,7 @@ function exec(cmd, timeoutMs) {
     try { ksu.exec(cmd, '{}', name); } catch (e) { done = true; clearTimeout(timer); delete window[name]; resolve({ errno: -1, stdout: '', stderr: String(e) }); }
   });
 }
-const hsp = (args, t) => exec(`sh ${HSP} ${args}`, t); // fixed argv only; the shell handles the operation lock
+const hsp = (args, t) => exec(`${HSP} ${args}`, t); // fixed argv only
 function toast(msg) {
   msg = String(msg || '').trim(); if (!msg) return;
   try { if (hasKsu && ksu.toast) { ksu.toast(msg); return; } } catch (e) {}
@@ -382,7 +383,7 @@ $('btnSaveLeases').onclick = async () => {
   if (!ok) { toast('MAC/IP 格式错误或重复（已标红）'); return; }
   lines.sort();
   await runOp('保存静态绑定', async (call) => {
-    const r = await call('lease import ' + b64utf8(lines.join('\n') + '\n'), 15000);
+    const r = await call('lease stage ' + LEASE_IMPORT + ' import=' + b64utf8(lines.join('\n') + '\n'), 15000);
     if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
     toast(lastLine(r));
     const a = await call('apply', 300000);

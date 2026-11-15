@@ -101,7 +101,16 @@ public final class RootShell {
         pool.execute(() -> cb.onResult(doArgv(argv)));
     }
 
+    /** Run fixed argv with body input; bytes are framed separately, never parsed as shell. */
+    public void execArgv(List<String> argv, String stdinText, Callback cb) {
+        pool.execute(() -> cb.onResult(doArgv(argv, stdinText)));
+    }
+
     private Result doArgv(List<String> argv) {
+        return doArgv(argv, null);
+    }
+
+    private Result doArgv(List<String> argv, String stdinText) {
         if (argv == null || argv.isEmpty()) return new Result(126, "", "empty argv", false);
         for (String arg : argv) {
             if (arg == null || unsafeArg(arg)) {
@@ -126,7 +135,7 @@ public final class RootShell {
             }
             denied = false;
             try {
-                return s.runArgv(line, 0);
+                return s.runArgv(line, stdinText, 0);
             } catch (WriteFailed e) {
                 s.close();
                 local.remove();
@@ -149,7 +158,9 @@ public final class RootShell {
     static boolean unsafeArg(String s) {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
-            if (c < 0x20 || c == 0x7f || ";|&`$<>()\\\"'".indexOf(c) >= 0) return true;
+            if (c < 0x20 || c == 0x7f || c == 0x3b || c == 0x7c || c == 0x26 || c == 0x60
+                    || c == 0x24 || c == 0x3c || c == 0x3e || c == 0x28 || c == 0x29
+                    || c == 0x22 || c == 0x27) return true;
         }
         return false;
     }
@@ -167,6 +178,15 @@ public final class RootShell {
     /** Frame a single-quoted argv command without eval. */
     static String frameArgv(String argvLine, String marker) {
         return "( " + argvLine + "\n) </dev/null\n"
+                + "__hsp_rc=$?; printf '\\n%s %d\\n' " + marker + " \"$__hsp_rc\"; printf '\\n%s\\n' "
+                + marker + " >&2\n";
+    }
+
+    /** Frame argv whose stdin is supplied by a here-document, never by shell interpolation. */
+    static String frameArgvWithStdin(String argvLine, String body, String marker) {
+        String end = "__HSP_IN_" + marker;
+        return "( " + argvLine + " <<'" + end + "'\n" + body
+                + (body.endsWith("\n") ? "" : "\n") + end + "\n) </dev/null\n"
                 + "__hsp_rc=$?; printf '\\n%s %d\\n' " + marker + " \"$__hsp_rc\"; printf '\\n%s\\n' "
                 + marker + " >&2\n";
     }
@@ -250,7 +270,7 @@ public final class RootShell {
             errQ = new LineQueue(p.getErrorStream(), "su-err");
             Result r;
             try {
-                r = runArgv("id", 60000);
+                r = runArgv("id", null, 60000);
             } catch (IOException e) {
                 close();
                 throw new DeniedException("su 已退出 (" + e.getMessage() + ")");
@@ -270,11 +290,14 @@ public final class RootShell {
             }
         }
 
-        Result runArgv(String argvLine, long timeoutMs) throws IOException {
+        Result runArgv(String argvLine, String stdinText, long timeoutMs) throws IOException {
             String marker = "__HSP_END_" + UUID.randomUUID().toString().replace("-", "");
             if (!alive()) throw new WriteFailed("shell not running");
             try {
-                stdin.write(frameArgv(argvLine, marker).getBytes(StandardCharsets.UTF_8));
+                String payload = stdinText == null
+                        ? frameArgv(argvLine, marker)
+                        : frameArgvWithStdin(argvLine, stdinText, marker);
+                stdin.write(payload.getBytes(StandardCharsets.UTF_8));
                 stdin.flush();
             } catch (IOException e) {
                 throw new WriteFailed(e.getMessage());
