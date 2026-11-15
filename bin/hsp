@@ -618,6 +618,8 @@ do_lease() {
             _staging=$RUN/leases.import.$$
             : > "$_staging"
             _lineno=0
+            _nl='
+'
             while IFS= read -r _l || [ -n "$_l" ]; do
                 _lineno=$((_lineno + 1))
                 _l=$(printf '%s' "$_l" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
@@ -629,7 +631,7 @@ do_lease() {
                 _vl=$(lease_validate_line "$_lm" "$_li" "$_lr") || { rm -f "$_staging"; echo "第 $_lineno 行: $_vl"; return 1; }
                 echo "$_vl" >> "$_staging"
             done <<EOF
-$_txt
+$_txt$_nl
 EOF
             if [ ! -s "$_staging" ]; then
                 rm -f "$_staging"
