@@ -29,7 +29,7 @@ import os, sys, zipfile
 root, out, include_app = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 files = ["README.md", "action.sh", "bin/hsctl.jar", "bin/hsp", "bin/hspd",
          "customize.sh", "defaults/config.conf", "defaults/leases.conf", "diag.sh",
-         "lib/common.sh", "module.prop", "sepolicy.rule", "service.sh", "uninstall.sh",
+         "lib/common.sh", "lib/backup.sh", "module.prop", "sepolicy.rule", "service.sh", "uninstall.sh",
          "webroot/index.html"]
 for base, _, names in os.walk(os.path.join(root, "META-INF")):
     for name in names:
