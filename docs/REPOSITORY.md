@@ -10,6 +10,9 @@
 
 - `origin`——工作仓库。
 - `upstream`——原始仓库，仅用于核对来源。
+- `branch.main.remote=origin`；`gh repo set-default` 指向 `lixKRT/hotspot_plus`。
+
+以后不显式指定仓库时，`git push`、`gh issue` 和 `gh repo view` 都应落到工作仓库，而不是上游。新增远程时不要把 `upstream` 放在 `origin` 之前，也不要让 `branch.main.remote` 指向上游。
 
 ## 首次推送顺序
 
