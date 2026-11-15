@@ -68,7 +68,8 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     for name in sorted(files):
         with open(os.path.join(root, name), "rb") as f:
             data = f.read()
-        if name != "bin/hsctl.jar" and b"\r\n" in data:
+        binary = name == "bin/hsctl.jar" or name.endswith(".apk")
+        if not binary and b"\r\n" in data:
             sys.exit("error: CRLF in packaged file: " + name)
         z.writestr(name, data)
 
