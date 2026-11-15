@@ -33,10 +33,12 @@ public final class MainActivity extends Activity {
     private WebView web;
     private FrameLayout root;
     private boolean night;
-    private boolean trustedDocument;
-    private String trustedUrl;
-    private boolean bridgesInstalled;
+    private final BridgeLifecycle bridge = new BridgeLifecycle();
     private String localHtml;
+
+    private boolean trustedDocument() {
+        return bridge.trusted();
+    }
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     @Override
@@ -106,24 +108,27 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                trustedDocument = WebPolicy.classifyDocument(url);
-                trustedUrl = trustedDocument ? url : null;
-                if (!trustedDocument || bridgesInstalled) {
+                BridgeLifecycle.Action action = bridge.pageStarted(url);
+                if (action == BridgeLifecycle.Action.REMOVE) {
                     web.removeJavascriptInterface("ksu");
                     web.removeJavascriptInterface("hspApp");
-                    bridgesInstalled = false;
                 }
-                installBridgesIfCurrent(url);
             }
 
             @Override
             public void onPageCommitVisible(WebView view, String url) {
-                installBridgesIfCurrent(url);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
-                installBridgesIfCurrent(url);
+                if (!bridge.accepting(url)) {
+                    if (bridge.navigating(url) == BridgeLifecycle.Action.REMOVE) {
+                        web.removeJavascriptInterface("ksu");
+                        web.removeJavascriptInterface("hspApp");
+                    }
+                } else if (bridge.needsInstall()) {
+                    installBridges();
+                }
             }
 
             @Override
@@ -149,12 +154,10 @@ public final class MainActivity extends Activity {
     private void showHtml(String html) {
         localHtml = html;
         App.ui(() -> {
-            trustedDocument = false;
-            trustedUrl = null;
-            web.removeJavascriptInterface("ksu");
-            web.removeJavascriptInterface("hspApp");
-            bridgesInstalled = false;
-            installBridges();
+            if (bridge.loadingDocument(BASE_URL) == BridgeLifecycle.Action.REMOVE) {
+                web.removeJavascriptInterface("ksu");
+                web.removeJavascriptInterface("hspApp");
+            }
             web.loadUrl(BASE_URL);
         });
     }
@@ -196,13 +199,8 @@ public final class MainActivity extends Activity {
     private void installBridges() {
         web.addJavascriptInterface(new KsuBridge(), "ksu");
         web.addJavascriptInterface(new AppBridge(), "hspApp");
-        bridgesInstalled = true;
-    }
-
-    private void installBridgesIfCurrent(String url) {
-        if (trustedDocument && url != null && url.equals(trustedUrl) && !bridgesInstalled) {
-            installBridges();
-        }
+        bridge.markInstalled();
+        web.evaluateJavascript("window.hspBridgeReady&&window.hspBridgeReady()", null);
     }
 
     private String page(String title, String msg, boolean retry) {
@@ -224,7 +222,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         if (web != null) {
-            web.removeJavascriptInterface("ksu");
+            if (bridge.destroy() == BridgeLifecycle.Action.REMOVE) {
+                web.removeJavascriptInterface("ksu");
+                web.removeJavascriptInterface("hspApp");
+            }
             web.destroy();
         }
         super.onDestroy();
@@ -248,12 +249,12 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void exec(String cmd, String options, String callback) {
             if (!RootShell.validCallbackName(callback)) return;
-            final boolean trusted = trustedDocument;
+            final boolean trusted = trustedDocument();
             if (!trusted) return;
             List<String> argv = CommandPolicy.parse(cmd);
             if (argv == null) {
                 App.ui(() -> {
-                    if (trustedDocument) {
+                    if (trustedDocument()) {
                         web.evaluateJavascript(RootShell.callbackJs(callback,
                                 new RootShell.Result(126, "", "命令不在 hsp 允许的固定接口内。", false)), null);
                     }
@@ -272,7 +273,7 @@ public final class MainActivity extends Activity {
             String content = CommandPolicy.decodeImport(payload);
             if (content == null) {
                 App.ui(() -> {
-                    if (trustedDocument) {
+                    if (trustedDocument()) {
                         web.evaluateJavascript(RootShell.callbackJs(callback,
                                 new RootShell.Result(126, "", "静态租约导入数据无效。", false)), null);
                     }
@@ -292,7 +293,7 @@ public final class MainActivity extends Activity {
 
         private void finish(String callback, boolean trusted, RootShell.Result r) {
             App.ui(() -> {
-                if (trustedDocument && trusted == trustedDocument) {
+                if (trustedDocument() && trusted == trustedDocument()) {
                     web.evaluateJavascript(RootShell.callbackJs(callback, r), null);
                 }
             });
@@ -302,7 +303,7 @@ public final class MainActivity extends Activity {
             App.shell().execArgv(argv, r -> {
                 final String js = RootShell.callbackJs(callback, r);
                 App.ui(() -> {
-                    if (!isDestroyed() && trustedDocument && trusted == trustedDocument) {
+                    if (!isDestroyed() && trustedDocument() && trusted == trustedDocument()) {
                         web.evaluateJavascript(js, null);
                     }
                 });
@@ -331,6 +332,12 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public String moduleInfo() {
             return "{\"id\":\"hotspot_plus\",\"moduleDir\":\"" + App.MODDIR + "\",\"host\":\"hotspot_plus_app\"}";
+        }
+
+        /** Probe for the WebUI: a live bridge answers; a stale/unbound one throws. */
+        @JavascriptInterface
+        public String ping() {
+            return "ok";
         }
     }
 

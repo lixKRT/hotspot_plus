@@ -15,3 +15,5 @@ docs/device-evidence.txt
 docs/legacy-hotspotboot-package.txt
 # design canvas for GitHub issues lives outside the published tree
 .scratch/
+# local throwaway diagnosis harnesses
+.debug/

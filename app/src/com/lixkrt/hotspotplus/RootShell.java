@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -19,10 +20,16 @@ import java.util.concurrent.TimeUnit;
  * Each pool thread owns one long-lived su process; commands are framed with a random marker so
  * stdout/stderr/exit code are recovered exactly. Several shells exist so a long operation
  * (e.g. "hsp on", up to ~1 min) never blocks the UI's status polling.
+ *
+ * Persistent shell output is line oriented but not necessarily newline-normalised: Android root
+ * shells (Magisk / su) often use CRLF. Markers are therefore matched after trimming trailing CR,
+ * and both streams are drained concurrently so a full pipe cannot deadlock the reader.
  */
 public final class RootShell {
 
     public static final int EACCES = 13;
+    /** Upper bound for a bridge command; operations such as hotspot start may take ~1 minute. */
+    static final long COMMAND_TIMEOUT_MS = 95000;
     public static final String DENIED_MSG =
             "未获得 root 权限：请打开 Magisk 应用 →「超级用户」，找到「热点增强」并允许 root，然后回到本应用点「重试」。";
 
@@ -98,16 +105,19 @@ public final class RootShell {
      * introduce shell syntax or command substitution.
      */
     public void execArgv(List<String> argv, Callback cb) {
-        pool.execute(() -> cb.onResult(doArgv(argv)));
+        execute(argv, null, cb);
     }
 
     /** Run fixed argv with body input; bytes are framed separately, never parsed as shell. */
     public void execArgv(List<String> argv, String stdinText, Callback cb) {
-        pool.execute(() -> cb.onResult(doArgv(argv, stdinText)));
+        execute(argv, stdinText, cb);
     }
 
-    private Result doArgv(List<String> argv) {
-        return doArgv(argv, null);
+    private void execute(List<String> argv, String stdinText, Callback cb) {
+        pool.execute(() -> {
+            Result r = doArgv(argv, stdinText);
+            cb.onResult(r);
+        });
     }
 
     private Result doArgv(List<String> argv, String stdinText) {
@@ -135,7 +145,7 @@ public final class RootShell {
             }
             denied = false;
             try {
-                return s.runArgv(line, stdinText, 0);
+                return s.runArgv(line, stdinText, COMMAND_TIMEOUT_MS);
             } catch (WriteFailed e) {
                 s.close();
                 local.remove();
@@ -201,6 +211,11 @@ public final class RootShell {
         return b.toString();
     }
 
+    /** Root shells may terminate lines with CRLF; markers are matched on the CR-free line. */
+    static String markerLine(String line) {
+        return line.endsWith("\r") ? line.substring(0, line.length() - 1) : line;
+    }
+
     /** Reads a stream into '\n'-separated lines (keeps '\r'), UTF-8. */
     static final class LineQueue implements Runnable {
         static final String EOF = new String("\u0000EOF");
@@ -250,6 +265,18 @@ public final class RootShell {
             }
             return s;
         }
+
+        /** Non-blocking poll (or bounded poll); null means the stream has no complete line yet. */
+        String poll(long timeoutMs) {
+            if (timeoutMs <= 0) return q.poll();
+            try {
+                return q.poll(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return EOF;
+            }
+        }
+
     }
 
     final class Shell {
@@ -257,6 +284,7 @@ public final class RootShell {
         final OutputStream stdin;
         final LineQueue outQ;
         final LineQueue errQ;
+        private final AtomicInteger epoch = new AtomicInteger();
 
         Shell() throws IOException {
             try {
@@ -305,28 +333,131 @@ public final class RootShell {
             return readResult(marker, timeoutMs);
         }
 
+        /**
+         * Read stdout and stderr concurrently until both markers arrive. Markers are unique per
+         * command and matched after removing a trailing CR: root shells may translate newlines.
+         * The overall wait is bounded; timeout is reported unambiguously as a stream stall.
+         */
         private Result readResult(String marker, long timeoutMs) throws IOException {
-            List<String> out = new ArrayList<>();
-            int code;
-            while (true) {
-                String l = outQ.take(timeoutMs);
-                if (l.startsWith(marker + " ")) {
-                    try {
-                        code = Integer.parseInt(l.substring(marker.length() + 1).trim());
-                    } catch (NumberFormatException e) {
-                        code = 1;
+            final int current = epoch.incrementAndGet();
+            final ReadSide out = new ReadSide(outQ, true);
+            final ReadSide err = new ReadSide(errQ, false);
+            Thread outReader = new Thread(() -> readSide(out, marker, current), "rootshell-read-out");
+            Thread errReader = new Thread(() -> readSide(err, marker, current), "rootshell-read-err");
+            outReader.setDaemon(true);
+            errReader.setDaemon(true);
+            outReader.start();
+            errReader.start();
+            long deadline = timeoutMs > 0 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs) : 0;
+            synchronized (this) {
+                boolean interrupted = false;
+                while (!(out.done && err.done)) {
+                    if (deadline != 0) {
+                        long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                        if (left <= 0) break;
+                        try {
+                            wait(left);
+                        } catch (InterruptedException e) {
+                            interrupted = true;
+                            break;
+                        }
+                    } else {
+                        try {
+                            wait();
+                        } catch (InterruptedException e) {
+                            interrupted = true;
+                            break;
+                        }
                     }
-                    break;
                 }
-                out.add(l);
+                if (interrupted) {
+                    retire(current);
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted");
+                }
+                if (!(out.done && err.done)) {
+                    retire(current);
+                    String missing = !out.done ? (!err.done ? "stdout+stderr" : "stdout") : "stderr";
+                    throw new IOException("timeout waiting for " + missing + " marker");
+                }
+                if (out.exited || err.exited) {
+                    retire(current);
+                    throw new IOException("shell exited while reading");
+                }
+                return new Result(out.code, join(out.lines), join(err.lines), false);
             }
-            List<String> err = new ArrayList<>();
-            while (true) {
-                String l = errQ.take(timeoutMs > 0 ? timeoutMs : 0);
-                if (l.equals(marker)) break;
-                err.add(l);
+        }
+
+        /** Invalidate any reader still parked on this run so it cannot eat the next command. */
+        private void retire(int current) {
+            epoch.compareAndSet(current, current + 1);
+        }
+
+        private void readSide(ReadSide side, String marker, int runEpoch) {
+            try {
+                while (true) {
+                    if (runEpoch != epoch.get()) {
+                        side.exited = true;
+                        return;
+                    }
+                    String raw = side.queue.poll(100);
+                    if (runEpoch != epoch.get()) {
+                        side.exited = true;
+                        return;
+                    }
+                    if (raw != null) {
+                        processLine(side, marker, raw);
+                        if (side.done) return;
+                    } else if (!alive()) {
+                        side.exited = true;
+                        return;
+                    }
+                }
+            } finally {
+                synchronized (Shell.this) {
+                    side.done = true;
+                    Shell.this.notifyAll();
+                }
             }
-            return new Result(code, join(out), join(err), false);
+        }
+
+        private void processLine(ReadSide side, String marker, String raw) {
+            if (raw == LineQueue.EOF) {
+                side.exited = true;
+                side.done = true;
+                return;
+            }
+            String line = markerLine(raw);
+            if (side.isStdout) {
+                if (line.startsWith(marker + " ")) {
+                    try {
+                        side.code = Integer.parseInt(line.substring(marker.length() + 1).trim());
+                    } catch (NumberFormatException e) {
+                        side.code = 1;
+                    }
+                    side.done = true;
+                } else {
+                    side.lines.add(raw);
+                }
+            } else if (line.equals(marker)) {
+                side.done = true;
+            } else {
+                side.lines.add(raw);
+            }
+        }
+
+        private final class ReadSide {
+            final LineQueue queue;
+            final boolean isStdout;
+            final List<String> lines = new ArrayList<>();
+            volatile boolean done;
+            volatile boolean exited;
+            volatile int code;
+
+            ReadSide(LineQueue queue, boolean isStdout) {
+                this.queue = queue;
+                this.isStdout = isStdout;
+            }
         }
 
         void close() {

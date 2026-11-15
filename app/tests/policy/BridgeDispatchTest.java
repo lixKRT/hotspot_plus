@@ -20,6 +20,15 @@ public final class BridgeDispatchTest {
         check("bridge uses argv dispatch", main.contains("execArgv("));
         check("executor has eval guard", root.contains("unsafeArg(") && root.contains("argvLine("));
         check("executor uses single quotes", root.contains("sq(arg)"));
+        int finish = main.indexOf("bridge.needsInstall()");
+        int install = main.indexOf("installBridges();", finish);
+        check("bridge installs after finished trusted page", finish >= 0 && install > finish);
+        check("load path never installs early", !main.contains("loadingDocument(BASE_URL) == BridgeLifecycle.Action.INSTALL"));
+        check("page callbacks never install bridges", !main.contains("installBridgesIfCurrent"));
+        String html = new String(Files.readAllBytes(Paths.get("webroot/index.html")), StandardCharsets.UTF_8);
+        check("webui probes bridge", html.contains("hspApp.ping()"));
+        check("webui reload is bounded", html.contains("bridgeReloads >= 2"));
+        check("webui timeout recovers bridge", html.contains("recoverBridge()"));
 
         List<String> argv = CommandPolicy.parse(CommandPolicy.CLI + " lease import " + b64(
                 "aa:bb:cc:dd:ee:ff 192.168.42.10 phone\n"));

@@ -157,17 +157,50 @@ details summary{cursor:pointer;color:var(--sub)}
 const HSP = '/data/adb/modules/hotspot_plus/bin/hsp';
 const LEASE_IMPORT = '/data/adb/modules/hotspot_plus/webroot/lease-import.conf';
 const $ = (id) => document.getElementById(id);
-const hasKsu = !!(window.ksu && typeof window.ksu.exec === 'function');
+let hasKsu = !!(window.ksu && typeof window.ksu.exec === 'function');
 if (!hasKsu) $('banner').style.display = 'block';
+const bridgeReady = new Promise((resolve) => {
+  if (hasKsu) { resolve(true); return; }
+  let waited = 0;
+  const timer = setInterval(() => {
+    if (bridgeProbe()) { clearInterval(timer); resolve(true); return; }
+    if ((waited += 50) >= 3000) { clearInterval(timer); resolve(false); }
+  }, 50);
+});
+function bridgeProbe() {
+  if (window.ksu && typeof window.ksu.exec === 'function') {
+    hasKsu = true; $('banner').style.display = 'none'; return true;
+  }
+  return false;
+}
+window.hspBridgeReady = () => { if (bridgeProbe()) refreshStatus(); };
+let bridgeReloads = +(sessionStorage.getItem('hsp_bridge_reloads') || 0);
+function bridgeAlive() {
+  try { return !!(window.hspApp && window.hspApp.ping() === 'ok'); } catch (e) { return false; }
+}
+function recoverBridge() {
+  if (bridgeReloads >= 2) return false;
+  bridgeReloads++;
+  sessionStorage.setItem('hsp_bridge_reloads', String(bridgeReloads));
+  setTimeout(() => location.reload(), 50);
+  return true;
+}
 
 // ---- KernelSU exec wrapper (same protocol as the `kernelsu` npm package) ----
 let cbSeq = 0;
 function exec(cmd, timeoutMs) {
   return new Promise((resolve) => {
-    if (!hasKsu) { resolve({ errno: -1, stdout: '', stderr: 'no ksu' }); return; }
+    if (!hasKsu) {
+      resolve({ errno: -1, stdout: '', stderr: 'no ksu' });
+      return;
+    }
     const name = `hsp_cb_${Date.now()}_${cbSeq++}`;
     let done = false;
-    const timer = setTimeout(() => { if (!done) { done = true; delete window[name]; resolve({ errno: -2, stdout: '', stderr: 'timeout' }); } }, timeoutMs || 90000);
+    const timer = setTimeout(() => {
+      if (done) return; done = true; delete window[name];
+      const recovering = recoverBridge();
+      resolve({ errno: -2, stdout: '', stderr: recovering ? 'root 桥已失效，正在重新加载界面' : 'timeout' });
+    }, timeoutMs || 90000);
     window[name] = (errno, stdout, stderr) => {
       if (done) return; done = true; clearTimeout(timer); delete window[name];
       resolve({ errno, stdout: stdout || '', stderr: stderr || '' });
@@ -228,6 +261,7 @@ async function refreshStatus() {
   const r = await hsp('status --json', 25000);
   const s = parseJson(r.stdout);
   if (!s) { $('apText').textContent = '状态读取失败'; $('apSub').textContent = (r.stderr || r.stdout).slice(0, 200); return; }
+  if (bridgeReloads) { bridgeReloads = 0; sessionStorage.removeItem('hsp_bridge_reloads'); }
   lastStatus = s;
   $('ver').textContent = s.version || '';
   if (!busy) $('apSwitch').checked = !!s.ap;
@@ -490,6 +524,7 @@ $('btnRestoreDismiss').onclick = async () => {
 
 // ---- init ----
 (async () => {
+  if (!(await bridgeReady) && !recoverBridge()) $('apSub').textContent = 'root 桥不可用';
   await refreshStatus();
   await loadConfig();
   checkRestorePrompt();
