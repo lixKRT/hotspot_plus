@@ -60,7 +60,7 @@ details summary{cursor:pointer;color:var(--sub)}
 </head>
 <body>
 <h1>热点增强 <span class="sub" id="ver"></span></h1>
-<div id="banner">未检测到 KernelSU WebUI 环境（window.ksu 不存在），页面仅供预览。</div>
+<div id="banner">薄壳桥不可用：当前页面没有可信的 root 执行通道，操作已禁用。</div>
 
 <!-- 状态 / 开关 -->
 <div class="card">
@@ -144,7 +144,7 @@ details summary{cursor:pointer;color:var(--sub)}
 'use strict';
 const HSP = '/data/adb/modules/hotspot_plus/bin/hsp';
 const $ = (id) => document.getElementById(id);
-const hasKsu = typeof window.ksu !== 'undefined' && window.ksu && typeof window.ksu.exec === 'function';
+const hasKsu = !!(window.ksu && typeof window.ksu.exec === 'function');
 if (!hasKsu) $('banner').style.display = 'block';
 
 // ---- KernelSU exec wrapper (same protocol as the `kernelsu` npm package) ----

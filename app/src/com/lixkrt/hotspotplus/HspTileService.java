@@ -1,4 +1,4 @@
-package com.hsp.hotspotplus;
+package com.lixkrt.hotspotplus;
 
 import android.app.PendingIntent;
 import android.content.ComponentName;

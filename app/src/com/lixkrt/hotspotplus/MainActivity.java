@@ -1,4 +1,4 @@
-package com.hsp.hotspotplus;
+package com.lixkrt.hotspotplus;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
@@ -12,7 +12,9 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -20,9 +22,6 @@ import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -32,10 +31,12 @@ import java.util.Map;
  * read through su) and provides a KernelSU-compatible `window.ksu` bridge backed by persistent root shells.
  */
 public final class MainActivity extends Activity {
-    static final String BASE_URL = "https://hotspot-plus.local/";
+    static final String BASE_URL = WebPolicy.LOCAL_ORIGIN;
     private WebView web;
     private FrameLayout root;
     private boolean night;
+    private boolean trustedDocument;
+    private boolean bridgesInstalled;
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     @Override
@@ -78,62 +79,109 @@ public final class MainActivity extends Activity {
         s.setDomStorageEnabled(true);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
+        s.setAllowFileAccessFromFileURLs(false);
+        s.setAllowUniversalAccessFromFileURLs(false);
+        s.setBlockNetworkLoads(true);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        s.setCacheMode(WebSettings.LOAD_NO_CACHE);
         s.setSupportZoom(false);
         if (android.os.Build.VERSION.SDK_INT >= 33) s.setAlgorithmicDarkeningAllowed(false);
-        web.setWebChromeClient(new WebChromeClient());
-        web.setWebViewClient(new WebViewClient() {
+        web.setWebChromeClient(new WebChromeClient() {
             @Override
-            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest req) {
-                Uri u = req.getUrl();
-                if (u != null && ("http".equals(u.getScheme()) || "https".equals(u.getScheme()))
-                        && !BASE_URL.startsWith(u.getScheme() + "://" + u.getHost())) {
-                    try {
-                        startActivity(new Intent(Intent.ACTION_VIEW, u));
-                    } catch (Exception ignored) {
-                    }
-                }
-                return true;
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture,
+                                          android.os.Message resultMsg) {
+                return false;
             }
         });
-        web.addJavascriptInterface(new KsuBridge(), "ksu");
-        web.addJavascriptInterface(new AppBridge(), "hspApp");
+        web.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                return handleNavigation(url == null ? null : Uri.parse(url));
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest req) {
+                return handleNavigation(req.getUrl());
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                trustedDocument = WebPolicy.classifyDocument(url);
+                if (!trustedDocument || bridgesInstalled) {
+                    web.removeJavascriptInterface("ksu");
+                    web.removeJavascriptInterface("hspApp");
+                    bridgesInstalled = false;
+                }
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (trustedDocument && WebPolicy.classifyDocument(url) && !bridgesInstalled) {
+                    installBridges();
+                }
+            }
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                Uri u = request.getUrl();
+                if (u == null || !WebPolicy.subresource(u.toString())) {
+                    return new WebResourceResponse("text/plain", "utf-8", null);
+                }
+                return null;
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                if (request.isForMainFrame()) {
+                    showHtml(page("界面加载失败", "本地界面未能加载，root 桥已关闭。", true));
+                }
+            }
+        });
         load();
     }
 
     private void showHtml(String html) {
-        App.ui(() -> web.loadDataWithBaseURL(BASE_URL, html, "text/html", "utf-8", null));
+        App.ui(() -> {
+            trustedDocument = false;
+            web.removeJavascriptInterface("ksu");
+            web.removeJavascriptInterface("hspApp");
+            bridgesInstalled = false;
+            web.loadDataWithBaseURL(BASE_URL, html, "text/html", "utf-8", null);
+        });
     }
 
-    /** Read the module's index.html via su; fall back to the bundled copy. */
+    /** Read the module's index.html via su. Missing/disabled module pages get an explicit degraded page. */
     void load() {
         showHtml(page("正在获取 root 权限…", "", false));
-        App.shell().exec("cat " + App.MODDIR + "/webroot/index.html; [ -f " + App.MODDIR
-                + "/disable ] && echo '<!--hsp-module-disabled-->'", null, null, r -> {
+        App.shell().exec("test ! -f " + App.MODDIR + "/disable && cat " + App.MODDIR + "/webroot/index.html", null, null, r -> {
             if (r.code == RootShell.EACCES) {
                 showHtml(page("需要 root 权限", RootShell.DENIED_MSG, true));
                 return;
             }
             String html = r.out;
-            if (!html.contains("<html")) {
-                html = asset("index.html");
-                App.toast(this, "未找到模块 hotspot_plus，已使用 App 内置界面；请先在 KernelSU 中安装模块并重启");
-            } else if (html.contains("<!--hsp-module-disabled-->")) {
-                App.toast(this, "模块 hotspot_plus 已在 KernelSU 中被禁用");
+            if (r.code != 0 || !html.contains("<html")) {
+                showHtml(page("本地界面不可用", "未找到模块 hotspot_plus 的 WebUI，或模块已被禁用。请安装/启用模块并重启；不会加载远程页面或旧的内置副本。", true));
+                return;
             }
             showHtml(html);
         });
     }
 
-    private String asset(String name) {
-        try (InputStream in = getAssets().open(name)) {
-            ByteArrayOutputStream bo = new ByteArrayOutputStream();
-            byte[] b = new byte[16384];
-            int n;
-            while ((n = in.read(b)) > 0) bo.write(b, 0, n);
-            return new String(bo.toByteArray(), StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            return page("界面加载失败", String.valueOf(e), true);
+    private boolean handleNavigation(Uri u) {
+        WebPolicy.Nav nav = WebPolicy.navigation(u == null ? null : u.toString());
+        if (nav == WebPolicy.Nav.EXTERNAL) {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, u));
+            } catch (Exception ignored) {
+            }
         }
+        return nav != WebPolicy.Nav.ALLOW;
+    }
+
+    private void installBridges() {
+        web.addJavascriptInterface(new KsuBridge(), "ksu");
+        web.addJavascriptInterface(new AppBridge(), "hspApp");
+        bridgesInstalled = true;
     }
 
     private String page(String title, String msg, boolean retry) {
@@ -144,7 +192,8 @@ public final class MainActivity extends Activity {
                 + ".c{background:" + card + ";border-radius:16px;padding:20px}h2{margin:0 0 10px;font-size:19px}p{color:" + sub + "}"
                 + "button{border:none;border-radius:10px;padding:10px 18px;font-size:15px;background:#2563eb;color:#fff}</style></head>"
                 + "<body><div class='c'><h2>" + esc(title) + "</h2><p>" + esc(msg) + "</p>"
-                + (retry ? "<button onclick='hspApp.retry()'>重试</button>" : "") + "</div></body></html>";
+                + (retry ? "<button id='retry'>重试</button><script>document.getElementById('retry').onclick=function(){location.replace('"
+                + BASE_URL + "')}</script>" : "") + "</div></body></html>";
     }
 
     private static String esc(String s) {
@@ -178,6 +227,17 @@ public final class MainActivity extends Activity {
         @JavascriptInterface
         public void exec(String cmd, String options, String callback) {
             if (!RootShell.validCallbackName(callback)) return;
+            final boolean trusted = trustedDocument;
+            if (!trusted) return;
+            if (!CommandPolicy.allowed(cmd, true)) {
+                App.ui(() -> {
+                    if (trustedDocument) {
+                        web.evaluateJavascript(RootShell.callbackJs(callback,
+                                new RootShell.Result(126, "", "命令不在 hsp 固定接口内", false)), null);
+                    }
+                });
+                return;
+            }
             String cwd = null;
             Map<String, String> env = null;
             try {
@@ -198,7 +258,9 @@ public final class MainActivity extends Activity {
             App.shell().exec(cmd == null ? "" : cmd, cwd, env, r -> {
                 final String js = RootShell.callbackJs(callback, r);
                 App.ui(() -> {
-                    if (!isDestroyed()) web.evaluateJavascript(js, null);
+                    if (!isDestroyed() && trustedDocument && trusted == trustedDocument) {
+                        web.evaluateJavascript(js, null);
+                    }
                 });
             });
         }

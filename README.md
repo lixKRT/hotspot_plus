@@ -32,12 +32,14 @@
 
 - **默认网段改为 192.168.4.0/24**：网关 192.168.4.1，地址池 192.168.4.100–192.168.4.200，系统 DhcpServer 的占位客户端地址是 192.168.4.254（按配置自动计算）。v0.3.0 已改回本机现有的 192.168.42.0/24。
 - **升级时自动迁移**（`lib/migrate.sh`，由 customize.sh 调用）：只有当 `config.conf` 里仍是旧默认值（网关 192.168.43.1、前缀 24、地址池 .43.100–.43.200）时，才把网关和地址池改成 192.168.4.x，同时把 `leases.conf` 里的 192.168.43.N 改成 192.168.4.N（备注保持不变），并清空旧的 udhcpd 租约库。改之前会备份为 `*.v01.bak`，过程会写进 `hsp.log`（标记 `[migrate]`）。自定义过的网关或地址池一律不动。**v0.3.0 已移除该迁移和脚本。**
-- **桌面 App「热点增强」**（`com.hsp.hotspotplus`，安装模块时自动安装）：
-  - 界面就是模块的 WebUI。App 通过 su 读取 `/data/adb/modules/hotspot_plus/webroot/index.html`，所以界面只有一份；读不到时（比如模块没装）才用 App 里内置的副本。
+- **桌面 App「热点增强」**（`com.lixkrt.hotspotplus`，安装模块时自动安装）：
+  - 界面就是模块的 WebUI。App 通过 su 读取 `/data/adb/modules/hotspot_plus/webroot/index.html`，所以界面只有一份；读不到或模块被禁用时显示明确的降级页，不加载远程页面或旧的内置副本。
   - 提供和 KernelSU WebUI 一样的 `window.ksu` 接口（`exec(cmd, options, callback)`、`toast`、`fullScreen`、`moduleInfo`），底层是几条常驻的 root shell（`su` 进程），长操作不会卡住状态刷新。
+  - root 桥只注入到本地可信页面；导航、子资源和混合内容都限制在本地来源，外部链接交给系统浏览器。页面只能调用固定的 `hsp` 子命令。
   - 需要在 KernelSU 管理器 →「超级用户」里给「热点增强」授权 root；没授权时会显示中文提示和「重试」按钮。
   - **快捷设置磁贴「热点增强」**：显示热点开/关和地址，点一下执行 `hsp toggle`，长按打开 App。
-  - **桌面图标长按 → 「切换热点」** 快捷方式。
+  - **桌面图标长按 → 「切换热点」** 快捷方式；入口由 app-signature 级权限保护，普通应用无法触发。目标启动器不支持时移除快捷方式，不放宽权限。
+  - 上游 `com.hsp.hotspotplus` 是另一个包，安装新 App 后可能仍存在；安装器只报告共存，不会自动卸载。
   - 深色模式跟随系统；全面屏下状态栏、导航栏、刘海和键盘区域都已避开。
 - diag 里扫描进程和 op.lock 文件描述符的步骤改成一次性、带 10 秒超时（v0.1.1 会对每个 fd fork 一次进程，在手机上很慢，诊断文件被截断）。`hsp unstick` 和锁诊断也改用同样的快速扫描。
 
@@ -308,14 +310,17 @@ app/         启动器 App 源码与 APK（见下）
 ### App「热点增强」（`app/`）
 
 ```text
-app/AndroidManifest.xml   MainActivity（WebView）、HspTileService（磁贴）、ToggleActivity（长按快捷方式）
+app/AndroidManifest.xml   MainActivity（WebView）、HspTileService（磁贴）、ToggleActivity（签名权限保护）
 app/src/…/RootShell.java  常驻 su shell 池 + 输出分帧（纯 Java，可在电脑 JVM 上用 sh 测试）
-app/src/…/MainActivity.java  window.ksu 兼容桥、读取模块 webroot、未授权提示
+app/src/…/MainActivity.java  window.ksu 兼容桥、本地来源限制、读取模块 webroot
+app/src/…/WebPolicy.java     导航/子资源来源策略（离线单测）
+app/src/…/CommandPolicy.java WebUI 可调用的固定 hsp 命令面（离线单测）
+app/tests/run.sh           无需 Android SDK 的策略与清单检查
 app/res/                  图标（自适应图标 + 单色主题图标）、磁贴图标、日夜主题
 app/build.sh              不用 Gradle：aapt2 + javac + d8 + zipalign + apksigner
 app/hotspot_plus.apk      构建产物（customize.sh 会安装它）
 app/keystore/             签名密钥（不打进模块 zip）
 ```
 
-- 构建：Android SDK `platforms;android-36` + `build-tools;37.0.0`，JDK 17+；执行 `SDK=/opt/android-sdk sh app/build.sh`，然后把 `app/build/hotspot_plus.apk` 复制到 `app/hotspot_plus.apk`。minSdk 30，targetSdk 36，v3 签名。
-- **签名密钥**：签名密钥不在仓库里（`app/keystore/` 已被 `.gitignore` 排除）。自己编译时请在 `app/keystore/` 放入自己的 `hotspot_plus.jks`（别名 `hotspotplus`）和 `password.txt`；注意用不同密钥签名的 App 不能覆盖安装 Release 里的版本，需先卸载。
+- 构建：Android SDK `platforms;android-36` + `build-tools;36.0.0`，JDK 17+；执行 `SDK=/opt/android-sdk sh app/build.sh`。没有本机 keystore 时构建会停在 `app/build/unsigned.apk`；放入 `app/keystore/hotspot_plus.jks`（别名 `hotspotplus`）和 `password.txt` 后才会生成签名的 `app/build/hotspot_plus.apk`。minSdk 30，targetSdk 36，versionCode 300。
+- **签名密钥**：签名密钥不在仓库里（`app/keystore/` 已被 `.gitignore` 排除）。不同密钥签名的同包名 App 不能覆盖安装；更新时必须使用首次安装的同一私钥。

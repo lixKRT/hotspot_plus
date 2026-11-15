@@ -1,4 +1,4 @@
-package com.hsp.hotspotplus;
+package com.lixkrt.hotspotplus;
 
 import android.app.Application;
 import android.content.Context;

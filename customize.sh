@@ -79,7 +79,10 @@ install_app() {
     fi
     rm -f "$_tmp"
     if echo "$_out" | grep -q Success; then
-        ui_print "- 已安装/更新 App「热点增强」(com.hsp.hotspotplus)"
+        ui_print "- 已安装/更新 App「热点增强」(com.lixkrt.hotspotplus)"
+        if pm list packages 2>/dev/null | grep -qx 'package:com.hsp.hotspotplus'; then
+            ui_print "  检测到上游「热点增强」(com.hsp.hotspotplus) 共存；未自动卸载，可自行保留用于回滚"
+        fi
         ui_print "  首次打开时请在 Magisk 或 KernelSU 管理器 →「超级用户」里给「热点增强」授权 root"
     else
         ui_print "! 自动安装 App 失败: $(echo "$_out" | tr '\n' ' ' | cut -c1-200)"
@@ -89,7 +92,7 @@ install_app() {
         else
             ui_print "  请手动安装模块内的 $MODPATH/app/hotspot_plus.apk"
         fi
-        echo "$_out" | grep -q UPDATE_INCOMPATIBLE && ui_print "  (签名不一致：请先卸载旧的「热点增强」App 再装)"
+        echo "$_out" | grep -q UPDATE_INCOMPATIBLE && ui_print "  (同包名但签名不一致：请先卸载已安装的 com.lixkrt.hotspotplus 再装)"
     fi
 }
 install_app

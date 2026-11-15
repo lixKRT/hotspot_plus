@@ -7,8 +7,8 @@
         android:shortcutShortLabel="@string/sc_toggle"
         android:shortcutLongLabel="@string/sc_toggle_long">
         <intent
-            android:action="com.hsp.hotspotplus.TOGGLE"
-            android:targetPackage="com.hsp.hotspotplus"
-            android:targetClass="com.hsp.hotspotplus.ToggleActivity" />
+            android:action="com.lixkrt.hotspotplus.TOGGLE"
+            android:targetPackage="com.lixkrt.hotspotplus"
+            android:targetClass="com.lixkrt.hotspotplus.ToggleActivity" />
     </shortcut>
 </shortcuts>

@@ -1,4 +1,4 @@
-package com.hsp.hotspotplus;
+package com.lixkrt.hotspotplus;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -33,11 +33,13 @@ public final class RootShell {
         public final int code;
         public final String out;
         public final String err;
+        public final boolean denied;
 
-        Result(int code, String out, String err) {
+        public Result(int code, String out, String err, boolean denied) {
             this.code = code;
             this.out = out;
             this.err = err;
+            this.denied = denied;
         }
 
         public String lastLine() {
@@ -105,7 +107,7 @@ public final class RootShell {
         try {
             return f.get();
         } catch (Exception e) {
-            return new Result(1, "", String.valueOf(e));
+            return new Result(1, "", String.valueOf(e), false);
         }
     }
 
@@ -120,9 +122,9 @@ public final class RootShell {
                     local.set(s);
                 } catch (DeniedException e) {
                     denied = true;
-                    return new Result(EACCES, "", DENIED_MSG + "\n(" + e.getMessage() + ")");
+                    return new Result(EACCES, "", DENIED_MSG + "\n(" + e.getMessage() + ")", true);
                 } catch (IOException e) {
-                    return new Result(1, "", "无法启动 root shell: " + e.getMessage());
+                    return new Result(1, "", "无法启动 root shell: " + e.getMessage(), false);
                 }
             }
             denied = false;
@@ -131,15 +133,15 @@ public final class RootShell {
             } catch (WriteFailed e) {
                 s.close();
                 local.remove();
-                if (attempt == 1) return new Result(1, "", "root shell 异常: " + e.getMessage());
+                if (attempt == 1) return new Result(1, "", "root shell 异常: " + e.getMessage(), false);
             } catch (IOException e) {
                 // shell died while the command was running: do NOT re-run it (could toggle twice)
                 s.close();
                 local.remove();
-                return new Result(1, "", "root shell 在执行中退出: " + e.getMessage());
+                return new Result(1, "", "root shell 在执行中退出: " + e.getMessage(), false);
             }
         }
-        return new Result(1, "", "unreachable");
+        return new Result(1, "", "unreachable", false);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -300,7 +302,7 @@ public final class RootShell {
                 if (l.equals(marker)) break;
                 err.add(l);
             }
-            return new Result(code, join(out), join(err));
+            return new Result(code, join(out), join(err), false);
         }
 
         void close() {
