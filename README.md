@@ -103,6 +103,13 @@
 
 另外从 `dumpsys wifi` 的 SoftApManager 里取「Wi‑Fi 关联数」，缓存 30 秒。
 
+`clients` 和 `clients --json` 使用同一条合并结果。每项包含 `mac`、`ip`、`ip6`、
+`hostname`、`remark`、`static_ip`、`state`、`online`、`lease`；没有的数据保持为空，不会
+猜地址或主机名。邻居表中的 `STALE` / `FAILED` / `INCOMPLETE` 条目仍会显示，并用
+`state` 标注；只有静态租约、当前没有邻居或租约的客户端显示为 `STATIC_ONLY`，只有动态
+租约的显示为 `LEASE_ONLY`。改网关后落在旧子网的地址显示为 `STALE_ADDR`，同时给出
+`static_ip` 的有效映射。
+
 ### 5. 守护进程 `hspd`
 
 - 开机后由 `service.sh` 启动。通过 `ip monitor address link` 事件立即响应，同时每 3 秒轮询一次兜底。
@@ -156,6 +163,7 @@ su -c "$H clients"       # 设备列表 (--json)
 su -c "$H set GATEWAY=192.168.42.1 PREFIX=24 DHCP_START=192.168.42.100 DHCP_END=192.168.42.200"
 su -c "$H lease add aa:bb:cc:dd:ee:ff 192.168.42.10 我的笔记本"
 su -c "$H lease del aa:bb:cc:dd:ee:ff"
+su -c "$H lease apply"   # 立即重算 udhcpd.conf（热点开启时）
 su -c "$H apply"         # 应用配置
 su -c "$H log 200"
 su -c "$H diag"          # 生成诊断文件
@@ -163,6 +171,18 @@ su -c "$H daemon restart"
 su -c "$H hsctl probe"   # 打印反射到的 Tethering 接口签名
 su -c "$H unstick"       # 清除卡住的操作（结束残留 hsp/hsctl 进程，删除操作锁）
 ```
+
+静态租约规则：
+
+- MAC 统一保存为小写冒号格式；IP 必须是配置子网内的私有主机地址，拒绝网络地址、
+  广播地址、网关和子网外地址。
+- `lease add` 拒绝已存在的 MAC 和已被其他 MAC 占用的 IP。WebUI 的整表保存使用
+  `lease import`，它先校验全部行（包括 base64 解码后的控制字符和非规范 MAC），
+  通过后才原子替换；重复 MAC/IP 会整体拒绝，不会留下半张表。
+- 备注会去掉引号、`$`、反引号、反斜杠和控制字符，最长 64 字节。
+- 导入或重绑后，旧地址会从 `udhcpd.leases` 里清除，避免 DHCP 把它再分给其他客户端。
+- 实际子网与配置不同时，静态租约保留主机号映射，并在 `status` 的 `subnet` 字段和
+  `config` 的 `leases[].effective_ip` 中给出结果。
 
 ### 配置项（`config.conf`）
 
