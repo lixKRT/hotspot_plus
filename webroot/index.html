@@ -98,7 +98,7 @@ details summary{cursor:pointer;color:var(--sub)}
   <div class="row"><label>固定热点网关<div class="sub">开启热点时请求固定地址（需自建 DHCP）</div></label>
     <label class="switch"><input type="checkbox" id="FIXED_GATEWAY"><span class="slider"></span></label></div>
   <div class="grid2">
-    <div class="field"><span class="sub">网关 IP</span><input type="text" id="GATEWAY" inputmode="decimal" placeholder="192.168.4.1"></div>
+    <div class="field"><span class="sub">网关 IP</span><input type="text" id="GATEWAY" inputmode="decimal" placeholder="192.168.42.1"></div>
     <div class="field"><span class="sub">前缀长度</span>
       <select id="PREFIX"><option>24</option><option>23</option><option>22</option><option>20</option><option>16</option><option>25</option><option>26</option><option>27</option><option>28</option></select></div>
   </div>
@@ -361,7 +361,7 @@ function addLeaseRow(mac, ip, name, fromClient) {
   }
   const d = document.createElement('div'); d.className = 'lease';
   d.innerHTML = `<input class="m" type="text" placeholder="aa:bb:cc:dd:ee:ff" autocapitalize="off">
-    <input class="i" type="text" inputmode="decimal" placeholder="192.168.4.10">
+    <input class="i" type="text" inputmode="decimal" placeholder="192.168.42.10">
     <input class="n" type="text" placeholder="备注"><button class="danger">删除</button>`;
   d.querySelector('.m').value = mac || ''; d.querySelector('.i').value = ip || ''; d.querySelector('.n').value = name || '';
   d.querySelector('button').onclick = () => d.remove();

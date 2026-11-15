@@ -1,12 +1,18 @@
+* text=auto
 # Shell files are executed on Android; a CRLF checkout breaks them.
 *.sh text eol=lf
+module.prop text eol=lf
 META-INF/com/google/android/update-binary text eol=lf
 META-INF/com/google/android/updater-script text eol=lf
+META-INF/com/google/android/* text eol=lf
 bin/hsp text eol=lf
 bin/hspd text eol=lf
+bin/hsctl.jar binary
 sepolicy.rule text eol=lf
 defaults/*.conf text eol=lf
 webroot/*.html text eol=lf
+lib/*.sh text eol=lf
+README.md text eol=lf
 tools/probe-8t.sh text eol=lf
 tools/tests/*.py text eol=lf
 tools/*.py text eol=lf

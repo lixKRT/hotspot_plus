@@ -18,9 +18,7 @@ map_range() {
     [ "$(map_ip 192.168.42.50 "$cfg" "$act" 256)" = "192.168.99.50" ]
 }
 
-TMPROOT=${TMPDIR:-/tmp}/hsp-test-$$
 mkdir -p "$TMPROOT/data/run" "$TMPROOT/data/logs"
-trap 'rm -rf "$TMPROOT"' EXIT
 
 run_case "prefix mask /24" mask_pfx_24
 run_case "prefix mask /28" mask_pfx_28

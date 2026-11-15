@@ -5,6 +5,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 FAIL=0
 TOTAL=0
+TMPROOT=${TMPDIR:-/tmp}/hsp-test-$$
+mkdir -p "$TMPROOT"
+trap 'rm -rf "$TMPROOT"' EXIT
 
 run_case() {
     name=$1

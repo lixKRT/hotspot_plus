@@ -78,11 +78,11 @@ HYPEROS=$(getprop ro.mi.os.version.incremental 2>/dev/null)
 # ---------------------------------------------------------------- config
 config_defaults() {
     FIXED_GATEWAY=1
-    GATEWAY=192.168.4.1
+    GATEWAY=192.168.42.1
     PREFIX=24
     DHCP_ENABLE=1
-    DHCP_START=192.168.4.100
-    DHCP_END=192.168.4.200
+    DHCP_START=192.168.42.100
+    DHCP_END=192.168.42.200
     LEASE_TIME=43200
     DNS=""
     ENFORCE_GATEWAY=1
