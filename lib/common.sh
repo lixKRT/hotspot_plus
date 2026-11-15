@@ -18,6 +18,9 @@ HSCTL_JAR=$MODDIR/bin/hsctl.jar
 FW_CHAIN=hsp_dhcp
 DHCPSTATE=$RUN/dhcp
 
+DHCP_FAIL_WINDOW=${HSP_DHCP_FAIL_WINDOW:-900}
+DHCP_STABLE_SECS=${HSP_DHCP_STABLE_SECS:-120}
+
 mkdir -p "$RUN" "$LOGDIR" 2>/dev/null
 
 # ---------------------------------------------------------------- binaries
@@ -704,19 +707,29 @@ dhcp_fail_limit() {
     [ "$_dl" -gt 0 ] 2>/dev/null || _dl=3
     echo "$_dl"
 }
+dhcp_stable_secs() {
+    case "$DHCP_STABLE_SECS" in ''|*[!0-9]*) echo 120 ;; *) echo "$DHCP_STABLE_SECS" ;; esac
+}
+dhcp_fail_window() {
+    case "$DHCP_FAIL_WINDOW" in ''|*[!0-9]*) echo 900 ;; *) echo "$DHCP_FAIL_WINDOW" ;; esac
+}
 dhcp_session_begin() {
     mkdir -p "$RUN" 2>/dev/null
     {
+        _ds_now=$(date +%s)
         echo "session=$(date +%s)-$$"
         echo "state=idle"
         echo "serving=0"
         echo "degraded=0"
         echo "failures=0"
+        echo "first_failure_at=0"
+        echo "last_failure_at=0"
+        echo "stable_since=0"
         echo "reason="
         echo "last_error="
         echo "retry_available=0"
         echo "retry_at=0"
-        echo "at=$(date +%s)"
+        echo "at=$_ds_now"
     } > "$DHCPSTATE"
     state_set dhcp_degraded 0
     state_set dhcp_reason ""
@@ -730,33 +743,69 @@ dhcp_summary_write() {
     state_set dhcp_last_error "$(dhcp_get last_error)"
     state_set dhcp_retry_available "$(dhcp_get retry_available)"
     state_set dhcp_failures "$(dhcp_get failures)"
+    state_set dhcp_first_failure_at "$(dhcp_get first_failure_at)"
+    state_set dhcp_last_failure_at "$(dhcp_get last_failure_at)"
     state_set dhcp_at "$(date +%s)"
 }
-dhcp_rollback_ordered() { # reason error
+dhcp_rollback_ordered() { # reason error [state]
     fw_del
     dhcp_stop
     dhcp_set serving 0
-    dhcp_set state failed
+    dhcp_set state "${3:-failed}"
     [ -n "$1" ] && dhcp_set reason "$1"
     [ -n "$2" ] && dhcp_set last_error "$2"
     log "dhcp: fail-closed (${1:-takeover failed}): removed $FW_CHAIN/OUTPUT, stopped udhcpd${2:+ error=$2}"
 }
+dhcp_window_begin() { # now: a new serving period starts the stability clock but keeps history
+    dhcp_set stable_since "$1"
+}
+dhcp_stable_check() { # now
+    _dc_now=$1; _dc_since=$(dhcp_get stable_since); _dc_since=${_dc_since:-0}
+    case "$_dc_since" in ''|*[!0-9]*) _dc_since=0 ;; esac
+    if [ "$(dhcp_get serving)" = 1 ] && [ "$_dc_since" -gt 0 ] &&
+        [ $((_dc_now - _dc_since)) -ge "$(dhcp_stable_secs)" ]; then
+        dhcp_set failures 0
+        dhcp_set first_failure_at 0
+        dhcp_set last_failure_at 0
+        dhcp_set stable_since "$_dc_now"
+        dhcp_summary_write
+        log "dhcp: stable for $(dhcp_stable_secs)s; failure window cleared"
+        return 0
+    fi
+    return 1
+}
 dhcp_record_failure() { # reason error
+    _dn=$(date +%s)
     _df=$(dhcp_get failures); _df=${_df:-0}
     case "$_df" in ''|*[!0-9]*) _df=0 ;; esac
+    _dff=$(dhcp_get first_failure_at); _dff=${_dff:-0}
+    case "$_dff" in ''|*[!0-9]*) _dff=0 ;; esac
+    _dlf=$(dhcp_get last_failure_at); _dlf=${_dlf:-0}
+    case "$_dlf" in ''|*[!0-9]*) _dlf=0 ;; esac
+    _dw=$(dhcp_fail_window)
+    if [ "$_df" -gt 0 ] && { [ "$_dff" -eq 0 ] || [ $((_dn - _dlf)) -gt "$_dw" ]; }; then
+        _df=0; _dff=0
+        log "dhcp: failure window expired (${_dw}s); resetting consecutive failures"
+    fi
     _df=$((_df + 1))
+    [ "$_dff" -eq 0 ] && _dff=$_dn
     dhcp_set failures "$_df"
+    dhcp_set first_failure_at "$_dff"
+    dhcp_set last_failure_at "$_dn"
+    dhcp_set stable_since 0
     dhcp_set reason "$1"
     dhcp_set last_error "$2"
     if [ "$_df" -ge "$(dhcp_fail_limit)" ]; then
         dhcp_degrade "$1" "$2"
     else
-        dhcp_rollback_ordered "$1" "$2"
+        dhcp_rollback_ordered "$1" "$2" degraded
+        dhcp_set retry_available 1
+        dhcp_set degraded 1
         dhcp_summary_write
     fi
 }
 dhcp_degrade() { # reason error
-    dhcp_rollback_ordered "$1" "$2"
+    dhcp_rollback_ordered "$1" "$2" degraded
     dhcp_set degraded 1
     dhcp_set retry_available 1
     dhcp_set state degraded
@@ -784,7 +833,7 @@ dhcp_takeover() { # iface addr
     fi
     dhcp_set serving 1
     dhcp_set state serving
-    dhcp_set failures 0
+    dhcp_window_begin "$(date +%s)"
     dhcp_set reason ""
     dhcp_set last_error ""
     dhcp_set retry_available 0
@@ -823,6 +872,15 @@ dhcp_retry() { # [iface addr]
     dhcp_summary_write
     echo "重试失败：$(dhcp_get last_error)；仍由系统 DHCP 分配地址，热点未重启"
     return 1
+}
+dhcp_reset() {
+    _dr_now=$(date +%s)
+    dhcp_set failures 0
+    dhcp_set first_failure_at 0
+    dhcp_set last_failure_at 0
+    dhcp_set stable_since "$_dr_now"
+    dhcp_summary_write
+    log "dhcp: user reset failure window"
 }
 
 # ---------------------------------------------------------------- udhcpd

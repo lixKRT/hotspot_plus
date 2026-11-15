@@ -8,6 +8,7 @@
 #   apply                              重新加载配置（需要时重启热点 / DHCP）
 #   config --json                      输出配置 + 静态租约 (WebUI 用)
 #   dhcp retry                         仅重试自建 DHCP，不重启热点
+#   dhcp reset                         手动清除 DHCP 连续失败窗口
 #   set KEY=VALUE [KEY=VALUE ...]      修改配置（带校验）
 #   lease list | add <MAC> <IP> [备注] | del <MAC> | import <base64>
 #   backup [list|export DIR] | restore DIR [--yes] | restore-prompt | restore-dismiss
@@ -804,6 +805,10 @@ do_dhcp_retry() {
     dhcp_retry "$AP_IF" "$AP_ADDR"
 }
 
+do_dhcp_reset() {
+    dhcp_reset
+}
+
 daemon_ctl() {
     case "$1" in
         start)
@@ -882,7 +887,11 @@ case "$cmd" in
     set) do_set "$@" ;;
     lease|leases) do_lease "$@" ;;
     dhcp)
-        [ "$1" = retry ] || { echo "用法: hsp dhcp retry"; exit 1; }
+        case "$1" in
+            retry) : ;;
+            reset) lock dhcp-reset; do_dhcp_reset; exit $? ;;
+            *) echo "用法: hsp dhcp retry|reset"; exit 1 ;;
+        esac
         lock dhcp-retry
         do_dhcp_retry ;;
     backup) do_backup "$@" ;;

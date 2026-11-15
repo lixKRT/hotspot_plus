@@ -198,9 +198,13 @@ udhcpd_start_failure_installs_no_takeover() {
     _sv=$(_dhcp_state serving)
     _fl=$(_dhcp_state failures)
     _dg=$(_dhcp_state degraded)
+    _mode=$(_dhcp_state state)
+    _retry=$(_dhcp_state retry_available)
     [ "$_sv" = 0 ] &&
-        [ "$_fl" = 1 ] &&
-        [ "$_dg" = 0 ] &&
+        [ "$_fl" -ge 1 ] &&
+        [ "$_dg" = 1 ] &&
+        [ "$_mode" = degraded ] &&
+        [ "$_retry" = 1 ] &&
         [ "$_rs" = "udhcpd 启动失败" ] &&
         ! grep -q ' -N hsp_dhcp' "$_dt/iptables.log" &&
         ! grep -q 'OUTPUT 1 -j hsp_dhcp' "$_dt/iptables.log" &&
@@ -233,16 +237,54 @@ repeated_crashes_enter_visible_degraded_mode() {
     _dhcp_env crashes || return 1
     _dhcp_eval 'dhcp_session_begin; dhcp_set serving 1
         dhcp_crash "synthetic udhcpd exit"
-        [ "$(dhcp_get degraded)" = 0 ] || exit 1
+        [ "$(dhcp_get degraded)" = 1 ] || exit 1
         dhcp_crash "synthetic udhcpd exit"
-        [ "$(dhcp_get degraded)" = 0 ] || exit 1
+        [ "$(dhcp_get failures)" = 2 ] || exit 1
         dhcp_crash "synthetic udhcpd exit"
         [ "$(dhcp_get degraded)" = 1 ] || exit 1
+        [ "$(dhcp_get failures)" = 3 ] || exit 1
         [ "$(dhcp_get retry_available)" = 1 ]' || return 1
     [ "$(_dhcp_state degraded)" = 1 ] &&
         [ "$(_dhcp_state reason)" = "udhcpd 连续异常退出" ] &&
         [ "$(_dhcp_summary dhcp_degraded)" = 1 ] &&
         grep -q 'DEGRADED' "$_dt/data/logs/hsp.log"
+}
+
+repeated_crash_retry_cycles_eventually_degrade() {
+    _dhcp_env crash-window || return 1
+    _dhcp_eval 'dhcp_session_begin
+        dhcp_set serving 1
+        dhcp_crash "crash 1"
+        _f1=$(dhcp_get failures)
+        DHCP_FAKE_MODE=success dhcp_retry wlan2 192.168.42.1/24 || exit 1
+        [ "$(dhcp_get failures)" = "$_f1" ] || exit 1
+        dhcp_crash "crash 2"
+        _f2=$(dhcp_get failures)
+        [ "$_f2" = 2 ] || exit 1
+        DHCP_FAKE_MODE=success dhcp_retry wlan2 192.168.42.1/24 || exit 1
+        [ "$(dhcp_get failures)" = "$_f2" ] || exit 1
+        dhcp_crash "crash 3"
+        [ "$(dhcp_get degraded)" = 1 ] || exit 1
+        [ "$(dhcp_get failures)" -ge 3 ] || exit 1' || return 1
+    [ "$(_dhcp_state degraded)" = 1 ] &&
+        [ "$(_dhcp_state last_error)" = "crash 3" ] &&
+        [ "$(_dhcp_state retry_available)" = 1 ]
+}
+
+stable_health_period_clears_failure_window() {
+    _dhcp_env stable-window || return 1
+    _dhcp_eval 'dhcp_session_begin
+        _now=$(date +%s)
+        dhcp_set failures 2
+        dhcp_set serving 1
+        dhcp_set state serving
+        dhcp_set stable_since "$_now"
+        DHCP_STABLE_SECS=30
+        dhcp_stable_check $((_now + 10))
+        [ "$(dhcp_get failures)" = 2 ] || exit 1
+        dhcp_stable_check $((_now + 31))
+        [ "$(dhcp_get failures)" = 0 ] || exit 1' || return 1
+    [ "$(_dhcp_state failures)" = 0 ]
 }
 
 status_exposes_dhcp_degraded_and_retry() {
@@ -261,13 +303,15 @@ status_exposes_dhcp_degraded_and_retry() {
 
 retry_success_restores_static_leases_without_restart() {
     _dhcp_env retry-ok || return 1
-    _dhcp_eval 'dhcp_session_begin
+    _dhcp_eval 'dhcp_session_begin; dhcp_set serving 1
+        dhcp_crash "prior crash"
         dhcp_degrade "udhcpd 连续异常退出" "udhcpd 进程已退出"' || return 1
     _dhcp_run -- dhcp retry > "$_dt/retry.out" 2>&1 || return 1
     _s=$(_dhcp_run -- status --json) || return 1
     _ok=1
     [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
     [ "$(_dhcp_state serving)" = 1 ] || _ok=0
+    [ "$(_dhcp_state failures)" -ge 1 ] || _ok=0
     grep -q '^static_lease 02:00:00:00:00:01 192.168.42.150$' "$_dt/data/run/udhcpd.conf" || _ok=0
     [ ! -s "$_dt/hsctl.log" ] || _ok=0
     printf '%s' "$_s" | grep -q '"dhcp_degraded":false' || _ok=0
@@ -316,6 +360,8 @@ run_case "DHCP starts and verifies before OUTPUT jump" dhcp_takeover_starts_and_
 run_case "udhcpd start failure installs no takeover" udhcpd_start_failure_installs_no_takeover
 run_case "firewall failure removes jump before dhcp stop" firewall_failure_removes_jump_before_stopping_udhcpd
 run_case "repeated udhcpd crashes become degraded" repeated_crashes_enter_visible_degraded_mode
+run_case "crash/retry cycles keep an accumulated window" repeated_crash_retry_cycles_eventually_degrade
+run_case "stable health period clears failure window" stable_health_period_clears_failure_window
 run_case "status exposes DHCP degraded and retry" status_exposes_dhcp_degraded_and_retry
 run_case "DHCP retry restores leases without restart" retry_success_restores_static_leases_without_restart
 run_case "DHCP retry failure is bounded and visible" retry_failure_stays_degraded_and_never_restarts_hotspot

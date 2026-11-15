@@ -113,6 +113,7 @@ while :; do
                 DHCP_FAILS=$(dhcp_get failures); [ -n "$DHCP_FAILS" ] || DHCP_FAILS=0
                 [ "$(dhcp_get degraded)" = 1 ] || serve_dhcp
             elif [ "$(dhcp_get serving)" = 1 ] && dhcp_running; then
+                dhcp_stable_check "$NOW"
                 if ! fw_check "$AP_IF"; then
                     log "firewall rule missing, fail-closing DHCP"
                     dhcp_crash "接管规则丢失"
