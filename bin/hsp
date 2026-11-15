@@ -1,6 +1,7 @@
 #!/system/bin/sh
 # hotspot_plus CLI.  Usage: su -c /data/adb/modules/hotspot_plus/bin/hsp <command>
 #   on | off | toggle | restart        控制热点（经 TetheringManager，使用系统已保存的 SSID/密码）
+#   boot-auto                         开机时执行一次 SIM 判断（由 service.sh 调用）
 #   status [--json]                    状态
 #   clients [--json]                   已连接设备 (IP/MAC/主机名)
 #   apply                              重新加载配置（需要时重启热点 / DHCP）
@@ -79,11 +80,15 @@ fallback_start() {
 }
 
 do_on() {
+    LIFECYCLE_RESULT=""
+    LIFECYCLE_ERROR=""
     if ap_detect; then
         if [ "$FIXED_GATEWAY" = 1 ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ] && dhcp_capable; then
             say "热点已开启但网关为 ${AP_ADDR%/*}，按配置重启"
             do_off quiet
+            [ "$LIFECYCLE_RESULT" = stopped ] || return 1
         else
+            LIFECYCLE_RESULT=already_on
             say "热点已开启：$AP_IF ${AP_ADDR}"
             return 0
         fi
@@ -101,6 +106,10 @@ do_on() {
     # shellcheck disable=SC2086
     _out=$(hsctl start $_args --pkg "$CALLER_PKG" --timeout 25)
     _rc=$?
+    _timed_out=0
+    _hsctl_failed=0
+    _hsctl_result=$(printf '%s\n' "$_out" | sed -n 's/^start_result=//p' | head -n1)
+    _err=$(printf '%s\n' "$_out" | sed -n 's/^error=//p' | head -n1)
     log "hsctl start rc=$_rc"
     echo "$_out" | while read -r _l; do [ -n "$_l" ] && log "  hsctl: $_l"; done
     if [ $_rc -eq 2 ]; then
@@ -109,18 +118,23 @@ do_on() {
         # shellcheck disable=SC2086
         _out=$(hsctl start $_args --pkg "$CALLER_PKG" --timeout 25 --no-exempt)
         _rc=$?
+        _hsctl_result=$(printf '%s\n' "$_out" | sed -n 's/^start_result=//p' | head -n1)
+        _err=$(printf '%s\n' "$_out" | sed -n 's/^error=//p' | head -n1)
         log "hsctl start (no-exempt) rc=$_rc"
         echo "$_out" | while read -r _l; do [ -n "$_l" ] && log "  hsctl: $_l"; done
     fi
     echo "$_out" | grep -E '^(start_result|error|sdk|method)=' | sed 's/^/  hsctl: /'
     case $_rc in
         0) : ;;
-        1|3) say "TetheringManager 返回：$(echo "$_out" | sed -n 's/^start_result=//p')" ;;
-        124|137|143) say "hsctl 超时被终止，尝试 cmd wifi start-softap 回退"; fallback_start ;;
-        *) say "hsctl 调用失败 rc=$_rc（$(echo "$_out" | sed -n 's/^error=//p')），尝试 cmd wifi start-softap 回退"
+        1|3) _hsctl_failed=1; say "TetheringManager 返回：$(echo "$_out" | sed -n 's/^start_result=//p')" ;;
+        124|137|143) _timed_out=1; say "hsctl 超时被终止，尝试 cmd wifi start-softap 回退"; fallback_start ;;
+        *) _hsctl_failed=1; say "hsctl 调用失败 rc=$_rc（$(echo "$_out" | sed -n 's/^error=//p')），尝试 cmd wifi start-softap 回退"
            fallback_start ;;
     esac
-    if wait_ap up 20; then
+    # shellcheck disable=SC2086
+    _wait=${HSP_START_WAIT:-20}
+    if wait_ap up "$_wait"; then
+        LIFECYCLE_RESULT=started
         say "热点已开启：$AP_IF $AP_ADDR"
         if [ -n "$_args" ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ]; then
             say "警告：请求的固定网关 $GATEWAY 未生效（系统可能忽略了静态地址请求），DHCP 将按实际网段工作"
@@ -128,15 +142,48 @@ do_on() {
         daemon_wake up
         return 0
     fi
+    if [ "$_hsctl_failed" = 1 ]; then
+        LIFECYCLE_RESULT=start_failed
+        LIFECYCLE_ERROR=${_err:-"hsctl start rc=$_rc"}
+        [ -n "$_err" ] || [ "$_hsctl_result" = SUCCESS ] || LIFECYCLE_ERROR=$_hsctl_result
+        [ -n "$LIFECYCLE_ERROR" ] || LIFECYCLE_ERROR="hsctl start rc=$_rc"
+        log "ERROR: hotspot start failed (rc=$_rc): $LIFECYCLE_ERROR"
+        rm -f "$RUN/started_by_hsp"
+    elif [ "$_rc" -ge 2 ] || { [ -n "$_hsctl_result" ] && [ "$_hsctl_result" != SUCCESS ]; }; then
+        LIFECYCLE_RESULT=start_failed
+        LIFECYCLE_ERROR=${_err:-"hsctl start rc=$_rc"}
+        [ -n "$_err" ] || [ "$_hsctl_result" = SUCCESS ] || LIFECYCLE_ERROR=$_hsctl_result
+        [ -n "$LIFECYCLE_ERROR" ] || LIFECYCLE_ERROR="hsctl start rc=$_rc"
+        log "ERROR: hotspot start failed (rc=$_rc): $LIFECYCLE_ERROR"
+        rm -f "$RUN/started_by_hsp"
+    elif [ "$_timed_out" = 1 ] || [ "$_wait" -gt 0 ]; then
+        LIFECYCLE_RESULT=timeout
+        LIFECYCLE_ERROR="hotspot did not become ready within ${_wait}s"
+        log "TIMEOUT: hotspot start did not become ready within ${_wait}s"
+    else
+        LIFECYCLE_RESULT=start_failed
+        LIFECYCLE_ERROR=${_err:-"hsctl start rc=$_rc"}
+        log "ERROR: hotspot start failed (rc=$_rc): $LIFECYCLE_ERROR"
+        rm -f "$RUN/started_by_hsp"
+    fi
     say "热点未能开启（详见 $LOG）"
     return 1
 }
 
 do_off() {
+    LIFECYCLE_RESULT=""
+    LIFECYCLE_ERROR=""
+    if ! ap_detect; then
+        LIFECYCLE_RESULT=already_off
+        [ "$1" = quiet ] || say "热点已关闭"
+        return 0
+    fi
     log "stopping hotspot"
     rm -f "$RUN/started_by_hsp"
     _out=$(hsctl stop --pkg "$CALLER_PKG" --timeout 10)
     _rc=$?
+    _timed_out=0
+    case $_rc in 124|137|143) _timed_out=1 ;; esac
     log "hsctl stop rc=$_rc"
     echo "$_out" | while read -r _l; do [ -n "$_l" ] && log "  hsctl: $_l"; done
     if [ $_rc -ge 2 ]; then
@@ -144,12 +191,63 @@ do_off() {
         tmo 15 "cmd wifi stop-softap" cmd wifi stop-softap >> "$LOG" 2>&1
     fi
     if wait_ap down 15; then
+        LIFECYCLE_RESULT=stopped
         [ "$1" = quiet ] || say "热点已关闭"
         daemon_wake down
         return 0
     fi
+    if [ "$_timed_out" = 1 ]; then
+        LIFECYCLE_RESULT=timeout
+        LIFECYCLE_ERROR="hotspot did not stop within 15s"
+        log "TIMEOUT: hotspot stop did not complete within 15s"
+    else
+        LIFECYCLE_RESULT=stop_failed
+        LIFECYCLE_ERROR="hsctl stop rc=$_rc"
+        log "ERROR: hotspot stop failed (rc=$_rc)"
+    fi
     say "热点关闭超时"
     return 1
+}
+
+do_boot_auto() {
+    if [ -f "$DATA/boot.done" ]; then
+        say "boot-auto already evaluated this boot; not reading SIM again"
+        return 0
+    fi
+    mkdir -p "$DATA" 2>/dev/null
+    echo "$(date +%s)" > "$DATA/boot.done"
+    if [ "$AUTO_START" != 1 ]; then
+        record_boot disabled skipped ""
+        record_lifecycle boot-auto skipped ""
+        return 0
+    fi
+    _sim=$(prop_get gsm.sim.state)
+    _ap=0
+    ap_detect >/dev/null 2>&1 && _ap=1
+    _decision=$(boot_autostart_decision "$AUTO_START" "$_sim" "$_ap")
+    case "$_decision" in
+        already_on)
+            record_boot already_on already_on "$_sim" ""
+            record_lifecycle boot-auto already_on ""
+            say "开机自动开启：热点已开启，跳过"
+            return 0 ;;
+        no_sim)
+            record_boot no_sim skipped "$_sim" ""
+            record_lifecycle boot-auto skipped ""
+            say "开机自动开启：没有 LOADED SIM，跳过"
+            return 0 ;;
+        start)
+            log "boot-auto: LOADED SIM found, starting hotspot once"
+            do_on
+            _rc=$?
+            record_boot start "$LIFECYCLE_RESULT" "$_sim" "$LIFECYCLE_ERROR"
+            record_lifecycle boot-auto "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"
+            return $_rc ;;
+        *)
+            record_boot disabled skipped "$_sim" ""
+            record_lifecycle boot-auto skipped ""
+            return 0 ;;
+    esac
 }
 
 do_status_json() {
@@ -163,6 +261,16 @@ do_status_json() {
     _eb=false; [ -f "$RUN/enforce_broken" ] && _eb=true
     _ver=$(sed -n 's/^version=//p' "$MODDIR/module.prop")
     _last=$(grep -E 'ERROR|WARN|TIMEOUT|LOCK: (breaking|flock)|另一个操作' "$LOG" 2>/dev/null | tail -n1)
+    _bd=$(state_get boot_decision)
+    [ -n "$_bd" ] || { [ "$AUTO_START" = 1 ] && _bd=not_run || _bd=disabled; }
+    _br=$(state_get boot_result); [ -n "$_br" ] || _br=not_run
+    _bs=$(state_get boot_sim)
+    _be=$(state_get boot_error)
+    _ba=$(state_get boot_at)
+    _la=$(state_get last_action)
+    _lr=$(state_get last_result)
+    _le=$(state_get last_error)
+    _lat=$(state_get last_at)
     _opb=false; H_PID=""; H_OP=""; H_AGE=""
     if lock_busy; then _opb=true; lock_holder_info; fi
     printf '{"ap":%s,"iface":"%s","addr":"%s","gateway_cfg":"%s","prefix_cfg":%s,"gateway_ok":%s,' \
@@ -171,6 +279,11 @@ do_status_json() {
         "$([ "$FIXED_GATEWAY" = 1 ] && echo true || echo false)" "$([ "$DHCP_ENABLE" = 1 ] && echo true || echo false)" \
         "$_dhcp" "$_fw" "$_dm" "$_udh"
     printf '"op_busy":%s,"op_name":"%s","op_pid":"%s","op_age":"%s",' "$_opb" "$H_OP" "$H_PID" "$H_AGE"
+    printf '"auto_start":%s,"boot_decision":"%s","boot_result":"%s","boot_sim":"%s","boot_error":"%s","boot_at":"%s",' \
+        "$([ "$AUTO_START" = 1 ] && echo true || echo false)" "$(json_esc "$_bd")" "$(json_esc "$_br")" \
+        "$(json_esc "$_bs")" "$(json_esc "$_be")" "$(json_esc "$_ba")"
+    printf '"last_action":"%s","last_result":"%s","last_error":"%s","last_at":"%s",' \
+        "$(json_esc "$_la")" "$(json_esc "$_lr")" "$(json_esc "$_le")" "$(json_esc "$_lat")"
     printf '"enforce_broken":%s,"sdk":"%s","release":"%s","hyperos":"%s","version":"%s","busybox":"%s","last_issue":"%s"}\n' \
         "$_eb" "$SDK" "$RELEASE" "$(json_esc "$HYPEROS")" "$_ver" "$BB" "$(json_esc "$_last")"
 }
@@ -183,6 +296,9 @@ do_status_text() {
     [ -n "$AP_IF" ] && echo "防火墙拦截系统DHCP: $(fw_check "$AP_IF" && echo yes || echo no)"
     echo "守护进程: $([ -n "$(daemon_pid)" ] && echo "运行中 pid $(daemon_pid)" || echo 未运行)"
     if lock_busy; then lock_holder_info; echo "操作锁: 被占用 ${H_OP:-?} pid=${H_PID:-?} ${H_AGE:-?}s"; else echo "操作锁: 空闲"; fi
+    echo "开机自动开启: $([ "$AUTO_START" = 1 ] && echo 启用 || echo 关闭)  最近判断: $(state_get boot_decision || echo disabled)  结果: $(state_get boot_result || echo not_run)"
+    [ -n "$(state_get boot_at)" ] && echo "开机判断时间: $(state_get boot_at)"
+    [ -n "$(state_get last_action)" ] && echo "最近操作: $(state_get last_action)  结果: $(state_get last_result)$( [ -n "$(state_get last_error)" ] && echo "  错误: $(state_get last_error)")"
     [ -f "$RUN/enforce_broken" ] && echo "注意: 静态网关请求未被系统采纳（本次开机已停止强制）"
     echo "AP 状态(IWifiManager): $(hsctl state 2>/dev/null | sed -n 's/^ap_state_name=//p')"
 }
@@ -395,10 +511,29 @@ daemon_ctl() {
 
 cmd=$1; [ $# -gt 0 ] && shift
 case "$cmd" in
-    on|start) lock on; do_on ;;
-    off|stop) lock off; do_off ;;
-    toggle) lock toggle; if ap_detect; then do_off; else do_on; fi ;;
-    restart) lock restart; do_off quiet; do_on ;;
+    on|start)
+        lock on
+        do_on; _rc=$?
+        record_lifecycle on "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"
+        exit $_rc ;;
+    off|stop)
+        lock off
+        do_off; _rc=$?
+        record_lifecycle off "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"
+        exit $_rc ;;
+    toggle)
+        lock toggle
+        if ap_detect; then do_off; else do_on; fi
+        _rc=$?
+        record_lifecycle toggle "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"
+        exit $_rc ;;
+    restart)
+        lock restart
+        do_off quiet
+        do_on; _rc=$?
+        record_lifecycle restart "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"
+        exit $_rc ;;
+    boot-auto) lock boot-auto; do_boot_auto ;;
     unstick) unstick ;;
     status) if [ "$1" = --json ]; then do_status_json; else do_status_text; fi ;;
     clients) if [ "$1" = --json ]; then do_clients_json; else do_clients_text; fi ;;

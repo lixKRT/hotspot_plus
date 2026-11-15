@@ -12,6 +12,7 @@ LOG=$LOGDIR/hsp.log
 CONF=$DATA/config.conf
 LEASES=$DATA/leases.conf
 LEASE_DB=$DATA/udhcpd.leases
+STATE=$RUN/state
 HSCTL_JAR=$MODDIR/bin/hsctl.jar
 FW_CHAIN=hsp_dhcp
 
@@ -74,6 +75,7 @@ SDK=$(getprop ro.build.version.sdk 2>/dev/null)
 RELEASE=$(getprop ro.build.version.release 2>/dev/null)
 HYPEROS=$(getprop ro.mi.os.version.incremental 2>/dev/null)
 [ -n "$HYPEROS" ] || HYPEROS=$(getprop ro.build.version.incremental 2>/dev/null)
+prop_get() { getprop "$1" 2>/dev/null; }
 
 # ---------------------------------------------------------------- config
 config_defaults() {
@@ -99,6 +101,60 @@ load_config() {
     case "$PREFIX" in ''|*[!0-9]*) PREFIX=24 ;; esac
     case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=3 ;; esac
     case "$LEASE_TIME" in ''|*[!0-9]*) LEASE_TIME=43200 ;; esac
+}
+
+# ---------------------------------------------------------------- lifecycle state
+state_get() { # key
+    [ -f "$STATE" ] || return 1
+    sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -n1
+}
+state_set() { # key value
+    [ $# -ge 2 ] || return 1
+    mkdir -p "$RUN" 2>/dev/null
+    _stmp=$STATE.tmp.$$
+    if [ -f "$STATE" ]; then
+        grep -v "^$1=" "$STATE" > "$_stmp" 2>/dev/null || :
+    else
+        : > "$_stmp"
+    fi
+    printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ' | tr -d '\000')" >> "$_stmp"
+    mv -f "$_stmp" "$STATE"
+}
+
+record_lifecycle() { # action result [error]
+    state_set last_action "$1"
+    state_set last_result "$2"
+    state_set last_error "${3:-}"
+    state_set last_at "$(date +%s)"
+    log "lifecycle: action=$1 result=$2${3:+ error=$3}"
+}
+
+record_boot() { # decision result sim [error]
+    state_set boot_decision "$1"
+    state_set boot_result "$2"
+    state_set boot_sim "$3"
+    state_set boot_error "${4:-}"
+    state_set boot_at "$(date +%s)"
+    log "boot-auto: decision=$1 result=$2 sim=${3:-none}${4:+ error=$4}"
+}
+
+sim_has_loaded() { # comma-separated gsm.sim.state
+    [ -n "$1" ] || return 1
+    printf '%s\n' "$1" | awk -F',' '
+        { for (i = 1; i <= NF; i++) { gsub(/^[ \t\r]+|[ \t\r]+$/, "", $i); if ($i == "LOADED") found = 1 } }
+        END { exit !found }'
+}
+
+boot_autostart_decision() { # AUTO_START sim_state ap_running(0|1)
+    if [ "$1" != 1 ]; then
+        echo disabled
+    elif [ "$3" = 1 ]; then
+        echo already_on
+    elif sim_has_loaded "$2"; then
+        echo start
+    else
+        echo no_sim
+    fi
 }
 
 # ---------------------------------------------------------------- IPv4 math
