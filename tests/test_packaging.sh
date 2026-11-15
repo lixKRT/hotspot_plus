@@ -121,9 +121,11 @@ PY
 }
 
 package_refuses_include_app_without_apk() {
+    _root=$TMPROOT/package-no-app-root
     _outdir=$TMPROOT/package-no-app
-    mkdir -p "$_outdir"
-    _out=$(cd "$ROOT" && INCLUDE_APP=1 sh ./package.sh "$_outdir" 2>&1) && return 1
+    mkdir -p "$_root" "$_outdir"
+    cp "$ROOT/package.sh" "$ROOT/module.prop" "$_root/"
+    _out=$(cd "$_root" && sh ./package.sh --include-app "$_outdir" 2>&1) && return 1
     printf '%s\n' "$_out" | grep -q 'app/hotspot_plus.apk is missing'
 }
 
@@ -134,4 +136,4 @@ run_case "shipped files use LF" shipped_files_are_lf
 run_case ".gitattributes covers shipped text" gitattributes_covers_shipped_text
 run_case "installer is Magisk/KernelSU neutral" installer_is_manager_neutral
 run_case "package excludes private/binary artifacts" package_omits_private_and_binary_artifacts
-run_case "package requires APK when INCLUDE_APP=1" package_refuses_include_app_without_apk
+run_case "package requires APK when --include-app is used" package_refuses_include_app_without_apk

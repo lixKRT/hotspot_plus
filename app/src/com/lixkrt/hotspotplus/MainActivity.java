@@ -21,6 +21,8 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 
 import java.util.List;
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Hosts the module's own WebUI (single source of truth: /data/adb/modules/hotspot_plus/webroot/index.html,
@@ -32,7 +34,9 @@ public final class MainActivity extends Activity {
     private FrameLayout root;
     private boolean night;
     private boolean trustedDocument;
+    private String trustedUrl;
     private boolean bridgesInstalled;
+    private String localHtml;
 
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     @Override
@@ -103,23 +107,32 @@ public final class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 trustedDocument = WebPolicy.classifyDocument(url);
+                trustedUrl = trustedDocument ? url : null;
                 if (!trustedDocument || bridgesInstalled) {
                     web.removeJavascriptInterface("ksu");
                     web.removeJavascriptInterface("hspApp");
                     bridgesInstalled = false;
                 }
+                installBridgesIfCurrent(url);
+            }
+
+            @Override
+            public void onPageCommitVisible(WebView view, String url) {
+                installBridgesIfCurrent(url);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
-                if (trustedDocument && WebPolicy.classifyDocument(url) && !bridgesInstalled) {
-                    installBridges();
-                }
+                installBridgesIfCurrent(url);
             }
 
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 Uri u = request.getUrl();
+                if (u != null && localHtml != null && WebPolicy.classifyDocument(u.toString())) {
+                    return new WebResourceResponse("text/html", "utf-8",
+                            new ByteArrayInputStream(localHtml.getBytes(StandardCharsets.UTF_8)));
+                }
                 if (u == null || !WebPolicy.subresource(u.toString())) {
                     return new WebResourceResponse("text/plain", "utf-8", null);
                 }
@@ -128,21 +141,21 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (request.isForMainFrame()) {
-                    showHtml(page("界面加载失败", "本地界面未能加载，root 桥已关闭。", true));
-                }
             }
         });
         load();
     }
 
     private void showHtml(String html) {
+        localHtml = html;
         App.ui(() -> {
             trustedDocument = false;
+            trustedUrl = null;
             web.removeJavascriptInterface("ksu");
             web.removeJavascriptInterface("hspApp");
             bridgesInstalled = false;
-            web.loadDataWithBaseURL(BASE_URL, html, "text/html", "utf-8", null);
+            installBridges();
+            web.loadUrl(BASE_URL);
         });
     }
 
@@ -184,6 +197,12 @@ public final class MainActivity extends Activity {
         web.addJavascriptInterface(new KsuBridge(), "ksu");
         web.addJavascriptInterface(new AppBridge(), "hspApp");
         bridgesInstalled = true;
+    }
+
+    private void installBridgesIfCurrent(String url) {
+        if (trustedDocument && url != null && url.equals(trustedUrl) && !bridgesInstalled) {
+            installBridges();
+        }
     }
 
     private String page(String title, String msg, boolean retry) {

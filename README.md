@@ -10,6 +10,9 @@
 > 设计已定稿，见 [术语表](GLOSSARY.md)、[架构决策](docs/adr/README.md) 和
 > [验收标准](docs/ACCEPTANCE.md)。当前代码仍是上游状态，适配尚未开始。
 
+App 签名密钥不随仓库分发。构建者需在仓库外保存本项目唯一的 keystore；
+签名身份固定为 ADR-0011 中记录的证书，不可逐次重建。
+
 给 **一加 8T KB2000（Android 16，Magisk 31.1）** 适配的 Magisk / KernelSU 模块，增强 Wi‑Fi 个人热点：
 
 1. 在桌面 App「热点增强」/ 快捷设置磁贴 / 模块 WebUI / 命令行里开关热点（沿用系统里已经保存的 SSID、密码、频段）
@@ -26,7 +29,7 @@
 - **默认网段保持设备现有的 192.168.42.0/24**：网关 192.168.42.1，地址池 192.168.42.100–192.168.42.200。
 - **不再迁移到上游的 192.168.4.0/24**：安装和升级只补缺失的默认文件，已有 `config.conf`、`leases.conf` 原样保留，不静默改写用户设置。
 - **安装包不依赖 KernelSU 管理器**：installer 在 Magisk 下同样可用，优先探测 `/data/adb/magisk/busybox`，并报告版本、架构、Android API 和 `udhcpd` 可用性。
-- **离线打包**：`sh package.sh [输出目录]` 默认生成不含 APK 的模块包；设置的路径不含 keystore、密码、APK 或设备证据。
+- **离线打包**：`sh package.sh [输出目录]` 默认生成不含 APK 的模块包；`sh package.sh --include-app dist` 可生成包含已签名 App 的本地发行包。两种方式都不会包含 keystore、密码或设备证据。
 
 ### v0.2.0 更新（上游历史，已被 v0.3.0 取代）
 

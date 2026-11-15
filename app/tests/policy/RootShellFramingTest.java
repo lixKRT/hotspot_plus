@@ -22,6 +22,9 @@ public final class RootShellFramingTest {
         check("commands cannot use newline", !CommandPolicy.allowed("set DNS=1.1.1.1\nid", true));
         check("executor rejects quote", RootShell.unsafeArg("a'b"));
         check("executor rejects newline", RootShell.unsafeArg("a\nb"));
+        check("bare uid accepted", RootShell.isRootId("0\n"));
+        check("posix id accepted", RootShell.isRootId("uid=0(root) gid=0(root) groups=0(root)\n"));
+        check("non-root uid rejected", !RootShell.isRootId("uid=2000(shell) gid=2000(shell)\n"));
         System.out.println("root framing: " + (failures == 0 ? "ok" : failures + " failed"));
         if (failures != 0) System.exit(1);
     }

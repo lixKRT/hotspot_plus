@@ -32,7 +32,9 @@ public final class WebPolicy {
     /** Main-frame and subresource requests must stay on the local origin. */
     public static boolean subresource(String url) {
         URI u = parse(url);
-        return u != null && isLocalOrigin(u);
+        if (u == null) return false;
+        if (isLocalOrigin(u)) return true;
+        return "data".equalsIgnoreCase(u.getScheme());
     }
 
     private static boolean isLocalOrigin(URI u) {

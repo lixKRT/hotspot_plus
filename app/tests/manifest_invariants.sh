@@ -34,3 +34,10 @@ grep -q 'exec(`${HSP} ${args}`' "$WEB" || fail 'fixed hsp command surface'
 grep -q "lease stage" "$WEB" || fail 'lease stage surface'
 grep -q '薄壳桥不可用' "$WEB" || fail 'degraded bridge copy'
 ! grep -q 'KernelSU WebUI 环境' "$WEB" || fail 'stale bridge fallback copy'
+
+# The local document must be served through the trusted origin. A data: main
+# document is rejected by the interceptor and shows ERR_INVALID_RESPONSE.
+grep -q 'web.loadUrl(BASE_URL)' "$APP/src/com/lixkrt/hotspotplus/MainActivity.java" \
+    || fail 'local page must load the trusted origin'
+! grep -q 'loadDataWithBaseURL\|loadData(html' "$APP/src/com/lixkrt/hotspotplus/MainActivity.java" \
+    || fail 'local page must not use data: document loading'

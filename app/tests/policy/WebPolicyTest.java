@@ -14,7 +14,9 @@ public final class WebPolicyTest {
         check("lookalike host is external, never trusted", WebPolicy.navigation("https://hotspot-plus.local.evil/") == WebPolicy.Nav.EXTERNAL);
         check("local subresource allowed", WebPolicy.subresource(WebPolicy.LOCAL_ORIGIN + "index.html"));
         check("remote subresource blocked", !WebPolicy.subresource("https://example.com/a.js"));
-        check("data subresource blocked", !WebPolicy.subresource("data:text/html,x"));
+        check("data main document allowed", WebPolicy.subresource("data:text/html;charset=utf-8;base64,PGh0bWw+"));
+        check("data document is not trusted", !WebPolicy.classifyDocument("data:text/html,<script>alert(1)</script>"));
+        check("file subresource blocked", !WebPolicy.subresource("file:///data/local/tmp/x"));
         System.out.println("web policy: " + (failures == 0 ? "ok" : failures + " failed"));
         if (failures != 0) System.exit(1);
     }

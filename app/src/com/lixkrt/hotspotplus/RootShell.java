@@ -275,7 +275,7 @@ public final class RootShell {
                 close();
                 throw new DeniedException("su 已退出 (" + e.getMessage() + ")");
             }
-            if (requireUid0 && !"0".equals(r.out.trim())) {
+            if (requireUid0 && !isRootId(r.out)) {
                 close();
                 throw new DeniedException("uid=" + r.out.trim());
             }
@@ -337,6 +337,12 @@ public final class RootShell {
             }
             p.destroy();
         }
+    }
+
+    static boolean isRootId(String out) {
+        if (out == null) return false;
+        String s = out.trim();
+        return "0".equals(s) || s.startsWith("uid=0 ") || s.startsWith("uid=0(");
     }
 
     // ------------------------------------------------------------------ JS glue (pure)
