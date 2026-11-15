@@ -1,0 +1,6 @@
+192.168.42.101 dev wlan2 lladdr 02:00:00:00:00:01 REACHABLE
+192.168.42.102 dev wlan2 lladdr 02:00:00:00:00:02 STALE
+192.168.42.103 dev wlan2 lladdr 02:00:00:00:00:03 REACHABLE
+fd00::101 dev wlan2 lladdr 02:00:00:00:00:01 REACHABLE
+fd00::102 dev wlan2 lladdr 02:00:00:00:00:02 REACHABLE
+fe80::201 dev wlan2 lladdr 02:00:00:00:00:01 STALE
