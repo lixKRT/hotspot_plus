@@ -271,6 +271,24 @@ repeated_crash_retry_cycles_eventually_degrade() {
         [ "$(_dhcp_state retry_available)" = 1 ]
 }
 
+failures_after_long_idle_still_accumulate() {
+    _dhcp_env crash-idle || return 1
+    _dhcp_eval 'dhcp_session_begin; dhcp_set serving 1
+        _now=$(date +%s)
+        dhcp_crash "crash 1"
+        [ "$(dhcp_get failures)" = 1 ] || exit 1
+        dhcp_set last_failure_at $((_now - 1000))
+        dhcp_crash "crash 2"
+        [ "$(dhcp_get failures)" = 2 ] || exit 1
+        dhcp_set last_failure_at $((_now - 1000))
+        dhcp_crash "crash 3"
+        [ "$(dhcp_get failures)" = 3 ] || exit 1
+        [ "$(dhcp_get degraded)" = 1 ] || exit 1' || return 1
+    [ "$(_dhcp_state degraded)" = 1 ] &&
+        [ "$(_dhcp_state failures)" = 3 ] &&
+        [ "$(_dhcp_state last_error)" = "crash 3" ]
+}
+
 stable_health_period_clears_failure_window() {
     _dhcp_env stable-window || return 1
     _dhcp_eval 'dhcp_session_begin
@@ -361,6 +379,7 @@ run_case "udhcpd start failure installs no takeover" udhcpd_start_failure_instal
 run_case "firewall failure removes jump before dhcp stop" firewall_failure_removes_jump_before_stopping_udhcpd
 run_case "repeated udhcpd crashes become degraded" repeated_crashes_enter_visible_degraded_mode
 run_case "crash/retry cycles keep an accumulated window" repeated_crash_retry_cycles_eventually_degrade
+run_case "long idle does not clear accumulated failures" failures_after_long_idle_still_accumulate
 run_case "stable health period clears failure window" stable_health_period_clears_failure_window
 run_case "status exposes DHCP degraded and retry" status_exposes_dhcp_degraded_and_retry
 run_case "DHCP retry restores leases without restart" retry_success_restores_static_leases_without_restart

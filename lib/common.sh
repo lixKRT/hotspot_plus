@@ -18,7 +18,6 @@ HSCTL_JAR=$MODDIR/bin/hsctl.jar
 FW_CHAIN=hsp_dhcp
 DHCPSTATE=$RUN/dhcp
 
-DHCP_FAIL_WINDOW=${HSP_DHCP_FAIL_WINDOW:-900}
 DHCP_STABLE_SECS=${HSP_DHCP_STABLE_SECS:-120}
 
 mkdir -p "$RUN" "$LOGDIR" 2>/dev/null
@@ -710,9 +709,6 @@ dhcp_fail_limit() {
 dhcp_stable_secs() {
     case "$DHCP_STABLE_SECS" in ''|*[!0-9]*) echo 120 ;; *) echo "$DHCP_STABLE_SECS" ;; esac
 }
-dhcp_fail_window() {
-    case "$DHCP_FAIL_WINDOW" in ''|*[!0-9]*) echo 900 ;; *) echo "$DHCP_FAIL_WINDOW" ;; esac
-}
 dhcp_session_begin() {
     mkdir -p "$RUN" 2>/dev/null
     {
@@ -780,13 +776,6 @@ dhcp_record_failure() { # reason error
     case "$_df" in ''|*[!0-9]*) _df=0 ;; esac
     _dff=$(dhcp_get first_failure_at); _dff=${_dff:-0}
     case "$_dff" in ''|*[!0-9]*) _dff=0 ;; esac
-    _dlf=$(dhcp_get last_failure_at); _dlf=${_dlf:-0}
-    case "$_dlf" in ''|*[!0-9]*) _dlf=0 ;; esac
-    _dw=$(dhcp_fail_window)
-    if [ "$_df" -gt 0 ] && { [ "$_dff" -eq 0 ] || [ $((_dn - _dlf)) -gt "$_dw" ]; }; then
-        _df=0; _dff=0
-        log "dhcp: failure window expired (${_dw}s); resetting consecutive failures"
-    fi
     _df=$((_df + 1))
     [ "$_dff" -eq 0 ] && _dff=$_dn
     dhcp_set failures "$_df"
