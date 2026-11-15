@@ -26,7 +26,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Hosts the module's own WebUI (single source of truth: /data/adb/modules/hotspot_plus/webroot/index.html,
- * read through su) and provides a KernelSU-compatible `window.ksu` bridge backed by persistent root shells.
+ * read through su) and provides a WebUI-compatible `window.ksu` bridge backed by persistent root shells.
  */
 public final class MainActivity extends Activity {
     static final String BASE_URL = WebPolicy.LOCAL_ORIGIN;
@@ -62,7 +62,7 @@ public final class MainActivity extends Activity {
             return WindowInsets.CONSUMED;
         });
         setContentView(root);
-        // must run after setContentView: on HyperOS the DecorView doesn't exist yet before it (NPE in getInsetsController)
+        // must run after setContentView: some OEM themes have no DecorView before it
         try {
             WindowInsetsController ic = w.getDecorView().getWindowInsetsController();
             if (ic != null) {
@@ -164,7 +164,7 @@ public final class MainActivity extends Activity {
         showHtml(page("正在获取 root 权限…", "", false));
         App.shell().execArgv(BridgeCommands.moduleDisabled(BridgeCommands.DISABLE), disabled -> {
             if (disabled.code == 0) {
-                showHtml(page("本地界面不可用", "模块 hotspot_plus 已被禁用。请启用模块并重启；不会加载远程页面或旧的内置副本。", true));
+                showHtml(page("本地界面不可用", "模块 hotspot_plus v0.3.0 已被禁用。请在 Magisk 中启用模块并重启；本应用不会加载内置副本或远程页面。", true));
                 return;
             }
             App.shell().execArgv(BridgeCommands.readPage(BridgeCommands.PAGE), r -> {
@@ -174,7 +174,7 @@ public final class MainActivity extends Activity {
                 }
                 String html = r.out;
                 if (r.code != 0 || !html.contains("<html")) {
-                    showHtml(page("本地界面不可用", "未找到模块 hotspot_plus 的 WebUI，或模块已被禁用。请安装/启用模块并重启；不会加载远程页面或旧的内置副本。", true));
+                    showHtml(page("本地界面不可用", "未找到模块 hotspot_plus v0.3.0 的本地 WebUI。请在 Magisk 中安装或启用模块并重启；本应用不会回退到内置副本或远程页面。", true));
                     return;
                 }
                 showHtml(html);
@@ -230,7 +230,7 @@ public final class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    /** App-only helpers (not part of the KernelSU API). */
+    /** App-only helpers (not part of the legacy WebUI bridge API). */
     final class AppBridge {
         @JavascriptInterface
         public void retry() {
@@ -238,7 +238,7 @@ public final class MainActivity extends Activity {
         }
     }
 
-    /** Same surface as KernelSU's WebUI `window.ksu` (exec / toast / fullScreen / moduleInfo). */
+    /** Same surface as the WebUI `window.ksu` bridge (exec / toast / fullScreen / moduleInfo). */
     final class KsuBridge {
         @JavascriptInterface
         public void exec(String cmd, String callback) {
@@ -255,7 +255,7 @@ public final class MainActivity extends Activity {
                 App.ui(() -> {
                     if (trustedDocument) {
                         web.evaluateJavascript(RootShell.callbackJs(callback,
-                                new RootShell.Result(126, "", "命令不在 hsp 固定接口内", false)), null);
+                                new RootShell.Result(126, "", "命令不在 hsp 允许的固定接口内。", false)), null);
                     }
                 });
                 return;
@@ -274,7 +274,7 @@ public final class MainActivity extends Activity {
                 App.ui(() -> {
                     if (trustedDocument) {
                         web.evaluateJavascript(RootShell.callbackJs(callback,
-                                new RootShell.Result(126, "", "静态租约数据无效", false)), null);
+                                new RootShell.Result(126, "", "静态租约导入数据无效。", false)), null);
                     }
                 });
                 return;

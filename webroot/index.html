@@ -297,7 +297,12 @@ async function setHotspot(on) {
   refreshClients();
 }
 $('apSwitch').addEventListener('change', (e) => setHotspot(e.target.checked));
-$('btnRefresh').onclick = () => { refreshStatus(); refreshClients(); };
+async function refreshAll() {
+  await refreshStatus();
+  if (!formBusy() && !formDirty()) await loadConfig(false); // re-read persisted config; keep unsaved edits
+  refreshClients();
+}
+$('btnRefresh').onclick = refreshAll;
 $('btnRestart').onclick = () => runOp('重启热点', async (call) => {
   $('apText').textContent = '正在重启…';
   const r = await call('restart', 300000); toast(lastLine(r));
@@ -357,12 +362,29 @@ $('btnClients').onclick = refreshClients;
 // ---- config ----
 const BOOL_KEYS = ['FIXED_GATEWAY', 'DHCP_ENABLE', 'ENFORCE_GATEWAY', 'AUTO_START', 'METERED'];
 const TEXT_KEYS = ['GATEWAY', 'PREFIX', 'DHCP_START', 'DHCP_END', 'LEASE_TIME', 'DNS', 'AP_IFACE'];
-async function loadConfig() {
+let cfgForm = '';        // snapshot of the last persisted values this form was rendered from
+const formBusy = () => busy || !!(lastStatus && lastStatus.op_busy);
+function formSnapshot(c) {
+  const o = {};
+  BOOL_KEYS.forEach((k) => (o[k] = c[k] === '1'));
+  TEXT_KEYS.forEach((k) => (o[k] = c[k] || ''));
+  return o;
+}
+function formDirty() {
+  if (!cfgForm) return false;
+  return BOOL_KEYS.some((k) => $(k).checked !== cfgForm[k]) ||
+    TEXT_KEYS.some((k) => $(k).value.trim() !== String(cfgForm[k]).trim());
+}
+// force=false: only overwrite untouched controls, so a status poll or a stray 刷新
+// cannot silently discard edits the user has not saved yet.
+async function loadConfig(force = true) {
   const r = await hsp('config', 15000);
   const c = parseJson(r.stdout);
   if (!c) { toast('读取配置失败'); return; }
-  BOOL_KEYS.forEach((k) => ($(k).checked = c[k] === '1'));
-  TEXT_KEYS.forEach((k) => ($(k).value = c[k] || ''));
+  const next = formSnapshot(c);
+  BOOL_KEYS.forEach((k) => { if (force || $(k).checked === cfgForm[k]) $(k).checked = next[k]; });
+  TEXT_KEYS.forEach((k) => { if (force || $(k).value.trim() === String(cfgForm[k]).trim()) $(k).value = next[k]; });
+  cfgForm = next;
   $('leases').innerHTML = '';
   (c.leases || []).forEach((l) => addLeaseRow(l.mac, l.ip, l.name));
 }
@@ -381,10 +403,15 @@ $('btnSaveCfg').onclick = () => {
   TEXT_KEYS.forEach((k) => args.push(`${k}=${$(k).value.trim().replace(/\s+/g, '')}`));
   runOp('保存并应用配置', async (call) => {
     const r = await call('set ' + args.join(' '), 15000);
-    if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
+    if (r.errno !== 0) {
+      toast(lastLine(r) || '保存失败');
+      await loadConfig();   // the save was rejected: show what is actually persisted
+      return;
+    }
     toast('已保存，正在应用…');
     const a = await call('apply', 300000);
     toast(lastLine(a));
+    await loadConfig();
   });
 };
 
