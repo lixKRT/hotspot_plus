@@ -70,10 +70,10 @@ tmo() {
 ipt() { tmo 15 "iptables $*" "$IPT" -w 5 "$@"; }
 
 # ---------------------------------------------------------------- device info
-SDK=$(getprop ro.build.version.sdk)
-RELEASE=$(getprop ro.build.version.release)
-HYPEROS=$(getprop ro.mi.os.version.incremental)
-[ -n "$HYPEROS" ] || HYPEROS=$(getprop ro.build.version.incremental)
+SDK=$(getprop ro.build.version.sdk 2>/dev/null)
+RELEASE=$(getprop ro.build.version.release 2>/dev/null)
+HYPEROS=$(getprop ro.mi.os.version.incremental 2>/dev/null)
+[ -n "$HYPEROS" ] || HYPEROS=$(getprop ro.build.version.incremental 2>/dev/null)
 
 # ---------------------------------------------------------------- config
 config_defaults() {
