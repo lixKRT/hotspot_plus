@@ -1,4 +1,14 @@
-# Hotspot Plus · 热点增强（KernelSU 模块）
+# Hotspot Plus · 热点增强
+
+> **一加 8T 适配工作仓库（公开）**
+>
+> 上游：<https://github.com/huanghaiyangyy/hotspot_plus>，基线提交
+> `0c48154e7c7c68adc0b25d7ccf9608a2715aaa10`（`v0.2.1`）。
+> 本仓库是针对一加 8T KB2000、Android 16、Magisk 31.1 的适配工作区。
+> 上游没有许可证文件；来源与再分发状态见 [仓库说明](docs/REPOSITORY.md)。
+>
+> 设计已定稿，见 [术语表](GLOSSARY.md)、[架构决策](docs/adr/README.md) 和
+> [验收标准](docs/ACCEPTANCE.md)。当前代码仍是上游状态，适配尚未开始。
 
 给 **Xiaomi 17 Pro（骁龙 8 Elite Gen 5，HyperOS OS4.0.0.40.XBLCNXM，Android 17 / SDK 37）** 用的 KernelSU 模块，增强 Wi‑Fi 个人热点：
 
