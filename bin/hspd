@@ -1,8 +1,9 @@
 #!/system/bin/sh
 # shellcheck disable=SC3045
 # hotspot_plus daemon: watches the hotspot interface, runs udhcpd (static leases) on it,
-# blocks Android's DhcpServer replies while udhcpd serves, and optionally re-starts a hotspot
-# that was turned on from the system toggle so it gets the fixed gateway.
+# blocks Android's DhcpServer replies while udhcpd serves, and drives the bounded fixed-gateway
+# repair policy (ADR-0007): one repair restart for a system-started hotspot, two for a
+# module-started one, then a visible degradation for the rest of the session.
 MODDIR=${0%/*}; MODDIR=${MODDIR%/bin}
 export MODDIR HSP_BB=1
 # shellcheck disable=SC2034,SC3045
@@ -14,7 +15,9 @@ if [ -n "$(daemon_pid)" ]; then echo "already running"; exit 0; fi
 echo $$ > "$RUN/hspd.pid"
 load_config
 log "daemon start (pid $$) Android $RELEASE SDK $SDK HyperOS $HYPEROS busybox=$BB udhcpd=$(bb_has udhcpd && echo yes || echo no)"
-rm -f "$RUN/enforce_broken" "$RUN/fw_ok" "$RUN/enforce_pending"
+rm -f "$RUN/fw_ok"
+# A daemon restart must not grant a second repair budget to an already degraded session.
+gw_active && [ "$(gw_get result)" = repairing ] && gw_set pending 0
 
 CUR=""          # "iface addr" of the session we are serving
 FP=""           # last address fingerprint
@@ -50,42 +53,18 @@ session_down() {
     dhcp_stop
     fw_del
     CUR=""; DHCP_FAILS=0
-    rm -f "$RUN/session" "$RUN/enforce_pending"
-}
-
-maybe_enforce() { # returns 0 if a restart was triggered
-    [ "$FIXED_GATEWAY" = 1 ] && [ "$ENFORCE_GATEWAY" = 1 ] || return 1
-    [ "${AP_ADDR%/*}" = "$GATEWAY" ] && return 1
-    dhcp_capable || return 1
-    [ -f "$RUN/enforce_broken" ] && return 1
-    _now=$(date +%s)
-    _sb=$(cat "$RUN/started_by_hsp" 2>/dev/null || echo 0)
-    if [ $(( _now - _sb )) -lt 90 ]; then
-        log "ERROR: hotspot was started by us with static gateway $GATEWAY but got ${AP_ADDR%/*}; ROM ignores TetheringRequest static address. Stop enforcing this boot."
-        touch "$RUN/enforce_broken"
-        return 1
-    fi
-    _le=$(cat "$RUN/last_enforce" 2>/dev/null || echo 0)
-    [ $(( _now - _le )) -lt 120 ] && return 1
-    echo "$_now" > "$RUN/last_enforce"
-    echo "$_now" > "$RUN/enforce_pending"
-    log "hotspot started elsewhere with gateway ${AP_ADDR%/*}; restarting it with fixed $GATEWAY"
-    setsid sh "$MODDIR/bin/hsp" restart >/dev/null 2>&1 < /dev/null 3>&- 9>&- &
-    return 0
-}
-
-enforce_pending() { # true while a restart we triggered is in flight (max 60s)
-    _ep=$(cat "$RUN/enforce_pending" 2>/dev/null) || return 1
-    [ $(( $(date +%s) - ${_ep:-0} )) -lt 60 ] && return 0
-    rm -f "$RUN/enforce_pending"; return 1
+    rm -f "$RUN/session"
+    gw_session_down "$(date +%s)"
 }
 
 session_up() {
     log "AP up: $AP_IF $AP_ADDR"
     CUR="$AP_IF $AP_ADDR"
     echo "$CUR $(date +%s)" > "$RUN/session"
-    if maybe_enforce; then rm -f "$RUN/started_by_hsp"; return; fi
-    rm -f "$RUN/started_by_hsp"   # consumed: only the first AP-up after `hsp on` counts
+    gw_observe "$AP_IF" "$AP_ADDR"
+    # A repair restart in flight leaves the address about to change; a only-scheduled retry
+    # keeps the hotspot usable, so DHCP still serves the (mapped) actual subnet meanwhile.
+    gw_pending && return
     serve_dhcp
 }
 
@@ -121,7 +100,9 @@ while :; do
         if [ "$CUR" != "$AP_IF $AP_ADDR" ]; then
             [ -n "$CUR" ] && session_down
             session_up
-        elif [ "$DHCP_ENABLE" = 1 ] && ! enforce_pending; then
+        elif gw_tick "$NOW" "$AP_ADDR"; then
+            log "gateway: repair restart dispatched; pausing DHCP health checks"
+        elif [ "$DHCP_ENABLE" = 1 ] && ! gw_pending; then
             # health checks for the running session
             if [ $DHCP_FAILS -lt 5 ] && dhcp_capable && ! dhcp_running; then
                 log "udhcpd not running, (re)starting (fails=$DHCP_FAILS)"

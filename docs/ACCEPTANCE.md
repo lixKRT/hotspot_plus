@@ -13,3 +13,16 @@
 9. 提供去敏日志，包含模块版本、探测结果和任何未验证项。
 
 缺少证据的项目记录为“未验证”，不能算部分通过。
+
+## Issue #5 固定网关与有界修复
+
+| 项目 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| 配置网关校验（私网、16–28 前缀、拒绝网络/广播地址、默认 `.42.1/24`） | PASS（离线） | `tests/test_gateway.sh` 校验矩阵与 `hsp set` 拒绝用例；无效 `config.conf` 回落到默认 |
+| 模块启动后最多再重启两次（约 5s / 15s）后降级 | PASS（离线） | `module_retry_uses_15s_then_degrades` 断言 attempts=2、limit=2、degraded、不再重启 |
+| 系统启动只做一次修复重启后降级 | PASS（离线） | `system_mismatch_degrades_after_one_repair`、`system_start_successful_repair_is_bounded` |
+| 修复额度按会话计数，主动关闭再开启重置 | PASS（离线） | `manual_off_on_starts_new_budget`、`off clears repair state` |
+| 状态/日志暴露尝试次数、最终网关、降级原因 | PASS（离线） | `status --json` 的 `gateway_attempts/gateway_limit/gateway_final/gateway_degraded/gateway_reason`；日志含 `gateway: repair attempt N/M` |
+| 修复不改写已保存 SSID/密码/频段/黑名单 | PASS（离线） | 修复路径只调用 `hsctl stop/start`（沿用系统已保存配置）与 `gw_set`，不触碰 Wi‑Fi 配置存储 |
+| **目标构建实际采纳固定网关请求** | **UNVERIFIED** | `docs/probes/02-platform-report.md`：请求字段存在，但验证需要重启热点或安装临时模块，超出只读范围；未在真机观测到修复后网关变为 `192.168.42.1/24` |
+| 每次修复重启后客户端断开/恢复 | **UNVERIFIED** | 需要真机与真实客户端；离线测试只证明重启次数有界 |

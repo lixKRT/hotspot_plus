@@ -13,6 +13,7 @@ CONF=$DATA/config.conf
 LEASES=$DATA/leases.conf
 LEASE_DB=$DATA/udhcpd.leases
 STATE=$RUN/state
+GWSTATE=$RUN/gateway
 HSCTL_JAR=$MODDIR/bin/hsctl.jar
 FW_CHAIN=hsp_dhcp
 
@@ -101,6 +102,14 @@ load_config() {
     case "$PREFIX" in ''|*[!0-9]*) PREFIX=24 ;; esac
     case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=3 ;; esac
     case "$LEASE_TIME" in ''|*[!0-9]*) LEASE_TIME=43200 ;; esac
+    if ! gateway_addr_valid "$GATEWAY" "$PREFIX"; then
+        log "WARN: invalid GATEWAY/PREFIX ($GATEWAY/$PREFIX); using 192.168.42.1/24"
+        GATEWAY=192.168.42.1; PREFIX=24
+    fi
+    if ! gateway_dhcp_valid "$GATEWAY" "$PREFIX" "$DHCP_START" "$DHCP_END"; then
+        log "WARN: invalid DHCP range ($DHCP_START-$DHCP_END) for $GATEWAY/$PREFIX; using 192.168.42.100-200"
+        DHCP_START=192.168.42.100; DHCP_END=192.168.42.200
+    fi
 }
 
 # ---------------------------------------------------------------- lifecycle state
@@ -234,6 +243,277 @@ ap_detect_fast() {
         if addr_fp | grep -qx "$_si $_sa"; then AP_IF=$_si; AP_ADDR=$_sa; return 0; fi
     fi
     ap_detect
+}
+
+# ---------------------------------------------------------------- fixed gateway policy
+# ADR-0007: module-start may request the gateway, retry twice (5s/15s) and then degrade;
+# system-start gets exactly one repair restart. Attempts are counted per hotspot session.
+is_private_ipv4() {
+    is_ipv4 "$1" || return 1
+    case "$1" in
+        10.*|192.168.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    esac
+    return 1
+}
+prefix_valid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 16 ] && [ "$1" -le 28 ]
+}
+in_subnet() { # ip network_int size (host part excludes network/broadcast)
+    _off=$(( $(ip2int "$1") - $2 ))
+    [ "$_off" -gt 0 ] && [ "$_off" -lt $(( $3 - 1 )) ]
+}
+gateway_addr_valid() { # gateway prefix
+    is_ipv4 "$1" || return 1
+    prefix_valid "$2" || return 1
+    is_private_ipv4 "$1" || return 1
+    _m=$(pfx2mask_int "$2"); _n=$(( $(ip2int "$1") & _m )); _sz=$(( 1 << (32 - $2) ))
+    in_subnet "$1" "$_n" "$_sz"
+}
+gateway_dhcp_valid() { # gateway prefix dhcp_start dhcp_end
+    gateway_addr_valid "$1" "$2" || return 1
+    is_ipv4 "$3" && is_ipv4 "$4" || return 1
+    _m=$(pfx2mask_int "$2"); _n=$(( $(ip2int "$1") & _m )); _sz=$(( 1 << (32 - $2) ))
+    in_subnet "$3" "$_n" "$_sz" && in_subnet "$4" "$_n" "$_sz" || return 1
+    _s=$(ip2int "$3"); _e=$(ip2int "$4"); _g=$(ip2int "$1")
+    [ "$_s" -le "$_e" ] || return 1
+    ! { [ "$_g" -ge "$_s" ] && [ "$_g" -le "$_e" ]; }
+}
+gateway_matches() { # cfg(ip/prefix) actual(ip/prefix)
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    [ "${1%/*}" = "${2%/*}" ] && [ "${1#*/}" = "${2#*/}" ]
+}
+
+# Attempt budget for one session. $1=origin $2=repairs already done.
+gw_repair_limit() {
+    case "$1" in
+        module) echo 2 ;;
+        system) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+gw_repair_delay() { # origin attempt_number (1-based)
+    case "$1" in
+        module) [ "$2" = 1 ] && echo 5 || echo 15 ;;
+        system) echo 0 ;;
+        *) return 1 ;;
+    esac
+}
+gateway_repair_plan() { # origin attempts_done -> "restart <delay>" | "degrade 0"
+    _lim=$(gw_repair_limit "$1")
+    [ "$_lim" -gt 0 ] || { echo "degrade 0"; return 0; }
+    if [ "$2" -ge "$_lim" ]; then echo "degrade 0"; return 0; fi
+    echo "restart $(gw_repair_delay "$1" $(( $2 + 1 )))"
+}
+
+gw_get() { # key
+    [ -f "$GWSTATE" ] || return 1
+    sed -n "s/^$1=//p" "$GWSTATE" 2>/dev/null | tail -n1
+}
+gw_set() { # key value
+    [ $# -ge 2 ] || return 1
+    mkdir -p "$RUN" 2>/dev/null
+    _gtmp=$GWSTATE.tmp.$$
+    if [ -f "$GWSTATE" ]; then
+        grep -v "^$1=" "$GWSTATE" > "$_gtmp" 2>/dev/null || :
+    else
+        : > "$_gtmp"
+    fi
+    printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ' | tr -d '\000')" >> "$_gtmp"
+    mv -f "$_gtmp" "$GWSTATE"
+}
+gw_active() { [ -f "$GWSTATE" ] && [ "$(gw_get active)" = 1 ]; }
+gw_pending() { [ "$(gw_get pending)" = 1 ]; }
+
+# Summary survives session end so `hsp status` can show the last outcome.
+gw_summary_write() { # result reason
+    state_set gw_result "$1"
+    state_set gw_reason "${2:-}"
+    state_set gw_attempts "$(gw_get attempts)"
+    state_set gw_limit "$(gw_get limit)"
+    state_set gw_origin "$(gw_get origin)"
+    state_set gw_final_gw "$(gw_get final_gw)"
+    state_set gw_degraded "$(gw_get degraded)"
+    state_set gw_at "$(date +%s)"
+}
+
+gw_session_begin() { # origin(module|system)
+    _go=${1:-system}
+    _gn=$(date +%s)
+    mkdir -p "$RUN" 2>/dev/null
+    rm -f "$GWSTATE" "$RUN/enforce_broken"
+    {
+        echo "active=1"
+        echo "session=$_gn-$$"
+        echo "origin=$_go"
+        echo "attempts=0"
+        echo "limit=$(gw_repair_limit "$_go")"
+        echo "pending=0"
+        echo "pending_at=0"
+        echo "seen=0"
+        echo "degraded=0"
+        echo "reason="
+        echo "result=starting"
+        echo "final_gw="
+        echo "next_at=0"
+        echo "at=$_gn"
+    } > "$GWSTATE"
+    state_set gw_result starting
+    state_set gw_reason ""
+    log "gateway: session begin origin=$_go limit=$(gw_repair_limit "$_go")"
+}
+
+gw_session_end() { # result reason
+    gw_active || return 0
+    gw_summary_write "${1:-ended}" "${2:-}"
+    log "gateway: session end result=${1:-ended} attempts=$(gw_get attempts) final=$(gw_get final_gw)${2:+ reason=$2}"
+    rm -f "$GWSTATE" "$RUN/enforce_broken"
+}
+
+gw_degrade() { # reason
+    gw_set degraded 1
+    gw_set result degraded
+    gw_set reason "$1"
+    gw_set next_at 0
+    gw_set pending 0
+    touch "$RUN/enforce_broken"
+    gw_summary_write degraded "$1"
+    log "gateway: DEGRADED origin=$(gw_get origin) attempts=$(gw_get attempts) final=$(gw_get final_gw) reason=$1"
+}
+
+gw_recovered() { # final
+    gw_set degraded 0
+    gw_set result ok
+    gw_set reason ""
+    gw_set next_at 0
+    gw_set final_gw "$1"
+    rm -f "$RUN/enforce_broken"
+    gw_summary_write ok ""
+    log "gateway: ok origin=$(gw_get origin) attempts=$(gw_get attempts) gateway=$1"
+}
+
+gw_spawn_repair() {
+    log "gateway: repair restart to apply $GATEWAY/$PREFIX (attempt $(gw_get attempts)/$(gw_get limit), origin $(gw_get origin))"
+    # Test hook: the caller drives `hsp repair` synchronously instead of a background child.
+    [ "$HSP_GW_NO_SPAWN" = 1 ] && return 0
+    setsid sh "$MODDIR/bin/hsp" repair >/dev/null 2>&1 < /dev/null 3>&- 9>&- &
+}
+
+gw_attempt_start() { # now
+    gw_set attempts $(( $(gw_get attempts) + 1 ))
+    gw_set pending 1
+    gw_set pending_phase stopping
+    gw_set pending_at "$1"
+    gw_set next_at 0
+    gw_set result repairing
+    gw_set reason "mismatch: want $GATEWAY/$PREFIX, got $(gw_get final_gw)"
+    log "gateway: repair attempt $(gw_get attempts)/$(gw_get limit) origin=$(gw_get origin) current=$(gw_get final_gw)"
+    gw_spawn_repair
+}
+
+gw_pending_started() { gw_set pending_phase starting; }
+
+gw_observe() { # iface addr  (call when the hotspot is up)
+    _if=$1; _addr=$2
+    gw_active || gw_session_begin system
+    _origin=$(gw_get origin)
+    [ "$(gw_get seen)" = 1 ] || gw_set seen 1
+    if gw_pending; then
+        # Before the restart begins the old AP is still visible; only an observation made
+        # after the stop/start cycle counts as "the repair restart returned".
+        if [ "$(gw_get pending_phase)" != starting ]; then
+            log "gateway: repair restart in progress; ignoring observation $_addr"
+            return 1
+        fi
+        gw_set pending 0
+        gw_set pending_phase ""
+        gw_set pending_at 0
+        log "gateway: repair restart returned with $_addr (attempts $(gw_get attempts)/$(gw_get limit))"
+    fi
+    gw_set final_gw "$_addr"
+    gw_set iface "$_if"
+    if [ "$FIXED_GATEWAY" != 1 ] || [ "$ENFORCE_GATEWAY" != 1 ]; then
+        gw_set result disabled
+        gw_set reason "fixed gateway disabled"
+        gw_set next_at 0
+        gw_summary_write disabled "fixed gateway disabled"
+        log "gateway: fixed gateway disabled; not enforcing (gateway=$_addr)"
+        return 2
+    fi
+    if gateway_matches "$GATEWAY/$PREFIX" "$_addr"; then
+        gw_recovered "$_addr"
+        return 0
+    fi
+    if ! dhcp_capable; then
+        # Without our own DHCP a restart cannot change the gateway; do not churn the hotspot.
+        gw_degrade "fixed gateway unavailable: own DHCP is not capable"
+        return 3
+    fi
+    if [ "$(gw_get degraded)" = 1 ]; then
+        log "gateway: still mismatched ($_addr), session already degraded; no restart"
+        return 3
+    fi
+    _plan=$(gateway_repair_plan "$_origin" "$(gw_get attempts)")
+    case "$_plan" in
+        restart\ *)
+            _delay=${_plan#restart }
+            if [ "$_delay" = 0 ]; then
+                gw_attempt_start "$(date +%s)"
+            else
+                gw_set result waiting
+                gw_set reason "mismatch: want $GATEWAY/$PREFIX, got $_addr"
+                gw_set next_at $(( $(date +%s) + _delay ))
+                log "gateway: mismatch ($_addr); retry $(( $(gw_get attempts) + 1 ))/$(gw_get limit) in ${_delay}s"
+            fi ;;
+        *)
+            gw_degrade "mismatch: want $GATEWAY/$PREFIX, got $_addr; retries exhausted" ;;
+    esac
+    return 1
+}
+
+gw_tick() { # now current_addr -> 0 when a repair restart was triggered
+    gw_active || return 1
+    [ "$(gw_get degraded)" = 1 ] && return 1
+    gw_pending && return 1
+    _na=$(gw_get next_at)
+    _na=${_na:-0}
+    case "$_na" in ''|*[!0-9]*) _na=0 ;; esac
+    [ "$_na" -gt 0 ] && [ "$1" -ge "$_na" ] || return 1
+    if gateway_matches "$GATEWAY/$PREFIX" "$2"; then
+        gw_recovered "$2"
+        return 1
+    fi
+    gw_attempt_start "$1"
+    return 0
+}
+
+# Called when the AP goes down. A repair restart keeps the session alive while pending.
+gw_session_down() { # now
+    gw_active || return 0
+    if gw_pending; then
+        _pa=$(gw_get pending_at); _pa=${_pa:-0}
+        case "$_pa" in ''|*[!0-9]*) _pa=0 ;; esac
+        if [ $(( $1 - _pa )) -lt 120 ]; then
+            log "gateway: AP down while repair restart is in flight; keeping session"
+            return 0
+        fi
+        gw_set pending 0
+        gw_degrade "repair restart did not bring the hotspot back"
+        gw_session_end degraded "$(gw_get reason)"
+        return 0
+    fi
+    if [ "$(gw_get degraded)" = 1 ]; then
+        gw_session_end degraded "$(gw_get reason)"
+    elif [ "$(gw_get result)" = ok ]; then
+        gw_session_end ok ""
+    else
+        gw_session_end ended "$(gw_get reason)"
+    fi
+}
+
+gw_status_value() { # key -> active value, else persisted summary
+    if gw_active; then gw_get "$1"; else state_get "gw_$1"; fi
 }
 
 # ---------------------------------------------------------------- hsctl (dex) wrapper
@@ -557,7 +837,7 @@ unstick() {
         case "$_c" in *hspd*) continue ;; esac   # never kill the daemon here
         kill "$_l" 2>/dev/null && _killed="$_killed $_l(fd:${_c%% *})"
     done
-    rm -f "$LOCKF" "$HOLDF" "$RUN"/hsctl.*.out "$RUN/started_by_hsp"; rmdir "$LOCKD" 2>/dev/null
+    rm -f "$LOCKF" "$HOLDF" "$RUN"/hsctl.*.out; rmdir "$LOCKD" 2>/dev/null
     log "UNSTICK done; killed:${_killed:- none}"
     echo "已清除操作锁；结束的进程:${_killed:- 无}"
 }

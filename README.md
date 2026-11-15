@@ -75,7 +75,11 @@
 - 副作用（源码确认）：这个 API 同时要求一个 `staticClientAddress`，系统的 `DhcpServer` 会进入 **single‑client 模式**，只发这一个地址。所以本模块：
   - 用子网最后一个可用地址（.254）当占位 client 地址；
   - 只有在**自建 DHCP 可用**时才发静态地址请求。否则不固定网关，避免系统只给 1 台设备分配地址。
-- 局限：只有**经本模块开启**的热点才会固定网关。用系统开关/快捷开关打开时，网段仍然随机。这时如果 `ENFORCE_GATEWAY=1`，守护进程会**自动把热点重启一次**换成固定网关，有 120 秒冷却。如果模块自己开的热点网关还是不对（说明 ROM 忽略了这个请求），本次开机不再强制，DHCP 按实际网段工作。
+- 修复策略（ADR-0007，按热点会话计数，不会形成重启循环）：
+  - 模块启动：请求配置网关；若未生效，最多再重启两次，间隔约 5 秒、15 秒，仍不符则本次会话降级（DHCP 按实际网段映射，不再自动重启）。
+  - 系统启动：用系统开关/快捷开关打开且网关不符时，只做**一次**修复重启；仍不符立即降级，不叠加模块启动的重试额度。
+  - 用户主动关闭再开启会创建新会话并获得新额度；`hsp status` 的 `gateway_attempts/gateway_limit/gateway_final/gateway_degraded/gateway_reason` 记录尝试与结果。
+  - 目标构建是否采纳静态地址请求仍未实测（见 `docs/probes/02-platform-report.md`）。
 - 评估过但没采用的方案：
   - Tethering 资源 overlay：Android 16 的 `config.xml` 里没有固定 Wi‑Fi 前缀的资源（只有 P2P 的 `config_tether_enable_legacy_wifi_p2p_dedicated_ip`）。
   - DeviceConfig：没有对应开关。
@@ -174,7 +178,7 @@ su -c "$H unstick"       # 清除卡住的操作（结束残留 hsp/hsctl 进程
 | DHCP_START / DHCP_END | .100 / .200 | 动态地址池。不要包含 .254（占位地址） |
 | LEASE_TIME | 43200 | 租期（秒） |
 | DNS | 空 | 留空 = 网关（系统 dnsmasq 转发）；多个用逗号分隔 |
-| ENFORCE_GATEWAY | 1 | 系统开关打开热点且网关不符时，自动重启一次 |
+| ENFORCE_GATEWAY | 1 | 网关不符时执行 ADR-0007 的有界修复（系统启动 1 次，模块启动最多 2 次重试） |
 | AUTO_START | 0 | 开机自动开热点 |
 | AP_IFACE | 空 | 手动指定热点接口 |
 | METERED | 1 | 下发 ANDROID_METERED 标记 |
