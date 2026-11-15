@@ -18,6 +18,43 @@
 
 缺少证据的项目记录为“未验证”，不能算部分通过。
 
+## Issue #10 真机验收（一加 8T KB2000，Android 16 / SDK 36，v0.3.0）
+
+设备通过 ADB 连接，串号与真实客户端标识均未记录。测试 MAC 使用真实客户端的
+MAC，仅在本机命令中传入；本文以 `CLIENT-A`（原地址 `.145`）和 `CLIENT-B`
+（`.168`）代替。测试地址统一为 `192.168.42.50`。
+
+| 项目 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| 静态租约：绑定后客户端获得 `.42.50` | PASS | `hsp lease add CLIENT-A 192.168.42.50 acc-test` 返回 `static_lease CLIENT-A 192.168.42.50`；绑定后客户端主动 `ipconfig /release` + `/renew`，Windows 与 `ip neigh` 均显示 `.42.50` |
+| 静态租约：旧地址不再分配 | PASS | 绑定期间旧地址 `.145` 在设备 `ip neigh` 中为 `INCOMPLETE`，Windows 无法 ping 通；`CLIENT-A` 仅出现在 `.42.50`。`.42.145` 未分配给其他客户端 |
+| 静态租约：删除后恢复动态地址 | PASS | `hsp lease del CLIENT-A` 后租约列表为空；客户端 `release/renew` 重新获得 `.145`，`ip neigh` 恢复 `REACHABLE` |
+| DHCP 故障注入：显示 `dhcp_degraded` | PASS | `kill -9 $(cat run/udhcpd.pid)` 一次后，`hsp status --json` 返回 `"dhcp_mode":"degraded","dhcp_degraded":true,"dhcp_reason":"udhcpd 连续异常退出","dhcp_retry_available":true` |
+| DHCP 故障注入：热点保持可用 | PASS | 降级期间 `"ap":true,"iface":"wlan2","addr":"192.168.42.1/24"`；`hsp clients --json` 仍返回客户端 |
+| DHCP 故障注入：系统 DHCP 接管 | PASS | 降级期间模块 `udhcpd` 不存在，系统 `dnsmasq --dhcp-authoritative` 运行；客户端 release/renew 从 `.145` 获得 `.254`，设备 `ip neigh` 显示 `CLIENT-A` 的 `.42.254 REACHABLE` |
+| DHCP 故障注入：仅清理/重装 `hsp_dhcp` | PASS | 降级前 `iptables -S` 有 `-A OUTPUT -j hsp_dhcp` 与 `-N hsp_dhcp`；降级后两者消失，`iptables -S OUTPUT` 其余规则和 `iptables -t nat -S` 未变；`hsp dhcp retry` 后仅恢复这两项，输出 `自建 DHCP 已恢复，静态租约生效` |
+| DHCP 故障注入：重试后恢复 | PASS | retry 后 `"dhcp_mode":"serving","dhcp_degraded":false,"dhcp_running":true,"fw_ok":true`；再次 release/renew 获得 `.145`，`ip neigh` 为 `REACHABLE` |
+| 卸载：remove 标记后重启清理 | PASS | `touch /data/adb/modules/hotspot_plus/remove` 后重启；`/data/adb/modules/hotspot_plus` 与 `/data/adb/hotspot_plus` 均不存在 |
+| 卸载：iptables/进程清理 | PASS | 重启后 `iptables -S` 无 `hsp_dhcp`/`oneplus8t` 规则；`ps -A` 无 `hspd`/`udhcpd` |
+| 卸载：旧模块仍禁用、无旧 APEX 挂载 | PASS | `/data/adb/modules/oneplus8t_fixed_hotspot/disable` 仍存在；`/apex/com.android.wifi` 解析为自身，`mount` 无模块/旧模块替换项 |
+| 卸载：备份包 | PASS | `/data/adb/hotspot_plus_backups/94652141-0.3.0/` 含 `config.conf`、`leases.conf`、`manifest`（`format=hotspot_plus_backup`、`format_version=1`、`module_version=v0.3.0`、`sha256=…`，权限 600） |
+| 重装：健康状态 | PASS | 重装 `dist/hotspot_plus-v0.3.0.zip` 后重启；`hsp status --json`：`"version":"v0.3.0","ap":true,"addr":"192.168.42.1/24","gateway_ok":true,"dhcp_mode":"serving","dhcp_running":true,"fw_ok":true,"daemon":true` |
+| 重装：备份保留 | PASS | 重启后 `/data/adb/hotspot_plus_backups/94652141-0.3.0/manifest` 仍存在 |
+| 重装：恢复提示 | PASS（CLI 契约；UI 视觉未验证） | `/data/adb/hotspot_plus/.config_default` 存在（安装器判定为全新安装）；`hsp restore-prompt` 返回 `prompt=1`、`count=1`。未改动 UI 文案；设备界面截图未捕获提示卡片，故不声称视觉验收 |
+
+### 真机观察与限制
+
+- 添加租约时 `_lease_apply_if_running` 会短暂停止 `udhcpd`；本次 daemon 记录
+  一次 `udhcpd 进程已退出` 并把摘要置为 degraded。off/on 后 `dhcp.state` 仍残留
+  `degraded=1`（摘要 `dhcp_degraded:true` 但 `reason`/`last_error` 为空），
+  `hsp dhcp reset` 不清理该位；`hsp dhcp retry` 可恢复为 serving。此项是本次真机观察，
+  未在本次改动范围内修复。
+- 静态租约测试需要客户端执行 release/renew；仅 off/on 热点不会强制客户端重新 DHCP。
+  本次由同一工作站作为 `CLIENT-A` 完成 release/renew，未出现无法重连的情况。
+- 卸载/重装测试触发了 2 次重启；测试期间旧模块始终保持 `/data/adb/modules/oneplus8t_fixed_hotspot/disable`。
+- 自动开启开关 UI 状态：设置页“开机自动开启热点”为关闭，与 `AUTO_START=0`、
+  `status --json` 的 `auto_start:false` / `boot_decision:disabled` 一致。
+
 ## Issue #5 固定网关与有界修复
 
 | 项目 | 状态 | 证据 / 缺口 |
