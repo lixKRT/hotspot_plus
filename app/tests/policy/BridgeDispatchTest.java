@@ -26,9 +26,8 @@ public final class BridgeDispatchTest {
         check("load path never installs early", !main.contains("loadingDocument(BASE_URL) == BridgeLifecycle.Action.INSTALL"));
         check("page callbacks never install bridges", !main.contains("installBridgesIfCurrent"));
         String html = new String(Files.readAllBytes(Paths.get("webroot/index.html")), StandardCharsets.UTF_8);
-        check("webui probes bridge", html.contains("hspApp.ping()"));
-        check("webui reload is bounded", html.contains("bridgeReloads >= 2"));
-        check("webui timeout recovers bridge", html.contains("recoverBridge()"));
+        check("webui waits for bridge readiness", html.contains("bridgeReady"));
+        check("webui never reloads to recover bridge", !html.contains("location.reload()"));
 
         List<String> argv = CommandPolicy.parse(CommandPolicy.CLI + " lease import " + b64(
                 "aa:bb:cc:dd:ee:ff 192.168.42.10 phone\n"));

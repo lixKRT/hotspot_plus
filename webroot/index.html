@@ -174,17 +174,6 @@ function bridgeProbe() {
   return false;
 }
 window.hspBridgeReady = () => { if (bridgeProbe()) refreshStatus(); };
-let bridgeReloads = +(sessionStorage.getItem('hsp_bridge_reloads') || 0);
-function bridgeAlive() {
-  try { return !!(window.hspApp && window.hspApp.ping() === 'ok'); } catch (e) { return false; }
-}
-function recoverBridge() {
-  if (bridgeReloads >= 2) return false;
-  bridgeReloads++;
-  sessionStorage.setItem('hsp_bridge_reloads', String(bridgeReloads));
-  setTimeout(() => location.reload(), 50);
-  return true;
-}
 
 // ---- KernelSU exec wrapper (same protocol as the `kernelsu` npm package) ----
 let cbSeq = 0;
@@ -198,8 +187,7 @@ function exec(cmd, timeoutMs) {
     let done = false;
     const timer = setTimeout(() => {
       if (done) return; done = true; delete window[name];
-      const recovering = recoverBridge();
-      resolve({ errno: -2, stdout: '', stderr: recovering ? 'root 桥已失效，正在重新加载界面' : 'timeout' });
+      resolve({ errno: -2, stdout: '', stderr: 'timeout' });
     }, timeoutMs || 90000);
     window[name] = (errno, stdout, stderr) => {
       if (done) return; done = true; clearTimeout(timer); delete window[name];
@@ -261,7 +249,6 @@ async function refreshStatus() {
   const r = await hsp('status --json', 25000);
   const s = parseJson(r.stdout);
   if (!s) { $('apText').textContent = '状态读取失败'; $('apSub').textContent = (r.stderr || r.stdout).slice(0, 200); return; }
-  if (bridgeReloads) { bridgeReloads = 0; sessionStorage.removeItem('hsp_bridge_reloads'); }
   lastStatus = s;
   $('ver').textContent = s.version || '';
   if (!busy) $('apSwitch').checked = !!s.ap;
@@ -524,7 +511,7 @@ $('btnRestoreDismiss').onclick = async () => {
 
 // ---- init ----
 (async () => {
-  if (!(await bridgeReady) && !recoverBridge()) $('apSub').textContent = 'root 桥不可用';
+  if (!(await bridgeReady)) $('apSub').textContent = 'root 桥不可用';
   await refreshStatus();
   await loadConfig();
   checkRestorePrompt();

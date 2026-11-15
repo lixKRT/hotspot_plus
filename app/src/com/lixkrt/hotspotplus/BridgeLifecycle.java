@@ -2,9 +2,9 @@ package com.lixkrt.hotspotplus;
 
 /**
  * Deterministic lifecycle for the trusted WebUI JavaScript bridges. A bridge is installed only
- * after its trusted local document finishes loading, exactly once per document, so page code never
- * observes an object id from an earlier navigation. Leaving the trusted document or destroying the
- * host removes it; page callbacks never re-add it mid-document.
+ * after its trusted local document finishes loading. Within the trusted origin that binding is
+ * never replaced, so reloads keep the same object id; leaving the trusted origin or destroying the
+ * host removes it. Page callbacks never add or remove it mid-document.
  */
 final class BridgeLifecycle {
     enum Action { NONE, INSTALL, REMOVE }
@@ -31,28 +31,24 @@ final class BridgeLifecycle {
         return pending && trusted;
     }
 
-    /** An explicit trusted document load: replace any bridge and bind after it finishes loading. */
+    /** An explicit trusted document load: bind once, then keep that object across reloads. */
     Action loadingDocument(String target) {
         boolean local = WebPolicy.classifyDocument(target);
         if (!local) return navigating(target);
-        boolean had = installed;
         url = target;
         trusted = true;
-        pending = true;
-        installed = false;
-        return had ? Action.REMOVE : Action.NONE;
+        if (!installed) pending = true;
+        return Action.NONE;
     }
 
-    /** A page callback says a trusted URL is starting; installation happens after it finishes. */
+    /** A page callback says a trusted URL is starting; never disturb an existing binding. */
     Action pageStarted(String target) {
         boolean local = WebPolicy.classifyDocument(target);
         if (!local) return navigating(target);
-        boolean had = installed;
         url = target;
         trusted = true;
-        pending = true;
-        installed = false;
-        return had ? Action.REMOVE : Action.NONE;
+        if (!installed) pending = true;
+        return Action.NONE;
     }
 
     /** Navigation/untrusted content: drop the bridge before any document can call it. */
