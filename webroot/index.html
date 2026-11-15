@@ -84,6 +84,7 @@ details summary{cursor:pointer;color:var(--sub)}
   </div>
   <div class="kv" id="kv"></div>
   <div class="warnbox" id="warn"></div>
+  <div class="btns" id="dhcpRetryWrap" style="display:none"><button class="op" id="btnDhcpRetry">重试自建 DHCP</button></div>
   <div id="opBanner"></div>
   <div class="btns"><button id="btnRefresh">刷新</button><button class="op" id="btnRestart">重启热点</button>
     <button class="danger" id="btnUnstick">清除卡住的操作</button></div>
@@ -249,7 +250,7 @@ async function refreshStatus() {
   const rows = [
     ['配置网关', `${s.gateway_cfg}/${s.prefix_cfg}` + (s.fixed_gateway ? '' : '（未启用固定）')],
     ['网关修复', repairText()],
-    ['自建 DHCP', s.dhcp_enable ? (s.dhcp_running ? '运行中' : (s.ap ? '未运行' : '待命')) : '已关闭'],
+    ['自建 DHCP', s.dhcp_enable ? (s.dhcp_degraded ? '已降级 · 系统 DHCP 接管' : (s.dhcp_running ? '运行中' : (s.ap ? '未运行' : '待命'))) : '已关闭'],
     ['拦截系统 DHCP', s.ap ? yes(s.fw_ok) : '—'],
     ['守护进程', s.daemon ? '运行中' : '未运行'],
     ['操作锁', s.op_busy ? `占用：${s.op_name || '?'} (pid ${s.op_pid || '?'}, ${s.op_age || '?'}s)` : '空闲'],
@@ -265,7 +266,9 @@ async function refreshStatus() {
     else if (s.gateway_repair) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致：正在重启修复（第 ${tries} 次）。`);
     else w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致` + (s.gateway_result === 'waiting' ? `：约 ${s.gateway_next_in || 0}s 后自动重试（已用 ${tries} 次）。` : '，可点“重启热点”。'));
   }
-  if (s.ap && s.dhcp_enable && !s.dhcp_running) w.push('自建 DHCP 未运行，当前由系统 DHCP 分配地址（静态绑定不生效）。');
+  if (s.ap && s.dhcp_enable && s.dhcp_degraded) w.push(`自建 DHCP 已降级：${s.dhcp_reason || '接管失败'}。当前由系统 DHCP 分配地址，静态绑定暂不生效。${s.dhcp_last_error ? '最近错误：' + s.dhcp_last_error + '。' : ''}${s.dhcp_retry_available ? '可点“重试自建 DHCP”恢复，不会重启热点。' : ''}`);
+  else if (s.ap && s.dhcp_enable && !s.dhcp_running) w.push('自建 DHCP 未运行，当前由系统 DHCP 分配地址（静态绑定不生效）。');
+  $('dhcpRetryWrap').style.display = s.ap && s.dhcp_retry_available ? 'flex' : 'none';
   if (s.last_issue && w.length) w.push('最近日志：' + s.last_issue);
   $('warn').style.display = w.length ? 'block' : 'none';
   $('warn').textContent = w.join('\n');
@@ -299,6 +302,10 @@ $('btnRestart').onclick = () => runOp('重启热点', async (call) => {
   $('apText').textContent = '正在重启…';
   const r = await call('restart', 300000); toast(lastLine(r));
   refreshClients();
+});
+$('btnDhcpRetry').onclick = () => runOp('重试自建 DHCP', async (call) => {
+  const r = await call('dhcp retry', 45000); toast(lastLine(r) || (r.errno === 0 ? '自建 DHCP 已恢复' : '重试失败'));
+  if (r.errno === 0) refreshClients();
 });
 let unstickArmed = 0;
 $('btnUnstick').onclick = async () => {
