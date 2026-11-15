@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.hsp.hotspotplus">
+    package="com.lixkrt.hotspotplus">
+
+    <permission
+        android:name="com.lixkrt.hotspotplus.permission.TOGGLE_HOTSPOT"
+        android:protectionLevel="signature" />
+
+    <uses-permission android:name="com.lixkrt.hotspotplus.permission.TOGGLE_HOTSPOT" />
 
     <application
         android:name=".App"
@@ -31,14 +37,12 @@
         <activity
             android:name=".ToggleActivity"
             android:exported="true"
+            android:permission="com.lixkrt.hotspotplus.permission.TOGGLE_HOTSPOT"
+            android:directBootAware="true"
             android:theme="@android:style/Theme.NoDisplay"
             android:excludeFromRecents="true"
             android:noHistory="true"
             android:taskAffinity="">
-            <intent-filter>
-                <action android:name="com.hsp.hotspotplus.TOGGLE" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
         </activity>
 
         <service

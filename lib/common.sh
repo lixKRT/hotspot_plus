@@ -11,6 +11,7 @@ LOGDIR=$DATA/logs
 LOG=$LOGDIR/hsp.log
 CONF=$DATA/config.conf
 LEASES=$DATA/leases.conf
+LEASE_IMPORT=$MODDIR/webroot/lease-import.conf
 LEASE_DB=$DATA/udhcpd.leases
 STATE=$RUN/state
 GWSTATE=$RUN/gateway

@@ -61,7 +61,7 @@ details summary{cursor:pointer;color:var(--sub)}
 </head>
 <body>
 <h1>热点增强 <span class="sub" id="ver"></span></h1>
-<div id="banner">未检测到 KernelSU WebUI 环境（window.ksu 不存在），页面仅供预览。</div>
+<div id="banner">薄壳桥不可用：当前页面没有可信的 root 执行通道，操作已禁用。</div>
 
 <!-- 恢复提示：只在全新安装且存在兼容备份时显示，绝不自动恢复 -->
 <div class="card" id="restoreCard">
@@ -155,8 +155,9 @@ details summary{cursor:pointer;color:var(--sub)}
 <script>
 'use strict';
 const HSP = '/data/adb/modules/hotspot_plus/bin/hsp';
+const LEASE_IMPORT = '/data/adb/modules/hotspot_plus/webroot/lease-import.conf';
 const $ = (id) => document.getElementById(id);
-const hasKsu = typeof window.ksu !== 'undefined' && window.ksu && typeof window.ksu.exec === 'function';
+const hasKsu = !!(window.ksu && typeof window.ksu.exec === 'function');
 if (!hasKsu) $('banner').style.display = 'block';
 
 // ---- KernelSU exec wrapper (same protocol as the `kernelsu` npm package) ----
@@ -174,8 +175,7 @@ function exec(cmd, timeoutMs) {
     try { ksu.exec(cmd, '{}', name); } catch (e) { done = true; clearTimeout(timer); delete window[name]; resolve({ errno: -1, stdout: '', stderr: String(e) }); }
   });
 }
-const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
-const hsp = (args, t) => exec(`LOCK_WAIT=20 sh ${HSP} ${args}`, t); // short lock wait: UI never queues behind a stuck op
+const hsp = (args, t) => exec(`${HSP} ${args}`, t); // fixed argv only
 function toast(msg) {
   msg = String(msg || '').trim(); if (!msg) return;
   try { if (hasKsu && ksu.toast) { ksu.toast(msg); return; } } catch (e) {}
@@ -377,8 +377,8 @@ function validateCfg() {
 $('btnSaveCfg').onclick = () => {
   if (!validateCfg()) { toast('请检查标红的输入'); return; }
   const args = [];
-  BOOL_KEYS.forEach((k) => args.push(shq(`${k}=${$(k).checked ? 1 : 0}`)));
-  TEXT_KEYS.forEach((k) => args.push(shq(`${k}=${$(k).value.trim().replace(/\s+/g, '')}`)));
+  BOOL_KEYS.forEach((k) => args.push(`${k}=${$(k).checked ? 1 : 0}`));
+  TEXT_KEYS.forEach((k) => args.push(`${k}=${$(k).value.trim().replace(/\s+/g, '')}`));
   runOp('保存并应用配置', async (call) => {
     const r = await call('set ' + args.join(' '), 15000);
     if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
@@ -409,7 +409,7 @@ $('btnSaveLeases').onclick = async () => {
   const lines = [], macs = new Set(), ips = new Set(); let ok = true;
   for (const row of $('leases').children) {
     const m = row.querySelector('.m'), i = row.querySelector('.i'), n = row.querySelector('.n');
-    const mac = normMac(m.value), ip = i.value.trim(), name = n.value.replace(/[\t\r\n"$`\\]/g, ' ').trim().slice(0, 64);
+    const mac = normMac(m.value), ip = i.value.trim(), name = n.value.replace(/[^\p{L}\p{N} ._()\-]/gu, ' ').replace(/ +/g, ' ').trim().slice(0, 64);
     if (!mac && !ip) continue;
     const mBad = !MACRE.test(mac) || macs.has(mac), iBad = !IPRE.test(ip) || ips.has(ip);
     m.classList.toggle('bad', mBad); i.classList.toggle('bad', iBad);
@@ -417,8 +417,9 @@ $('btnSaveLeases').onclick = async () => {
     macs.add(mac); ips.add(ip); lines.push(`${mac} ${ip}${name ? ' ' + name : ''}`);
   }
   if (!ok) { toast('MAC/IP 格式错误或重复（已标红）'); return; }
+  lines.sort();
   await runOp('保存静态绑定', async (call) => {
-    const r = await call('lease import ' + shq(b64utf8(lines.join('\n') + '\n')), 15000);
+    const r = await call('lease stage ' + LEASE_IMPORT + ' import=' + b64utf8(lines.join('\n') + '\n'), 15000);
     if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
     toast(lastLine(r));
     const a = await call('apply', 300000);

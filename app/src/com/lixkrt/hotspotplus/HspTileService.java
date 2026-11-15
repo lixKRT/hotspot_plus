@@ -1,4 +1,4 @@
-package com.hsp.hotspotplus;
+package com.lixkrt.hotspotplus;
 
 import android.app.PendingIntent;
 import android.content.ComponentName;
@@ -38,7 +38,7 @@ public final class HspTileService extends TileService {
     }
 
     private void refresh() {
-        App.shell().exec(App.HSP + " status --json", null, null, r -> {
+        App.shell().execArgv(java.util.Arrays.asList(App.HSP, "status", "--json"), r -> {
             int st;
             String sub;
             if (r.code == RootShell.EACCES) {

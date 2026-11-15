@@ -622,6 +622,50 @@ do_set() {
     echo "已保存"
 }
 
+lease_import_file() { # path -> replace leases from canonical "MAC IP [备注]" lines
+    _src=$1
+    [ -f "$_src" ] || { echo "导入文件不存在: $_src"; return 1; }
+    _out=$LEASES.new
+    : > "$_out"
+    _err=$(while IFS= read -r _l || [ -n "$_l" ]; do
+        case "$_l" in ''|'#'*) continue ;; esac
+        _lm=${_l%% *}; _rest=${_l#* }
+        _li=${_rest%% *}; _lr=${_rest#* }
+        [ "$_lm" != "$_li" ] || continue
+        [ "$_li" != "$_rest" ] || _lr=""
+        _lv=$(lease_validate_line "$_lm" "$_li" "$_lr") || { echo "$_lv"; break; }
+        echo "$_lv"
+    done < "$_src" > "$_out")
+    _rc=$?
+    if [ "$_rc" -ne 0 ] || [ -n "$_err" ]; then
+        rm -f "$_out"
+        echo "${_err:-导入失败}"
+        return 1
+    fi
+    { echo "# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)"; cat "$_out"; } > "$LEASES.tmp" \
+        && mv -f "$LEASES.tmp" "$LEASES"
+    rm -f "$_out"
+    log "leases imported from file: $(grep -vc '^#' "$LEASES") entries"
+    echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约"
+}
+lease_stage_stdin() { # write canonical stdin to fixed import path; do not replace leases yet
+    _dst=$1
+    _src=$(mktemp 2>/dev/null || echo "$DATA/stage.$$")
+    [ "$_dst" = "$LEASE_IMPORT" ] || { echo "无效导入暂存路径"; return 1; }
+    cat > "$_src" || { rm -f "$_src"; echo "读取暂存数据失败"; return 1; }
+    _err=$(while IFS= read -r _l || [ -n "$_l" ]; do
+        case "$_l" in ''|'#'*) continue ;; esac
+        _lm=${_l%% *}; _rest=${_l#* }
+        _li=${_rest%% *}; _lr=${_rest#* }
+        [ "$_li" != "$_rest" ] || _lr=""
+        _lv=$(lease_validate_line "$_lm" "$_li" "$_lr") || { echo "$_lv"; break; }
+    done < "$_src")
+    if [ -n "$_err" ]; then rm -f "$_src"; echo "$_err"; return 1; fi
+    _n=$(grep -vcE '^[[:space:]]*(#|$)' "$_src" 2>/dev/null || true)
+    [ "$_n" -gt 0 ] || { rm -f "$_src"; echo "未提供静态租约"; return 1; }
+    mv -f "$_src" "$_dst" || { rm -f "$_src"; echo "写入暂存文件失败"; return 1; }
+    echo "已暂存 $_n 条静态租约"
+}
 do_lease() {
     _sub=$1; shift
     case "$_sub" in
@@ -730,8 +774,11 @@ EOF
             mv -f "$LEASES.import.$$" "$LEASES"
             rm -f "$_staging"
             log "leases imported: $(grep -vc '^#' "$LEASES") entries"
-            echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约"
-            _lease_apply_if_running ;;
+            echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约" ;;
+        import-file)
+            lease_import_file "$1" ;;
+        stage)
+            lease_stage_stdin "$1" ;;
         apply)
             if ap_detect_fast; then
                 subnet_setup "$AP_ADDR"
@@ -751,7 +798,7 @@ EOF
             [ "$SUBNET_STATUS" = mapped ] && echo "子网映射: $SUBNET_CFG_CIDR -> $SUBNET_ACTUAL_CIDR（保留主机号）"
             return 0
             ;;
-        *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64"; return 1 ;;
+        *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64|import-file PATH|stage PATH"; return 1 ;;
     esac
 }
 
