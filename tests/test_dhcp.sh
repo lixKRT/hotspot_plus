@@ -350,6 +350,85 @@ retry_failure_stays_degraded_and_never_restarts_hotspot() {
         grep -q '重试失败' "$_dt/retry.out"
 }
 
+lease_add_and_delete_while_serving_do_not_degrade() {
+    _dhcp_env lease-reload || return 1
+    _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' || return 1
+    _p1=$(cat "$_dt/data/run/udhcpd.pid" 2>/dev/null)
+    _dhcp_run -- lease add 02:00:00:00:00:02 192.168.42.160 test >/dev/null || return 1
+    _p2=$(cat "$_dt/data/run/udhcpd.pid" 2>/dev/null)
+    _dhcp_run -- lease del 02:00:00:00:00:01 >/dev/null || return 1
+    _dhcp_run -- status --json > "$_dt/status.json" || return 1
+    _ok=1
+    [ "$(_dhcp_state serving)" = 1 ] || _ok=0
+    [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
+    [ "$(_dhcp_state failures)" = 0 ] || _ok=0
+    [ "$(_dhcp_summary dhcp_degraded)" = 0 ] || _ok=0
+    [ -n "$_p1" ] && [ -n "$_p2" ] && [ "$_p1" != "$_p2" ] || _ok=0
+    grep -q '^static_lease 02:00:00:00:00:02 192.168.42.160' "$_dt/data/run/udhcpd.conf" || _ok=0
+    ! grep -q '^static_lease 02:00:00:00:00:01 ' "$_dt/data/run/udhcpd.conf" || _ok=0
+    grep -q '"dhcp_degraded":false' "$_dt/status.json" || _ok=0
+    ! grep -q 'udhcpd 进程已退出' "$_dt/data/logs/hsp.log" || _ok=0
+    _dhcp_cleanup_process
+    [ "$_ok" = 1 ]
+}
+
+explicit_reset_clears_stale_degraded_state() {
+    _dhcp_env explicit-reset || return 1
+    _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' || return 1
+    _dhcp_eval 'dhcp_set state degraded
+        dhcp_set degraded 1
+        dhcp_set failures 3
+        dhcp_set reason ""
+        dhcp_set last_error ""
+        dhcp_set retry_available 1
+        dhcp_summary_write' || return 1
+    _dhcp_run -- dhcp reset > "$_dt/reset.out" 2>&1 || return 1
+    _s=$(_dhcp_run -- status --json) || return 1
+    _ok=1
+    [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
+    [ "$(_dhcp_state failures)" = 0 ] || _ok=0
+    [ "$(_dhcp_state first_failure_at)" = 0 ] || _ok=0
+    [ "$(_dhcp_state last_failure_at)" = 0 ] || _ok=0
+    [ "$(_dhcp_state retry_available)" = 0 ] || _ok=0
+    [ "$(_dhcp_summary dhcp_degraded)" = 0 ] || _ok=0
+    printf '%s' "$_s" | grep -q '"dhcp_degraded":false' || _ok=0
+    _dhcp_cleanup_process
+    [ "$_ok" = 1 ]
+}
+
+actual_udhcpd_kill_still_degrades() {
+    _dhcp_env kill-nine || return 1
+    _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' || return 1
+    _p=$(cat "$_dt/data/run/udhcpd.pid" 2>/dev/null)
+    [ -n "$_p" ] || return 1
+    kill -9 "$_p" 2>/dev/null || return 1
+    _i=0; while kill -0 "$_p" 2>/dev/null && [ "$_i" -lt 20 ]; do sleep 0.1; _i=$((_i + 1)); done
+    ! kill -0 "$_p" 2>/dev/null || return 1
+    _dhcp_eval 'dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' || return 1
+    [ "$(_dhcp_state degraded)" = 1 ] &&
+        [ "$(_dhcp_state reason)" = "udhcpd 连续异常退出" ] &&
+        [ "$(_dhcp_state last_error)" = "udhcpd 进程已退出" ] &&
+        [ "$(_dhcp_summary dhcp_degraded)" = 1 ] &&
+        [ "$(_dhcp_state failures)" = 1 ]
+}
+
+serving_state_clears_stale_degraded_flag() {
+    _dhcp_env stale-clear || return 1
+    _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' || return 1
+    _dhcp_eval 'dhcp_set state degraded
+        dhcp_set degraded 1
+        dhcp_set reason ""
+        dhcp_set last_error ""
+        dhcp_summary_write
+        dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' || return 1
+    _ok=1
+    [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
+    [ "$(_dhcp_state state)" = serving ] || _ok=0
+    [ "$(_dhcp_summary dhcp_degraded)" = 0 ] || _ok=0
+    _dhcp_cleanup_process
+    [ "$_ok" = 1 ]
+}
+
 cleanup_is_idempotent_and_targets_only_hsp_chain() {
     _dhcp_env cleanup || return 1
     _dhcp_eval 'fw_del; fw_del' || return 1
@@ -361,7 +440,8 @@ cleanup_is_idempotent_and_targets_only_hsp_chain() {
 
 daemon_health_check_fail_closes_crashed_udhcpd() {
     _dhcp_env daemon-crash || return 1
-    grep -q 'dhcp_crash' "$ROOT/bin/hspd" &&
+    grep -q 'dhcp_health_check' "$ROOT/bin/hspd" &&
+        grep -q 'dhcp_crash' "$ROOT/lib/common.sh" &&
         grep -q 'fw_del' "$ROOT/lib/common.sh" &&
         grep -q 'dhcp_stop' "$ROOT/lib/common.sh" &&
         grep -q 'dhcp retry' "$ROOT/bin/hsp"
@@ -384,6 +464,10 @@ run_case "stable health period clears failure window" stable_health_period_clear
 run_case "status exposes DHCP degraded and retry" status_exposes_dhcp_degraded_and_retry
 run_case "DHCP retry restores leases without restart" retry_success_restores_static_leases_without_restart
 run_case "DHCP retry failure is bounded and visible" retry_failure_stays_degraded_and_never_restarts_hotspot
+run_case "lease reloads while serving stay healthy" lease_add_and_delete_while_serving_do_not_degrade
+run_case "explicit reset clears degraded state" explicit_reset_clears_stale_degraded_state
+run_case "actual udhcpd kill still degrades" actual_udhcpd_kill_still_degrades
+run_case "healthy serving clears stale degraded" serving_state_clears_stale_degraded_flag
 run_case "DHCP cleanup is idempotent and exact" cleanup_is_idempotent_and_targets_only_hsp_chain
 run_case "daemon fail-closes a crashed udhcpd" daemon_health_check_fail_closes_crashed_udhcpd
 run_case "UI shows Chinese degraded warning and retry" ui_shows_chinese_degraded_warning_and_retry

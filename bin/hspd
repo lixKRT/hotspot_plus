@@ -105,19 +105,9 @@ while :; do
             log "gateway: repair restart dispatched; pausing DHCP health checks"
         elif [ "$DHCP_ENABLE" = 1 ] && ! gw_pending; then
             # health checks for the running session
-            if [ "$(dhcp_get degraded)" = 1 ]; then
-                :
-            elif dhcp_capable && [ "$(dhcp_get serving)" = 1 ] && ! dhcp_running; then
-                log "udhcpd not running, fail-closing and retrying (fails=$DHCP_FAILS/$(dhcp_fail_limit))"
-                dhcp_crash "udhcpd 进程已退出"
+            if dhcp_capable && [ "$(dhcp_get serving)" = 1 ]; then
+                dhcp_health_check "$NOW" "$AP_IF" "$AP_ADDR"
                 DHCP_FAILS=$(dhcp_get failures); [ -n "$DHCP_FAILS" ] || DHCP_FAILS=0
-                [ "$(dhcp_get degraded)" = 1 ] || serve_dhcp
-            elif [ "$(dhcp_get serving)" = 1 ] && dhcp_running; then
-                dhcp_stable_check "$NOW"
-                if ! fw_check "$AP_IF"; then
-                    log "firewall rule missing, fail-closing DHCP"
-                    dhcp_crash "接管规则丢失"
-                fi
             fi
         fi
     else

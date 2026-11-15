@@ -813,10 +813,15 @@ _lease_import_conflicts() {
 _lease_apply_if_running() {
     AP_IF=""; AP_ADDR=""
     ap_detect_fast >/dev/null 2>&1 || return 0
+    [ "$(dhcp_get serving)" = 1 ] || return 0
+    dhcp_reload_begin
     dhcp_stop 2>/dev/null
     lease_scrub_conflicts
-    [ -n "$AP_IF" ] && dhcp_write_conf "$AP_IF" "$AP_ADDR" >/dev/null 2>&1
-    log "static leases regenerated for $AP_IF"
+    if dhcp_takeover "$AP_IF" "$AP_ADDR"; then
+        log "static leases reloaded for $AP_IF"
+    else
+        log "static lease reload failed for $AP_IF"
+    fi
     return 0
 }
 

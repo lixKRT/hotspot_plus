@@ -18,6 +18,8 @@ GWSTATE=$RUN/gateway
 HSCTL_JAR=$MODDIR/bin/hsctl.jar
 FW_CHAIN=hsp_dhcp
 DHCPSTATE=$RUN/dhcp
+DHCP_RELOAD=$RUN/udhcpd.reload
+DHCP_RELOAD_MAX=${HSP_DHCP_RELOAD_MAX:-60}
 
 DHCP_STABLE_SECS=${HSP_DHCP_STABLE_SECS:-120}
 
@@ -707,11 +709,32 @@ dhcp_fail_limit() {
     [ "$_dl" -gt 0 ] 2>/dev/null || _dl=3
     echo "$_dl"
 }
+dhcp_reload_begin() {
+    mkdir -p "$RUN" 2>/dev/null
+    date +%s > "$DHCP_RELOAD"
+}
+dhcp_reload_end() {
+    rm -f "$DHCP_RELOAD"
+}
+dhcp_reload_pending() {
+    [ -f "$DHCP_RELOAD" ] || return 1
+    _drm=$(cat "$DHCP_RELOAD" 2>/dev/null)
+    case "$_drm" in ''|*[!0-9]*) dhcp_reload_end; return 1 ;; esac
+    _drnow=$(date +%s)
+    _drage=$((_drnow - _drm))
+    [ "$_drage" -lt 0 ] && _drage=0
+    if [ "$_drage" -gt "$DHCP_RELOAD_MAX" ]; then
+        dhcp_reload_end
+        return 1
+    fi
+    return 0
+}
 dhcp_stable_secs() {
     case "$DHCP_STABLE_SECS" in ''|*[!0-9]*) echo 120 ;; *) echo "$DHCP_STABLE_SECS" ;; esac
 }
 dhcp_session_begin() {
     mkdir -p "$RUN" 2>/dev/null
+    dhcp_reload_end
     {
         _ds_now=$(date +%s)
         echo "session=$(date +%s)-$$"
@@ -747,6 +770,7 @@ dhcp_summary_write() {
 dhcp_rollback_ordered() { # reason error [state]
     fw_del
     dhcp_stop
+    dhcp_reload_end
     dhcp_set serving 0
     dhcp_set state "${3:-failed}"
     [ -n "$1" ] && dhcp_set reason "$1"
@@ -791,6 +815,7 @@ dhcp_record_failure() { # reason error
         dhcp_rollback_ordered "$1" "$2" degraded
         dhcp_set retry_available 1
         dhcp_set degraded 1
+        dhcp_set state degraded
         dhcp_summary_write
     fi
 }
@@ -823,10 +848,12 @@ dhcp_takeover() { # iface addr
     fi
     dhcp_set serving 1
     dhcp_set state serving
+    dhcp_set degraded 0
     dhcp_window_begin "$(date +%s)"
     dhcp_set reason ""
     dhcp_set last_error ""
     dhcp_set retry_available 0
+    dhcp_reload_end
     dhcp_summary_write
     log "dhcp: takeover confirmed: $DHCP_SUMMARY; $FW_CHAIN/OUTPUT installed"
     return 0
@@ -865,12 +892,62 @@ dhcp_retry() { # [iface addr]
 }
 dhcp_reset() {
     _dr_now=$(date +%s)
+    dhcp_reload_end
+    _dr_degraded=$(dhcp_get degraded)
+    _dr_state=$(dhcp_get state)
     dhcp_set failures 0
     dhcp_set first_failure_at 0
     dhcp_set last_failure_at 0
     dhcp_set stable_since "$_dr_now"
+    if dhcp_running; then
+        dhcp_set degraded 0
+        dhcp_set reason ""
+        dhcp_set last_error ""
+        dhcp_set retry_available 0
+        dhcp_set serving 1
+        dhcp_set state serving
+    elif [ "$_dr_degraded" = 1 ]; then
+        dhcp_set degraded 0
+        dhcp_set state idle
+        dhcp_set retry_available 0
+        [ "$_dr_state" = degraded ] && dhcp_set reason ""
+    else
+        dhcp_set serving 0
+        dhcp_set state idle
+    fi
     dhcp_summary_write
-    log "dhcp: user reset failure window"
+    log "dhcp: user reset cleared failure window and degraded flag"
+}
+dhcp_health_check() { # now iface addr
+    _dhc_now=${1:-$(date +%s)}
+    _dhc_if=$2; _dhc_addr=$3
+    [ "$(dhcp_get serving)" = 1 ] || return 0
+    if dhcp_running; then
+        dhcp_reload_end
+        if [ "$(dhcp_get degraded)" = 1 ]; then
+            dhcp_set degraded 0
+            dhcp_set reason ""
+            dhcp_set last_error ""
+            dhcp_set retry_available 0
+            dhcp_set state serving
+            dhcp_summary_write
+            log "dhcp: healthy serving state cleared stale degraded flag"
+        fi
+        dhcp_stable_check "$_dhc_now"
+        if ! fw_check "$_dhc_if"; then
+            log "firewall rule missing, fail-closing DHCP"
+            dhcp_crash "接管规则丢失"
+            return 1
+        fi
+        return 0
+    fi
+    if dhcp_reload_pending; then
+        log "dhcp: expected module-initiated udhcpd reload; not counting a crash"
+        return 0
+    fi
+    log "udhcpd not running, fail-closing and retrying (fails=$(dhcp_get failures)/$(dhcp_fail_limit))"
+    dhcp_crash "udhcpd 进程已退出"
+    [ "$(dhcp_get degraded)" = 1 ] || dhcp_takeover "$_dhc_if" "$_dhc_addr"
 }
 
 # ---------------------------------------------------------------- udhcpd
