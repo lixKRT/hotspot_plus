@@ -168,16 +168,36 @@ boot_autostart_decision() { # AUTO_START sim_state ap_running(0|1)
 
 # ---------------------------------------------------------------- IPv4 math
 is_ipv4() {
-    echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+    case "$1" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
     _o=$1
     for _i in 1 2 3 4; do
-        _v=${_o%%.*}; _o=${_o#*.}
-        [ "$_v" -le 255 ] 2>/dev/null || return 1
+        _v=${_o%%.*}
+        case "$_v" in
+            0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;;
+            *) return 1 ;;
+        esac
+        if [ "$_i" -lt 4 ]; then
+            case "$_o" in *.*) _o=${_o#*.} ;; *) return 1 ;; esac
+        else
+            case "$_o" in *.*) return 1 ;; esac
+        fi
     done
     return 0
 }
+is_private_ipv4() {
+    is_ipv4 "$1" || return 1
+    _pa=${1%%.*}; _pr=${1#*.}
+    _pb=${_pr%%.*}
+    [ "$_pa" = 10 ] ||
+        { [ "$_pa" = 192 ] && [ "$_pb" = 168 ]; } ||
+        { [ "$_pa" = 172 ] && [ "$_pb" -ge 16 ] && [ "$_pb" -le 31 ]; }
+}
 is_mac() { echo "$1" | tr '-' ':' | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; }
 lc() { echo "$1" | tr 'A-F' 'a-f' | tr '-' ':'; }
+sanitize_remark() {
+    printf '%s' "$1" | tr '\n\r\t' '   ' | tr -d '\001-\010\013\014\016-\037' \
+        | tr -d '"$`\\' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//' | cut -c1-64
+}
 ip2int() {
     _a=${1%%.*}; _r=${1#*.}; _b=${_r%%.*}; _r=${_r#*.}; _c=${_r%%.*}; _d=${_r#*.}
     echo $(( (_a << 24) + (_b << 16) + (_c << 8) + _d ))
@@ -193,6 +213,54 @@ map_ip() {
     _off=$(( $(ip2int "$1") - $2 ))
     [ "$_off" -gt 0 ] && [ "$_off" -lt $(( $4 - 1 )) ] || return 1
     int2ip $(( $3 + _off ))
+}
+
+# lease_validate_line MAC IP [REMARK] -> canonical "mac ip remark" or "ERR ..." and rc 1.
+# A static address must be a usable host address in the configured private subnet.
+lease_validate_line() {
+    is_mac "$1" || { echo "ERR 无效 MAC: $1"; return 1; }
+    is_ipv4 "$2" || { echo "ERR 无效 IP: $2"; return 1; }
+    is_private_ipv4 "$2" || { echo "ERR 静态租约需在私有网段: $2"; return 1; }
+    _lv_mask=$(pfx2mask_int "$PREFIX")
+    _lv_net=$(( $(ip2int "$GATEWAY") & _lv_mask ))
+    _lv_size=$(( 1 << (32 - PREFIX) ))
+    _lv_off=$(( $(ip2int "$2") - _lv_net ))
+    if [ "$_lv_off" -le 0 ] || [ "$_lv_off" -ge $(( _lv_size - 1 )) ]; then
+        echo "ERR 地址 $2 不是 $(int2ip "$_lv_net")/$PREFIX 内的主机地址（不能是网络/广播/越界地址）"
+        return 1
+    fi
+    [ "$2" = "$GATEWAY" ] && { echo "ERR 地址 $2 是热点网关"; return 1; }
+    _lv_nm=$(sanitize_remark "${3:-}")
+    printf '%s %s%s\n' "$(lc "$1")" "$2" "${_lv_nm:+ $_lv_nm}"
+}
+
+# subnet_setup [actual_ip/prefix]: describe configured and observed subnets.
+# Sets SUBNET_STATUS (unavailable|configured|mapped), SUBNET_*_NET/CIDR, SUBNET_EXAMPLE.
+subnet_setup() {
+    SUBNET_STATUS=unavailable
+    SUBNET_CFG_NET=""; SUBNET_CFG_CIDR=""; SUBNET_ACTUAL_NET=""; SUBNET_ACTUAL_CIDR=""
+    SUBNET_CFG_SIZE=0; SUBNET_ACTUAL_SIZE=0; SUBNET_EXAMPLE=""
+    _ss_cm=$(pfx2mask_int "$PREFIX")
+    SUBNET_CFG_NET=$(( $(ip2int "$GATEWAY") & _ss_cm ))
+    SUBNET_CFG_SIZE=$(( 1 << (32 - PREFIX) ))
+    SUBNET_CFG_CIDR="$(int2ip "$SUBNET_CFG_NET")/$PREFIX"
+    [ -n "${1:-}" ] || return 0
+    _ss_ip=${1%/*}; _ss_pfx=${1#*/}
+    [ "$_ss_pfx" != "$1" ] || return 0
+    case "$_ss_pfx" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_ss_pfx" -ge 16 ] && [ "$_ss_pfx" -le 28 ] || return 0
+    is_ipv4 "$_ss_ip" || return 0
+    _ss_am=$(pfx2mask_int "$_ss_pfx")
+    SUBNET_ACTUAL_NET=$(( $(ip2int "$_ss_ip") & _ss_am ))
+    SUBNET_ACTUAL_SIZE=$(( 1 << (32 - _ss_pfx) ))
+    SUBNET_ACTUAL_CIDR="$(int2ip "$SUBNET_ACTUAL_NET")/$_ss_pfx"
+    if [ "$SUBNET_ACTUAL_NET" = "$SUBNET_CFG_NET" ] && [ "$_ss_pfx" = "$PREFIX" ]; then
+        SUBNET_STATUS=configured
+    else
+        SUBNET_STATUS=mapped
+        SUBNET_EXAMPLE=$(map_ip "$DHCP_START" "$SUBNET_CFG_NET" "$SUBNET_ACTUAL_NET" "$SUBNET_ACTUAL_SIZE") || SUBNET_EXAMPLE=""
+        [ -z "$SUBNET_EXAMPLE" ] || SUBNET_EXAMPLE="$DHCP_START -> $SUBNET_EXAMPLE"
+    fi
 }
 
 # ---------------------------------------------------------------- AP detection
@@ -619,6 +687,8 @@ dhcp_stop() {
     rm -f "$RUN/udhcpd.pid"
 }
 # Writes $RUN/udhcpd.conf for iface $1 with addr $2 (ip/prefix). Echo summary.
+# Static reservations are always inside the configured single subnet. When the platform
+# ignored the gateway request they keep the host part via map_ip().
 dhcp_write_conf() {
     _if=$1; _gw=${2%/*}; _pf=${2#*/}
     _mask=$(pfx2mask_int "$_pf")
@@ -637,6 +707,27 @@ dhcp_write_conf() {
     [ "$_net" != "$_cfgnet" ] && log "WARN: actual subnet $(int2ip $_net)/$_pf != configured $(int2ip $_cfgnet)/$PREFIX; static leases mapped by host part"
     _dns=$DNS; [ -n "$_dns" ] || _dns=$_gw
     _max=$(( $(ip2int "$_e") - $(ip2int "$_s") + 1 + 32 ))
+    _static=$RUN/static.leases.$$
+    _reserved=$RUN/reserved.ips.$$
+    : > "$_static"
+    : > "$_reserved"
+    if [ -f "$LEASES" ]; then
+        while read -r _mac _ip _rest; do
+            case "$_mac" in ''|'#'*) continue ;; esac
+            _vl=$(lease_validate_line "$_mac" "$_ip" "$_rest") || { log "static lease invalid: $_vl"; continue; }
+            _mac=${_vl%% *}
+            _ip=${_vl#* }; _ip=${_ip%% *}
+            _mip=$(map_ip "$_ip" "$_cfgnet" "$_net" "$_size") || { log "static lease $_mac $_ip skipped (outside subnet)"; continue; }
+            [ "$_mip" = "$_gw" ] && continue
+            if grep -qx "$_mip" "$_reserved" || grep -q "^$_mip " "$_reserved"; then
+                log "ERROR: static lease IP collision on mapped address $_mip (MAC $_mac); entry skipped"
+                continue
+            fi
+            _sstart=$(ip2int "$_s"); _send=$(ip2int "$_e"); _sip=$(ip2int "$_mip")
+            [ "$_sip" -ge "$_sstart" ] && [ "$_sip" -le "$_send" ] && echo "reserve $_mip" >> "$_reserved"
+            echo "static_lease $_mac $_mip" >> "$_static"
+        done < "$LEASES"
+    fi
     {
         echo "# generated by hotspot_plus $(date)"
         echo "interface $_if"
@@ -657,17 +748,49 @@ dhcp_write_conf() {
         echo "opt lease $LEASE_TIME"
         # Android vendor option 43 "ANDROID_METERED" (same as Android's own DhcpServer/dnsmasq)
         [ "$METERED" = 1 ] && echo "opt 43 414e44524f49445f4d455445524544"
-        if [ -f "$LEASES" ]; then
-            while read -r _mac _ip _rest; do
-                case "$_mac" in ''|'#'*) continue ;; esac
-                is_mac "$_mac" || continue
-                _mip=$(map_ip "$_ip" "$_cfgnet" "$_net" "$_size") || { log "static lease $_mac $_ip skipped (outside subnet)"; continue; }
-                [ "$_mip" = "$_gw" ] && continue
-                echo "static_lease $(lc "$_mac") $_mip"
-            done < "$LEASES"
-        fi
+        cat "$_static"
     } > "$RUN/udhcpd.conf"
+    rm -f "$_static" "$_reserved"
     DHCP_SUMMARY="$_if $_s-$_e gw=$_gw dns=$_dns"
+}
+
+# Remove dynamic lease records that now collide with a static reservation. This prevents a
+# client's old address from being offered to another MAC after a rebind. The daemon owns
+# lease writes; callers stop it before invoking this so it cannot rewrite the file in place.
+lease_scrub_conflicts() { # [lease-file ...]
+    [ -f "$LEASE_DB" ] || return 0
+    [ -n "$(dhcp_pid 2>/dev/null)" ] && dhcp_stop 2>/dev/null
+    _res=$RUN/static.reserved.$$
+    : > "$_res"
+    for _lf in "${@:-$LEASES}"; do
+        [ -f "$_lf" ] || continue
+        while read -r _smac _sip _rest; do
+            case "$_smac" in ''|'#'*|Mac) continue ;; esac
+            _sv=$(lease_validate_line "$_smac" "$_sip" "${_rest:-}") || continue
+            _sv_ip=${_sv#* }; _sv_ip=${_sv_ip%% *}
+            echo "$_sv_ip" >> "$_res"
+        done < "$_lf"
+    done
+    [ -s "$_res" ] || { rm -f "$_res"; return 0; }
+    _tmp=$LEASE_DB.scrub.$$
+    awk -v reserved="$(tr '\n' ' ' < "$_res")" '
+        BEGIN { n = split(reserved, a, " "); for (i = 1; i <= n; i++) if (a[i] != "") skip[a[i]] = 1 }
+        NR == 1 { print; next }
+        {
+            ip = ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ? $2 : substr($0, 19, 16)
+            gsub(/^ +| +$/, "", ip)
+            if (ip in skip) next
+        }
+        { print }
+    ' "$LEASE_DB" > "$_tmp"
+    _before=$(wc -l < "$LEASE_DB" 2>/dev/null || echo 0)
+    _after=$(wc -l < "$_tmp" 2>/dev/null || echo 0)
+    mv -f "$_tmp" "$LEASE_DB"
+    rm -f "$_res"
+    if [ $((_before - _after)) -gt 0 ]; then
+        log "lease scrub: removed $((_before - _after)) stale lease(s) that collide with static reservations"
+    fi
+    return 0
 }
 dhcp_start() {
     _if=$1; _addr=$2
