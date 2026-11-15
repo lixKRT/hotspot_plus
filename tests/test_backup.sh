@@ -226,6 +226,12 @@ upgrade_clears_runtime_only() {
     cp "$ROOT/defaults/leases.conf" "$_bt/mod/defaults/leases.conf"
     cp "$ROOT/module.prop" "$_bt/mod/module.prop"
     cp "$ROOT/customize.sh" "$_bt/mod/customize.sh"
+    printf 'old stderr\n' > "$_bt/data/logs/hsctl.err"
+    printf 'old dhcp log\n' > "$_bt/data/logs/udhcpd.log"
+    printf 'old rotated\n' > "$_bt/data/logs/hsp.log.1"
+    printf 'stale tmp\n' > "$_bt/data/run/hsctl.tmp"
+    printf 'lock\n' > "$_bt/data/run/session.lock"
+    printf 'sock\n' > "$_bt/data/run/hspd.sock"
     _before_c=$(cksum "$_bt/data/config.conf")
     _before_l=$(cksum "$_bt/data/leases.conf")
     _out=$(HSP_DATA="$_bt/data" MODPATH="$_bt/mod" HSP_INSTALLER_DRY_RUN=1 \
@@ -237,6 +243,12 @@ upgrade_clears_runtime_only() {
         [ ! -e "$_bt/data/run/hspd.pid" ] &&
         [ ! -e "$_bt/data/run/state" ] &&
         [ ! -e "$_bt/data/logs/hsp.log" ] &&
+        [ ! -e "$_bt/data/logs/hsctl.err" ] &&
+        [ ! -e "$_bt/data/logs/udhcpd.log" ] &&
+        [ ! -e "$_bt/data/logs/hsp.log.1" ] &&
+        [ ! -e "$_bt/data/run/hsctl.tmp" ] &&
+        [ ! -e "$_bt/data/run/session.lock" ] &&
+        [ ! -e "$_bt/data/run/hspd.sock" ] &&
         [ -d "$_bt/data/run" ] && [ -d "$_bt/data/logs" ]
 }
 
@@ -251,6 +263,36 @@ installer_marks_only_default_config() {
         sh -c 'ui_print() { printf "%s\n" "$*"; }; abort() { printf "%s\n" "$*"; }; set_perm() { :; }; set_perm_recursive() { :; }; . "$MODPATH/customize.sh"' 2>&1) ||
         { printf '%s\n' "$_out"; return 1; }
     [ -f "$_bt/data2/.config_default" ] && [ ! -f "$_bt/data/.config_default" ]
+}
+
+config_marker_lifecycle() {
+    _backup_env lifecycle
+    _out=$(_backup_hsp backup) || { printf '%s\n' "$_out"; return 1; }
+    # 1) default config + marker => prompt eligible
+    : > "$_bt/data/.config_default"
+    _out=$(_backup_hsp restore-prompt) || { printf '%s\n' "$_out"; return 1; }
+    printf '%s\n' "$_out" | grep -q '^prompt=1$' || { printf '%s\n' "$_out"; return 1; }
+    # 2) successful user config change clears the marker => not eligible
+    _out=$(env HSP_DATA="$_bt/data" HSP_BACKUP_DIR="$_bt/backups" HSP_BUSYBOX=/nonexistent \
+        MODDIR="$ROOT" sh "$ROOT/bin/hsp" set DNS=223.5.5.5 2>&1) || { printf '%s\n' "$_out"; return 1; }
+    [ ! -e "$_bt/data/.config_default" ] || { printf 'marker survived set\n'; return 1; }
+    _out=$(_backup_hsp restore-prompt) || { printf '%s\n' "$_out"; return 1; }
+    printf '%s\n' "$_out" | grep -q '^prompt=0$' || { printf '%s\n' "$_out"; return 1; }
+    # 3) restore also clears marker/dismissal => not eligible
+    : > "$_bt/data/.config_default"
+    _pkg=$(_bundle_of "$_bt/backups")
+    _out=$(_backup_hsp restore "$_pkg" --yes) || { printf '%s\n' "$_out"; return 1; }
+    [ ! -e "$_bt/data/.config_default" ] &&
+        _out=$(_backup_hsp restore-prompt) &&
+        printf '%s\n' "$_out" | grep -q '^prompt=0$'
+}
+
+clean_install_is_prompt_eligible() {
+    _backup_env clean
+    _out=$(_backup_hsp backup) || { printf '%s\n' "$_out"; return 1; }
+    rm -f "$_bt/data/config.conf" "$_bt/data/leases.conf"
+    _out=$(_backup_hsp restore-prompt) || { printf '%s\n' "$_out"; return 1; }
+    printf '%s\n' "$_out" | grep -q '^prompt=1$'
 }
 
 ui_restore_prompt_requires_confirmation() {
@@ -277,4 +319,6 @@ run_case "uninstall retries then continues loudly" uninstall_retries_then_contin
 run_case "uninstall backs up before deleting data" uninstall_creates_backup_before_removing_data
 run_case "upgrade preserves user assets only" upgrade_clears_runtime_only
 run_case "installer marks default config distinctly" installer_marks_only_default_config
+run_case "config marker lifecycle: default/set/restore" config_marker_lifecycle
+run_case "clean install is restore-prompt eligible" clean_install_is_prompt_eligible
 run_case "UI restore prompt needs explicit confirmation" ui_restore_prompt_requires_confirmation

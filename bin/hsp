@@ -593,6 +593,8 @@ do_set() {
     gateway_dhcp_valid "$GATEWAY" "$PREFIX" "$DHCP_START" "$DHCP_END" ||
         { echo "DHCP 范围 $DHCP_START-$DHCP_END 不在 $GATEWAY/$PREFIX 内或包含网关"; return 1; }
     for _kv in "$@"; do conf_set_raw "${_kv%%=*}" "${_kv#*=}"; done
+    # The config is no longer the installer default: a fresh-install restore prompt must not appear.
+    [ -n "${BACKUP_DEFAULT_MARKER:-}" ] && rm -f "$BACKUP_DEFAULT_MARKER"
     log "config updated: $*"
     echo "已保存"
 }
