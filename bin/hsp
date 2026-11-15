@@ -1,6 +1,7 @@
 #!/system/bin/sh
 # hotspot_plus CLI.  Usage: su -c /data/adb/modules/hotspot_plus/bin/hsp <command>
 #   on | off | toggle | restart        控制热点（经 TetheringManager，使用系统已保存的 SSID/密码）
+#   repair                            执行一次会话内的受限网关修复（守护进程内部使用）
 #   boot-auto                         开机时执行一次 SIM 判断（由 service.sh 调用）
 #   status [--json]                    状态
 #   clients [--json]                   已连接设备 (IP/MAC/主机名)
@@ -82,16 +83,18 @@ fallback_start() {
 do_on() {
     LIFECYCLE_RESULT=""
     LIFECYCLE_ERROR=""
+    GATEWAY_KEPT=""
     if ap_detect; then
-        if [ "$FIXED_GATEWAY" = 1 ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ] && dhcp_capable; then
-            say "热点已开启但网关为 ${AP_ADDR%/*}，按配置重启"
-            do_off quiet
-            [ "$LIFECYCLE_RESULT" = stopped ] || return 1
-        else
-            LIFECYCLE_RESULT=already_on
-            say "热点已开启：$AP_IF ${AP_ADDR}"
-            return 0
-        fi
+        # Not started by us: it is a system-owned session (ADR-0007 gives it one repair restart).
+        gw_active || gw_session_begin system
+        gw_observe "$AP_IF" "$AP_ADDR"
+        GATEWAY_KEPT=1
+        LIFECYCLE_RESULT=already_on
+        say "热点已开启：$AP_IF ${AP_ADDR}"
+        return 0
+    fi
+    if ! gw_active; then
+        gw_session_begin module
     fi
     _args=""
     if [ "$FIXED_GATEWAY" = 1 ]; then
@@ -101,7 +104,6 @@ do_on() {
             say "警告：自建 DHCP 不可用（DHCP_ENABLE=0 / 无 udhcpd / iptables owner 不支持），本次不固定网关（否则系统 DHCP 只会给 1 台设备分配地址）"
         fi
     fi
-    date +%s > "$RUN/started_by_hsp"
     log "starting hotspot via TetheringManager ${_args:+($_args)}"
     # shellcheck disable=SC2086
     _out=$(hsctl start $_args --pkg "$CALLER_PKG" --timeout 25)
@@ -136,11 +138,21 @@ do_on() {
     if wait_ap up "$_wait"; then
         LIFECYCLE_RESULT=started
         say "热点已开启：$AP_IF $AP_ADDR"
-        if [ -n "$_args" ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ]; then
-            say "警告：请求的固定网关 $GATEWAY 未生效（系统可能忽略了静态地址请求），DHCP 将按实际网段工作"
+        gw_observe "$AP_IF" "$AP_ADDR"
+        case $? in
+            2) say "固定网关已关闭，本次按系统网段工作" ;;
+            3) say "固定网关 $GATEWAY 未生效，本会话已降级（不再重启）" ;;
+            1) say "网关 $AP_ADDR 与配置不符，将按会话额度自动修复" ;;
+        esac
+        if [ "$FIXED_GATEWAY" = 1 ] && [ "$(gw_get result)" = waiting ]; then
+            say "请求的固定网关 $GATEWAY 未生效，将在约 $(($(gw_get next_at) - $(date +%s))) 秒后重试"
         fi
         daemon_wake up
         return 0
+    fi
+    if gw_active && gw_pending; then
+        gw_set pending 0
+        gw_degrade "repair restart did not bring the hotspot back"
     fi
     if [ "$_hsctl_failed" = 1 ]; then
         LIFECYCLE_RESULT=start_failed
@@ -148,14 +160,12 @@ do_on() {
         [ -n "$_err" ] || [ "$_hsctl_result" = SUCCESS ] || LIFECYCLE_ERROR=$_hsctl_result
         [ -n "$LIFECYCLE_ERROR" ] || LIFECYCLE_ERROR="hsctl start rc=$_rc"
         log "ERROR: hotspot start failed (rc=$_rc): $LIFECYCLE_ERROR"
-        rm -f "$RUN/started_by_hsp"
     elif [ "$_rc" -ge 2 ] || { [ -n "$_hsctl_result" ] && [ "$_hsctl_result" != SUCCESS ]; }; then
         LIFECYCLE_RESULT=start_failed
         LIFECYCLE_ERROR=${_err:-"hsctl start rc=$_rc"}
         [ -n "$_err" ] || [ "$_hsctl_result" = SUCCESS ] || LIFECYCLE_ERROR=$_hsctl_result
         [ -n "$LIFECYCLE_ERROR" ] || LIFECYCLE_ERROR="hsctl start rc=$_rc"
         log "ERROR: hotspot start failed (rc=$_rc): $LIFECYCLE_ERROR"
-        rm -f "$RUN/started_by_hsp"
     elif [ "$_timed_out" = 1 ] || [ "$_wait" -gt 0 ]; then
         LIFECYCLE_RESULT=timeout
         LIFECYCLE_ERROR="hotspot did not become ready within ${_wait}s"
@@ -164,8 +174,8 @@ do_on() {
         LIFECYCLE_RESULT=start_failed
         LIFECYCLE_ERROR=${_err:-"hsctl start rc=$_rc"}
         log "ERROR: hotspot start failed (rc=$_rc): $LIFECYCLE_ERROR"
-        rm -f "$RUN/started_by_hsp"
     fi
+    gw_active && gw_session_end "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"
     say "热点未能开启（详见 $LOG）"
     return 1
 }
@@ -173,13 +183,15 @@ do_on() {
 do_off() {
     LIFECYCLE_RESULT=""
     LIFECYCLE_ERROR=""
+    _keep_gw=""
+    [ "$1" = quiet ] && _keep_gw=$2
     if ! ap_detect; then
+        [ "$_keep_gw" = keep ] || gw_session_down "$(date +%s)"
         LIFECYCLE_RESULT=already_off
         [ "$1" = quiet ] || say "热点已关闭"
         return 0
     fi
     log "stopping hotspot"
-    rm -f "$RUN/started_by_hsp"
     _out=$(hsctl stop --pkg "$CALLER_PKG" --timeout 10)
     _rc=$?
     _timed_out=0
@@ -191,6 +203,7 @@ do_off() {
         tmo 15 "cmd wifi stop-softap" cmd wifi stop-softap >> "$LOG" 2>&1
     fi
     if wait_ap down 15; then
+        [ "$_keep_gw" = keep ] || gw_session_down "$(date +%s)"
         LIFECYCLE_RESULT=stopped
         [ "$1" = quiet ] || say "热点已关闭"
         daemon_wake down
@@ -207,6 +220,25 @@ do_off() {
     fi
     say "热点关闭超时"
     return 1
+}
+
+do_repair() {
+    # One bounded repair restart inside the current session. The attempt was already counted
+    # (and marked pending) by gw_attempt_start; origin and budget survive the stop/start.
+    LIFECYCLE_RESULT=""; LIFECYCLE_ERROR=""
+    if ! gw_active || [ "$(gw_get degraded)" = 1 ] || ! gw_pending; then
+        log "gateway: repair requested without an active pending attempt; ignored"
+        return 0
+    fi
+    log "gateway: executing repair restart (attempt $(gw_get attempts)/$(gw_get limit) origin $(gw_get origin))"
+    do_off quiet keep
+    [ "$LIFECYCLE_RESULT" = stopped ] || [ "$LIFECYCLE_RESULT" = already_off ] || {
+        gw_set pending 0
+        gw_degrade "repair restart could not stop the hotspot"
+        return 1
+    }
+    gw_pending_started
+    do_on
 }
 
 do_boot_auto() {
@@ -254,12 +286,28 @@ do_status_json() {
     _ap=false; _if=""; _addr=""
     ap_detect_fast && { _ap=true; _if=$AP_IF; _addr=$AP_ADDR; }
     subnet_setup "$_addr"
-    _gwok=false; [ "${_addr%/*}" = "$GATEWAY" ] && _gwok=true
+    _gwok=false; gateway_matches "$GATEWAY/$PREFIX" "$_addr" && _gwok=true
     _dhcp=false; dhcp_running && _dhcp=true
     _fw=false; [ -n "$_if" ] && fw_check "$_if" && _fw=true
     _dm=false; [ -n "$(daemon_pid)" ] && _dm=true
     _udh=false; bb_has udhcpd && _udh=true
-    _eb=false; [ -f "$RUN/enforce_broken" ] && _eb=true
+    _eb=false; { [ -f "$RUN/enforce_broken" ] || [ "$(gw_status_value degraded)" = 1 ]; } && _eb=true
+    _gr=$(gw_status_value result); [ -n "$_gr" ] || _gr=not_run
+    _grr=$(gw_status_value reason)
+    _grt=$(gw_status_value attempts); [ -n "$_grt" ] || _grt=0
+    _grl=$(gw_status_value limit); [ -n "$_grl" ] || _grl=0
+    _go=$(gw_status_value origin)
+    _gf=$(gw_status_value final_gw)
+    _gd=false; [ "$(gw_status_value degraded)" = 1 ] && _gd=true
+    _gm=false; gateway_matches "$GATEWAY/$PREFIX" "$_gf" && _gm=true
+    _gp=false; gw_pending && _gp=true
+    _gn=$(gw_get next_at); _gn=${_gn:-0}
+    case "$_gn" in ''|*[!0-9]*) _gn=0 ;; esac
+    _gnw=0
+    if [ "$_gn" -gt 0 ]; then
+        _gnw=$(( _gn - $(date +%s) ))
+        [ "$_gnw" -lt 0 ] && _gnw=0
+    fi
     _ver=$(sed -n 's/^version=//p' "$MODDIR/module.prop")
     _last=$(grep -E 'ERROR|WARN|TIMEOUT|LOCK: (breaking|flock)|另一个操作' "$LOG" 2>/dev/null | tail -n1)
     _bd=$(state_get boot_decision)
@@ -285,6 +333,11 @@ do_status_json() {
         "$(json_esc "$_bs")" "$(json_esc "$_be")" "$(json_esc "$_ba")"
     printf '"last_action":"%s","last_result":"%s","last_error":"%s","last_at":"%s",' \
         "$(json_esc "$_la")" "$(json_esc "$_lr")" "$(json_esc "$_le")" "$(json_esc "$_lat")"
+    printf '"gateway_repair":%s,"gateway_origin":"%s","gateway_attempts":%s,"gateway_limit":%s,' \
+        "$([ "$_gp" = true ] && echo true || echo false)" "$(json_esc "$_go")" "$_grt" "$_grl"
+    printf '"gateway_final":"%s","gateway_degraded":%s,"gateway_reason":"%s","gateway_result":"%s",' \
+        "$(json_esc "$_gf")" "$_gd" "$(json_esc "$_grr")" "$(json_esc "$_gr")"
+    printf '"gateway_next_in":%s,"gateway_matches_final":%s,' "$_gnw" "$_gm"
     printf '"subnet":{"status":"%s","configured":"%s","actual":"%s","example_mapping":"%s"},"enforce_broken":%s,"sdk":"%s","release":"%s","hyperos":"%s","version":"%s","busybox":"%s","last_issue":"%s"}\n' \
         "$SUBNET_STATUS" "$SUBNET_CFG_CIDR" "$SUBNET_ACTUAL_CIDR" "$(json_esc "$SUBNET_EXAMPLE")" \
         "$_eb" "$SDK" "$RELEASE" "$(json_esc "$HYPEROS")" "$_ver" "$BB" "$(json_esc "$_last")"
@@ -306,7 +359,9 @@ do_status_text() {
     echo "开机自动开启: $([ "$AUTO_START" = 1 ] && echo 启用 || echo 关闭)  最近判断: $(state_get boot_decision || echo disabled)  结果: $(state_get boot_result || echo not_run)"
     [ -n "$(state_get boot_at)" ] && echo "开机判断时间: $(state_get boot_at)"
     [ -n "$(state_get last_action)" ] && echo "最近操作: $(state_get last_action)  结果: $(state_get last_result)$( [ -n "$(state_get last_error)" ] && echo "  错误: $(state_get last_error)")"
-    [ -f "$RUN/enforce_broken" ] && echo "注意: 静态网关请求未被系统采纳（本次开机已停止强制）"
+    echo "网关修复: 结果=$(gw_status_value result || echo not_run) 来源=$(gw_status_value origin || echo -) 尝试=$(gw_status_value attempts || echo 0)/$(gw_status_value limit || echo 0) 当前=$(gw_status_value final_gw || echo -)"
+    [ -n "$(gw_status_value reason)" ] && echo "  原因: $(gw_status_value reason)"
+    [ "$(gw_status_value degraded)" = 1 ] && echo "注意: 固定网关未生效，本次会话已降级（静态租约按实际网段映射）"
     echo "AP 状态(IWifiManager): $(hsctl state 2>/dev/null | sed -n 's/^ap_state_name=//p')"
 }
 
@@ -531,15 +586,10 @@ do_set() {
     # cross-field checks with the new values applied
     load_config
     for _kv in "$@"; do eval "${_kv%%=*}=\${_kv#*=}"; done
-    _m=$(pfx2mask_int "$PREFIX"); _n=$(( $(ip2int "$GATEWAY") & _m )); _sz=$(( 1 << (32 - PREFIX) ))
-    _g=$(( $(ip2int "$GATEWAY") - _n ))
-    if [ "$_g" -le 0 ] || [ "$_g" -ge $(( _sz - 1 )) ]; then echo "网关不能是网络地址/广播地址"; return 1; fi
-    case "$GATEWAY" in 10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;; *) echo "网关需在私有网段 (10/8, 172.16/12, 192.168/16)"; return 1 ;; esac
-    for _ip in "$DHCP_START" "$DHCP_END"; do
-        _o=$(( $(ip2int "$_ip") - _n ))
-        if [ "$_o" -le 0 ] || [ "$_o" -ge $(( _sz - 1 )) ]; then echo "DHCP 范围 $_ip 不在 $(int2ip $_n)/$PREFIX 内"; return 1; fi
-    done
-    [ "$(ip2int "$DHCP_START")" -le "$(ip2int "$DHCP_END")" ] || { echo "DHCP 起始地址大于结束地址"; return 1; }
+    is_private_ipv4 "$GATEWAY" || { echo "网关需在私有网段 (10/8, 172.16/12, 192.168/16)"; return 1; }
+    gateway_addr_valid "$GATEWAY" "$PREFIX" || { echo "网关不能是网络地址/广播地址"; return 1; }
+    gateway_dhcp_valid "$GATEWAY" "$PREFIX" "$DHCP_START" "$DHCP_END" ||
+        { echo "DHCP 范围 $DHCP_START-$DHCP_END 不在 $GATEWAY/$PREFIX 内或包含网关"; return 1; }
     for _kv in "$@"; do conf_set_raw "${_kv%%=*}" "${_kv#*=}"; done
     log "config updated: $*"
     echo "已保存"
@@ -746,15 +796,22 @@ _lease_apply_if_running() {
 do_apply() {
     load_config
     if ap_detect; then
-        if [ "$FIXED_GATEWAY" = 1 ] && [ "${AP_ADDR%/*}" != "$GATEWAY" ] && dhcp_capable; then
-            rm -f "$RUN/enforce_broken"
-            say "网关需变更为 $GATEWAY，正在重启热点…"
-            lock apply; do_off quiet; do_on
-            return $?
+        if [ "$FIXED_GATEWAY" = 1 ] && ! gateway_matches "$GATEWAY/$PREFIX" "$AP_ADDR" && dhcp_capable; then
+            if [ "$ENFORCE_GATEWAY" = 1 ]; then
+                # ADR-0007: apply is not off -> on; keep the current session's attempt count.
+                gw_hold_begin
+                say "网关需变更为 $GATEWAY，正在重启热点…"
+                lock apply; do_off quiet; do_on
+                return $?
+            fi
+            say "已应用；网关仍为 ${AP_ADDR%/*}（未启用自动修复，可手动重启热点）"
+            daemon_wake reload
+            return 0
         fi
         daemon_wake reload
         say "已应用（DHCP 将按新配置重启）"
     else
+        gw_session_end ended "hotspot off"
         daemon_wake reload
         say "已保存，下次开启热点时生效"
     fi
@@ -794,10 +851,14 @@ case "$cmd" in
         exit $_rc ;;
     restart)
         lock restart
+        gw_hold_begin
         do_off quiet
         do_on; _rc=$?
         record_lifecycle restart "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"
         exit $_rc ;;
+    repair)
+        lock repair
+        do_repair ;;
     boot-auto) lock boot-auto; do_boot_auto ;;
     unstick) unstick ;;
     status) if [ "$1" = --json ]; then do_status_json; else do_status_text; fi ;;

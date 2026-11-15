@@ -220,11 +220,24 @@ async function refreshStatus() {
   $('ver').textContent = s.version || '';
   if (!busy) $('apSwitch').checked = !!s.ap;
   $('apText').textContent = busy ? `正在执行：${opLabel}…` : (s.ap ? '热点已开启' : '热点已关闭');
-  $('apDot').className = 'dot ' + (s.ap ? (s.gateway_ok || !s.fixed_gateway ? 'ok' : 'warn') : '');
+  $('apDot').className = 'dot ' + (s.ap ? (s.gateway_ok || !s.fixed_gateway ? 'ok' : (s.gateway_degraded ? 'bad' : 'warn')) : '');
   $('apSub').textContent = s.ap ? `${s.iface} · ${s.addr}` : `Android ${s.release} (SDK ${s.sdk})`;
   const yes = (b) => (b ? '是' : '否');
+  const repairText = () => {
+    const r = s.gateway_result || 'not_run';
+    const tries = `${s.gateway_attempts || 0}/${s.gateway_limit || 0}`;
+    const origin = s.gateway_origin === 'module' ? '模块启动' : (s.gateway_origin === 'system' ? '系统启动' : '—');
+    if (s.gateway_repair) return `重启中（${origin}，第 ${tries} 次）`;
+    if (r === 'waiting') return `等待重试（${origin}，已用 ${tries}，约 ${s.gateway_next_in || 0}s 后重启）`;
+    if (r === 'degraded') return `已降级（${origin}，尝试 ${tries} 次）`;
+    if (r === 'ok') return `已生效（${origin}，尝试 ${tries} 次）`;
+    if (r === 'disabled') return '未启用固定网关';
+    if (r === 'starting') return '本次会话待观察';
+    return `无修复记录（尝试 ${tries} 次）`;
+  };
   const rows = [
     ['配置网关', `${s.gateway_cfg}/${s.prefix_cfg}` + (s.fixed_gateway ? '' : '（未启用固定）')],
+    ['网关修复', repairText()],
     ['自建 DHCP', s.dhcp_enable ? (s.dhcp_running ? '运行中' : (s.ap ? '未运行' : '待命')) : '已关闭'],
     ['拦截系统 DHCP', s.ap ? yes(s.fw_ok) : '—'],
     ['守护进程', s.daemon ? '运行中' : '未运行'],
@@ -235,7 +248,12 @@ async function refreshStatus() {
   const w = [];
   if (!s.udhcpd_available) w.push('busybox 缺少 udhcpd：静态绑定/固定网关不可用。');
   if (!s.daemon) w.push('守护进程未运行（可点“重启守护进程”）。');
-  if (s.ap && s.fixed_gateway && !s.gateway_ok) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致` + (s.enforce_broken ? '：系统未采纳静态地址请求（见日志）。' : '，可点“重启热点”。'));
+  if (s.ap && s.fixed_gateway && !s.gateway_ok) {
+    const tries = `${s.gateway_attempts || 0}/${s.gateway_limit || 0}`;
+    if (s.gateway_degraded) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致：已尝试 ${tries} 次仍失败，本次会话降级（静态租约按实际网段映射，不再自动重启）。`);
+    else if (s.gateway_repair) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致：正在重启修复（第 ${tries} 次）。`);
+    else w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致` + (s.gateway_result === 'waiting' ? `：约 ${s.gateway_next_in || 0}s 后自动重试（已用 ${tries} 次）。` : '，可点“重启热点”。'));
+  }
   if (s.ap && s.dhcp_enable && !s.dhcp_running) w.push('自建 DHCP 未运行，当前由系统 DHCP 分配地址（静态绑定不生效）。');
   if (s.last_issue && w.length) w.push('最近日志：' + s.last_issue);
   $('warn').style.display = w.length ? 'block' : 'none';
