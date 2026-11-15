@@ -351,6 +351,8 @@ gw_session_begin() { # origin(module|system)
         echo "limit=$(gw_repair_limit "$_go")"
         echo "pending=0"
         echo "pending_at=0"
+        echo "hold=0"
+        echo "hold_at=0"
         echo "seen=0"
         echo "degraded=0"
         echo "reason="
@@ -366,12 +368,16 @@ gw_session_begin() { # origin(module|system)
 
 gw_session_end() { # result reason
     gw_active || return 0
+    gw_set hold 0
+    gw_set hold_at 0
     gw_summary_write "${1:-ended}" "${2:-}"
     log "gateway: session end result=${1:-ended} attempts=$(gw_get attempts) final=$(gw_get final_gw)${2:+ reason=$2}"
     rm -f "$GWSTATE" "$RUN/enforce_broken"
 }
 
 gw_degrade() { # reason
+    gw_set hold 0
+    gw_set hold_at 0
     gw_set degraded 1
     gw_set result degraded
     gw_set reason "$1"
@@ -414,11 +420,31 @@ gw_attempt_start() { # now
 
 gw_pending_started() { gw_set pending_phase starting; }
 
+# A user-requested restart/apply must keep the current session (ADR-0007: only an explicit
+# off -> on resets the budget). The daemon may see the AP down before the start completes,
+# so mark the session as manually restarting until the next observation.
+gw_hold_begin() {
+    gw_active || return 0
+    gw_set hold 1
+    gw_set hold_at "$(date +%s)"
+    log "gateway: manual restart requested; keeping session budget (attempts $(gw_get attempts)/$(gw_get limit), origin $(gw_get origin))"
+}
+gw_hold_clear() {
+    [ "$(gw_get hold)" = 1 ] || return 0
+    gw_set hold 0
+    gw_set hold_at 0
+}
+gw_holding() { [ "$(gw_get hold)" = 1 ]; }
+
 gw_observe() { # iface addr  (call when the hotspot is up)
     _if=$1; _addr=$2
     gw_active || gw_session_begin system
     _origin=$(gw_get origin)
     [ "$(gw_get seen)" = 1 ] || gw_set seen 1
+    if gw_holding; then
+        gw_hold_clear
+        log "gateway: manual restart returned with $_addr (attempts $(gw_get attempts)/$(gw_get limit))"
+    fi
     if gw_pending; then
         # Before the restart begins the old AP is still visible; only an observation made
         # after the stop/start cycle counts as "the repair restart returned".
@@ -491,6 +517,15 @@ gw_tick() { # now current_addr -> 0 when a repair restart was triggered
 # Called when the AP goes down. A repair restart keeps the session alive while pending.
 gw_session_down() { # now
     gw_active || return 0
+    if gw_holding; then
+        _ha=$(gw_get hold_at); _ha=${_ha:-0}
+        case "$_ha" in ''|*[!0-9]*) _ha=0 ;; esac
+        if [ $(( $1 - _ha )) -lt 120 ]; then
+            log "gateway: AP down during a manual restart; keeping session budget"
+            return 0
+        fi
+        gw_hold_clear
+    fi
     if gw_pending; then
         _pa=$(gw_get pending_at); _pa=${_pa:-0}
         case "$_pa" in ''|*[!0-9]*) _pa=0 ;; esac

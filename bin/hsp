@@ -533,8 +533,8 @@ do_apply() {
     if ap_detect; then
         if [ "$FIXED_GATEWAY" = 1 ] && ! gateway_matches "$GATEWAY/$PREFIX" "$AP_ADDR" && dhcp_capable; then
             if [ "$ENFORCE_GATEWAY" = 1 ]; then
-                # explicit user action: a new session gets a fresh, bounded budget
-                gw_session_begin system
+                # ADR-0007: apply is not off -> on; keep the current session's attempt count.
+                gw_hold_begin
                 say "网关需变更为 $GATEWAY，正在重启热点…"
                 lock apply; do_off quiet; do_on
                 return $?
@@ -546,7 +546,7 @@ do_apply() {
         daemon_wake reload
         say "已应用（DHCP 将按新配置重启）"
     else
-        rm -f "$GWSTATE" "$RUN/enforce_broken"
+        gw_session_end ended "hotspot off"
         daemon_wake reload
         say "已保存，下次开启热点时生效"
     fi
@@ -586,6 +586,7 @@ case "$cmd" in
         exit $_rc ;;
     restart)
         lock restart
+        gw_hold_begin
         do_off quiet
         do_on; _rc=$?
         record_lifecycle restart "$LIFECYCLE_RESULT" "$LIFECYCLE_ERROR"

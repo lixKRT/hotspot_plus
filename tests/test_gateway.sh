@@ -409,6 +409,112 @@ config_change_does_not_expand_budget() {
         [ "$(_restarts)" = 3 ]
 }
 
+# Exhausted module budget, then a user `apply`: one manual restart is allowed, but it must
+# not restore the repair allowance or start a new automatic repair loop.
+apply_after_exhausted_budget_keeps_budget() {
+    _gw_env apply-exhausted || return 1
+    _gw_fakes
+    _gw_config 192.168.42.1 24 1 1
+    printf '192.168.4.1/24\n' > "$_gw/default"
+    _gw_run -- on > "$_gw/out0" 2>&1 || return 1
+    _gw_repair || return 1
+    _gw_repair || return 1
+    [ "$(_gw_state degraded)" = 1 ] || return 1
+    _before=$(_restarts)
+    _gw_run -- apply > "$_gw/apply.out" 2>&1 || return 1
+    _s=$(_gw_status)
+    [ "$(_restarts)" = $(( _before + 1 )) ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_attempts"]')" = 2 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_limit"]')" = 2 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_degraded"]')" = True ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_result"]')" = degraded ] &&
+        grep -q 'manual restart requested; keeping session budget' "$_gw/data/logs/hsp.log"
+}
+
+# Same for `restart`: it is not a new session, so attempts stay exhausted.
+restart_after_exhausted_budget_keeps_budget() {
+    _gw_env restart-exhausted || return 1
+    _gw_fakes
+    _gw_config 192.168.42.1 24 1 1
+    printf '192.168.4.1/24\n' > "$_gw/default"
+    _gw_run -- on > "$_gw/out0" 2>&1 || return 1
+    _gw_repair || return 1
+    _gw_repair || return 1
+    [ "$(_gw_state degraded)" = 1 ] || return 1
+    _before=$(_restarts)
+    _gw_run -- restart > "$_gw/restart.out" 2>&1 || return 1
+    _s=$(_gw_status)
+    [ "$(_restarts)" = $(( _before + 1 )) ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_attempts"]')" = 2 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_origin"]')" = module ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_degraded"]')" = True ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_result"]')" = degraded ]
+}
+
+# After apply/restart preserved the budget, only an explicit off -> on resets it.
+explicit_off_on_after_apply_still_resets() {
+    _gw_env apply-then-off-on || return 1
+    _gw_fakes
+    _gw_config 192.168.42.1 24 1 1
+    printf '192.168.4.1/24\n' > "$_gw/default"
+    _gw_run -- on > "$_gw/out0" 2>&1 || return 1
+    _gw_repair || return 1
+    _gw_repair || return 1
+    _gw_run -- apply > "$_gw/apply.out" 2>&1 || return 1
+    [ "$(_gw_state attempts)" = 2 ] || return 1
+    _gw_run -- off > "$_gw/off.out" 2>&1 || return 1
+    [ ! -f "$_gw/data/run/gateway" ] || return 1
+    _gw_run -- on > "$_gw/on2.out" 2>&1 || return 1
+    _s=$(_gw_status)
+    [ "$(printf '%s' "$_s" | _jq 'd["gateway_attempts"]')" = 0 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_limit"]')" = 2 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_result"]')" = waiting ]
+}
+
+# Even a healthy session keeps its identity across `apply` (no new session, no extra attempts).
+apply_on_healthy_session_does_not_open_new_session() {
+    _gw_env apply-healthy || return 1
+    _gw_fakes
+    _gw_config 192.168.42.1 24 1 1
+    printf '192.168.42.1/24\n' > "$_gw/default"
+    _gw_run -- on > "$_gw/out0" 2>&1 || return 1
+    _session=$(_gw_state session)
+    printf '192.168.4.1/24\n' > "$_gw/default"
+    _gw_run -- set DHCP_START=192.168.42.120 DHCP_END=192.168.42.210 > "$_gw/set.out" 2>&1 || return 1
+    _gw_run -- apply > "$_gw/apply.out" 2>&1 || return 1
+    _s=$(_gw_status)
+    [ "$(_gw_state session)" = "$_session" ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_attempts"]')" = 0 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_origin"]')" = module ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_degraded"]')" = False ] &&
+        [ "$(grep -c 'gateway: session begin' "$_gw/data/logs/hsp.log")" = 1 ]
+}
+
+# A system start whose one repair failed must stay degraded; it must not inherit the
+# module-start retry allowance (no second restart, no 5s/15s retries).
+failed_system_repair_does_not_gain_module_allowance() {
+    _gw_env system-no-upgrade || return 1
+    _gw_fakes
+    _gw_config 192.168.42.1 24 1 1
+    printf '192.168.43.1/24\n' > "$_gw/ap"
+    printf '192.168.43.1/24\n' > "$_gw/default"
+    _gw_run -- on > "$_gw/out" 2>&1 || return 1
+    _gw_run -- repair > "$_gw/repair.out" 2>&1
+    [ "$(_gw_state degraded)" = 1 ] || return 1
+    _before=$(_restarts)
+    # A later `on` (idempotent), `apply` and a stray repair request must all stay bounded.
+    _gw_run -- on > "$_gw/on2.out" 2>&1 || return 1
+    _gw_run -- apply > "$_gw/apply.out" 2>&1 || return 1
+    _gw_run -- repair > "$_gw/repair2.out" 2>&1
+    _s=$(_gw_status)
+    [ "$(printf '%s' "$_s" | _jq 'd["gateway_origin"]')" = system ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_attempts"]')" = 1 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_limit"]')" = 1 ] &&
+        [ "$(printf '%s' "$_s" | _jq 'd["gateway_degraded"]')" = True ] &&
+        [ "$(_restarts)" -le $(( _before + 1 )) ] &&
+        ! grep -q 'retry .* in 5s\|retry .* in 15s' "$_gw/data/logs/hsp.log"
+}
+
 daemon_has_one_repair_owner() {
     ! grep -q 'started_by_hsp\|last_enforce\|enforce_pending' "$ROOT/bin/hspd" &&
         grep -q 'gw_observe' "$ROOT/bin/hspd" &&
@@ -486,6 +592,11 @@ run_case "off clears repair state" manual_off_clears_repair_state
 run_case "status exposes attempts/final/reason" status_exposes_attempts_final_and_reason
 run_case "start failure releases the session" lifecycle_failure_releases_session
 run_case "config change does not expand budget" config_change_does_not_expand_budget
+run_case "apply after exhausted budget keeps budget" apply_after_exhausted_budget_keeps_budget
+run_case "restart after exhausted budget keeps budget" restart_after_exhausted_budget_keeps_budget
+run_case "explicit off/on after apply still resets" explicit_off_on_after_apply_still_resets
+run_case "apply on healthy session keeps session" apply_on_healthy_session_does_not_open_new_session
+run_case "failed system repair gains no module allowance" failed_system_repair_does_not_gain_module_allowance
 run_case "daemon is the single repair owner" daemon_has_one_repair_owner
 run_case "repeat on while waiting does not stack restarts" repeat_on_while_waiting_does_not_stack_restarts
 run_case "pending repair is not double counted" pending_repair_is_not_double_counted
