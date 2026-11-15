@@ -1,0 +1,211 @@
+{
+  "overall": "PARTIAL",
+  "counts": {
+    "PASS": 15,
+    "FAIL": 0,
+    "UNVERIFIED": 3
+  },
+  "checks": [
+    {
+      "id": "build.identity",
+      "status": "PASS",
+      "detail": "KB2000 Android 16 SDK 36 build=<REDACTED> magisk=31.1:MAGISK:R"
+    },
+    {
+      "id": "selinux.mode",
+      "status": "PASS",
+      "detail": "Enforcing"
+    },
+    {
+      "id": "root.uid",
+      "status": "PASS",
+      "detail": "uid 0 in a real script"
+    },
+    {
+      "id": "root.selinux_domain",
+      "status": "PASS",
+      "detail": "u:r:magisk:s0"
+    },
+    {
+      "id": "busybox.tools",
+      "status": "PASS",
+      "detail": "udhcpd,dumpleases,ip,flock,timeout"
+    },
+    {
+      "id": "tethering.signatures",
+      "status": "PASS",
+      "detail": "startTethering + localIPv4Address/staticClientAddress + IIntResultListener"
+    },
+    {
+      "id": "fixed_gateway.request",
+      "status": "UNVERIFIED",
+      "detail": "request fields exist; adoption needs hotpot restart/install, forbidden in this ticket"
+    },
+    {
+      "id": "callback.magisk_domain",
+      "status": "PASS",
+      "detail": "event registration and IIntResultListener callback succeeded"
+    },
+    {
+      "id": "callback.methods",
+      "status": "PASS",
+      "detail": "asBinder,onCallbackStarted,onCallbackStopped,onConfigurationChanged,onOffloadStatusChanged,onSupportedTetheringTypes,onTetherClientsChanged,onTetherStatesChanged,onUpstreamChanged"
+    },
+    {
+      "id": "boot.timing",
+      "status": "PASS",
+      "detail": "boot_completed=1; /data/adb readable; CE available=true; user unlocked"
+    },
+    {
+      "id": "boot.timing_at_service_start",
+      "status": "UNVERIFIED",
+      "detail": "no install/reboot marker in this ticket; observed post-boot state only"
+    },
+    {
+      "id": "hotspot.interface",
+      "status": "PASS",
+      "detail": "wlan2 192.168.42.1/24"
+    },
+    {
+      "id": "dhcp.iptables_owner",
+      "status": "PASS",
+      "detail": "chain+owner rule added and linked on wlan2"
+    },
+    {
+      "id": "dhcp.iptables_cleanup",
+      "status": "PASS",
+      "detail": "temporary hsp_probe_02 chain removed"
+    },
+    {
+      "id": "dhcp.udhcpd",
+      "status": "PASS",
+      "detail": "udhcpd started with temporary config"
+    },
+    {
+      "id": "dhcp.dumpleases",
+      "status": "PASS",
+      "detail": "header-only lease database readable"
+    },
+    {
+      "id": "dhcp.udhcpd_cleanup",
+      "status": "PASS",
+      "detail": "udhcpd stopped"
+    },
+    {
+      "id": "dhcp.end_to_end",
+      "status": "UNVERIFIED",
+      "detail": "no client traffic injected; lease handoff is covered by acceptance ticket"
+    }
+  ],
+  "cleanup": [
+    {
+      "id": "dhcp.iptables_owner",
+      "detail": "temporary hsp_probe_02 chain removed; pre-existing rules untouched"
+    },
+    {
+      "id": "dhcp.udhcpd",
+      "detail": "udhcpd stopped; temporary directory removed"
+    }
+  ],
+  "facts": {
+    "ROOT": [
+      "id=uid=0(root) gid=0(root) groups=0(root) context=<redacted>",
+      "context=u:r:magisk:s0"
+    ],
+    "BUSYBOX": [
+      "path=/data/adb/magisk/busybox",
+      "version=BusyBox v1.36.1.1 topjohnwu (2024-10-06 01:38:43 PDT) multi-call binary."
+    ],
+    "HSCTL": [
+      "hsctl_version=0.1.1 sdk=36 release=16",
+      "sdk=36",
+      "tethering_binder=ok android.net.ITetheringConnector$Stub$Proxy",
+      "method=public android.os.IBinder android.net.ITetheringConnector$Stub$Proxy.asBinder()",
+      "method=public java.lang.String android.net.ITetheringConnector$Stub$Proxy.getInterfaceDescriptor()",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.isTetheringSupported(java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.registerTetheringEventCallback(android.net.ITetheringEventCallback,java.lang.String) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.requestLatestTetheringEntitlementResult(int,android.os.ResultReceiver,boolean,java.lang.String,java.lang.String) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.setPreferTestNetworks(boolean,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.setUsbTethering(boolean,java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.startTethering(android.net.TetheringRequestParcel,java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.stopAllTethering(java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.stopTethering(int,java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.stopTetheringRequest(android.net.TetheringManager$TetheringRequest,java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.tether(java.lang.String,java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.unregisterTetheringEventCallback(android.net.ITetheringEventCallback,java.lang.String) throws android.os.RemoteException",
+      "method=public void android.net.ITetheringConnector$Stub$Proxy.untether(java.lang.String,java.lang.String,java.lang.String,android.net.IIntResultListener) throws android.os.RemoteException",
+      "parcel_field=Creator CREATOR",
+      "parcel_field=int connectivityScope",
+      "parcel_field=boolean exemptFromEntitlementCheck",
+      "parcel_field=String interfaceName",
+      "parcel_field=LinkAddress localIPv4Address",
+      "parcel_field=String packageName",
+      "parcel_field=int requestType",
+      "parcel_field=boolean showProvisioningUi",
+      "parcel_field=SoftApConfiguration softApConfig",
+      "parcel_field=LinkAddress staticClientAddress",
+      "parcel_field=int tetheringType",
+      "parcel_field=int uid",
+      "parcel_field=int CONTENTS_FILE_DESCRIPTOR",
+      "parcel_field=int PARCELABLE_ELIDE_DUPLICATES",
+      "parcel_field=int PARCELABLE_STABILITY_LOCAL",
+      "parcel_field=int PARCELABLE_STABILITY_VINTF",
+      "parcel_field=int PARCELABLE_WRITE_RETURN_VALUE",
+      "request_ctor=public android.net.TetheringManager$TetheringRequest(android.net.TetheringRequestParcel)",
+      "request_ctor=private android.net.TetheringManager$TetheringRequest(android.os.Parcel)",
+      "request_ctor=android.net.TetheringManager$TetheringRequest(android.os.Parcel,android.net.TetheringManager-IA)",
+      "listener_iface=ok",
+      "wifi_method=public android.net.wifi.SoftApConfiguration android.net.wifi.IWifiManager$Stub$Proxy.getSoftApConfiguration() throws android.os.RemoteException",
+      "wifi_method=public android.net.wifi.WifiConfiguration android.net.wifi.IWifiManager$Stub$Proxy.getWifiApConfiguration() throws android.os.RemoteException",
+      "wifi_method=public int android.net.wifi.IWifiManager$Stub$Proxy.getWifiApEnabledState() throws android.os.RemoteException",
+      "wifi_method=public void android.net.wifi.IWifiManager$Stub$Proxy.queryLastConfiguredTetheredApPassphraseSinceBoot(android.net.wifi.IStringListener) throws android.os.RemoteException",
+      "wifi_method=public void android.net.wifi.IWifiManager$Stub$Proxy.registerLocalOnlyHotspotSoftApCallback(android.net.wifi.ISoftApCallback,android.os.Bundle) throws android.os.RemoteException",
+      "wifi_method=public void android.net.wifi.IWifiManager$Stub$Proxy.registerSoftApCallback(android.net.wifi.ISoftApCallback) throws android.os.RemoteException",
+      "wifi_method=public android.net.wifi.SoftApConfiguration android.net.wifi.IWifiManager$Stub$Proxy.restoreSoftApBackupData(byte[]) throws android.os.RemoteException",
+      "wifi_method=public byte[] android.net.wifi.IWifiManager$Stub$Proxy.retrieveSoftApBackupData() throws android.os.RemoteException",
+      "wifi_method=public boolean android.net.wifi.IWifiManager$Stub$Proxy.setSoftApConfiguration(android.net.wifi.SoftApConfiguration,java.lang.String) throws android.os.RemoteException",
+      "wifi_method=public boolean android.net.wifi.IWifiManager$Stub$Proxy.setWifiApConfiguration(android.net.wifi.WifiConfiguration,java.lang.String) throws android.os.RemoteException",
+      "wifi_method=public boolean android.net.wifi.IWifiManager$Stub$Proxy.startSoftAp(android.net.wifi.WifiConfiguration,java.lang.String) throws android.os.RemoteException",
+      "wifi_method=public boolean android.net.wifi.IWifiManager$Stub$Proxy.startTetheredHotspot(android.net.wifi.SoftApConfiguration,java.lang.String) throws android.os.RemoteException",
+      "wifi_method=public void android.net.wifi.IWifiManager$Stub$Proxy.startTetheredHotspotRequest(android.net.TetheringManager$TetheringRequest,android.net.wifi.ISoftApCallback,java.lang.String) throws android.os.RemoteException",
+      "wifi_method=public boolean android.net.wifi.IWifiManager$Stub$Proxy.stopSoftAp() throws android.os.RemoteException",
+      "wifi_method=public void android.net.wifi.IWifiManager$Stub$Proxy.unregisterLocalOnlyHotspotSoftApCallback(android.net.wifi.ISoftApCallback,android.os.Bundle) throws android.os.RemoteException",
+      "wifi_method=public void android.net.wifi.IWifiManager$Stub$Proxy.unregisterSoftApCallback(android.net.wifi.ISoftApCallback) throws android.os.RemoteException",
+      "wifi_method=public boolean android.net.wifi.IWifiManager$Stub$Proxy.validateSoftApConfiguration(android.net.wifi.SoftApConfiguration) throws android.os.RemoteException",
+      "ap_state=13",
+      "ap_state_name=ENABLED"
+    ],
+    "HSCTL_STATE": [
+      "hsctl_version=0.1.1 sdk=36 release=16 ap_state=13 ap_state_name=ENABLED ",
+      "hsctl_version=0.1.1 sdk=36 release=16",
+      "ap_state=13",
+      "ap_state_name=ENABLED"
+    ],
+    "CALLBACK": [
+      "callback_interface=ok",
+      "event_callback_registration=PASS",
+      "event_callback_methods=asBinder,onCallbackStarted,onCallbackStopped,onConfigurationChanged,onOffloadStatusChanged,onSupportedTetheringTypes,onTetherClientsChanged,onTetherStatesChanged,onUpstreamChanged",
+      "binder_callback=PASS isTetheringSupported_result=0",
+      "callback_unregister=PASS"
+    ],
+    "BOOT": [
+      "sys.boot_completed=1",
+      "dev.bootcomplete=1",
+      "ro.crypto.state=encrypted",
+      "sys.user.0.ce_available=true",
+      "init.svc.vold=running",
+      "init.svc.netd=running",
+      "uptime=83115.99",
+      "user=State:RUNNING_UNLOCKED",
+      "data_adb_readable=yes",
+      "tethering_service=Service_tethering:_found"
+    ],
+    "NET": [
+      "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever;13: rmnet_data2    inet 10.1.105.117/30 scope global rmnet_data2\\       valid_lft forever preferred_lft forever;27: ds-br0    inet 172.28.0.1/16 brd 172.28.255.255 scope global ds-br0\\       valid_lft forever preferred_lft forever;29: wlan2    inet 192.168.42.1/24 brd 192.168.42.255 scope global wlan2\\       valid_lft forever preferred_lft forever;"
+    ],
+    "IPTABLES": [
+      "-N hsp_probe_02;-A hsp_probe_02 -o wlan2 -p udp -m udp --sport 67 --dport 68 -m owner ! --uid-owner 0 -j DROP;"
+    ]
+  },
+  "sha256": "8e0804869fa931b19278cc8e9705902665a07c3dd232153268ce10d8edd8c24e"
+}
