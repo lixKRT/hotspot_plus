@@ -10,3 +10,5 @@ app/build/
 # raw device evidence is kept locally, not published
 docs/device-evidence.txt
 docs/legacy-hotspotboot-package.txt
+# design canvas for GitHub issues lives outside the published tree
+.scratch/
