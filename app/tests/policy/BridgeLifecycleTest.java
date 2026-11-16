@@ -8,32 +8,28 @@ public final class BridgeLifecycleTest {
         String local = WebPolicy.LOCAL_ORIGIN;
         BridgeLifecycle b = new BridgeLifecycle();
         check("starts uninstalled", !b.installed());
-        check("load defers install", b.loadingDocument(local) == BridgeLifecycle.Action.NONE);
-        check("not installed while loading", !b.installed() && b.needsInstall());
-        check("page start keeps deferral", b.pageStarted(local) == BridgeLifecycle.Action.NONE);
+        check("load installs before document", b.loadingDocument(local) == BridgeLifecycle.Action.INSTALL);
+        check("installed before loading", b.installed() && !b.needsInstall());
+        check("page start keeps binding", b.pageStarted(local) == BridgeLifecycle.Action.NONE);
         check("finished document accepted", b.accepting(local));
-        b.markInstalled();
-        check("installed after finish", b.installed() && !b.needsInstall());
         check("reload keeps binding", b.loadingDocument(local) == BridgeLifecycle.Action.NONE);
         check("reload still bound", b.installed() && !b.needsInstall());
         check("page start keeps binding", b.pageStarted(local) == BridgeLifecycle.Action.NONE);
         check("page start still bound", b.installed());
         check("external navigation removes", b.navigating("https://example.com/") == BridgeLifecycle.Action.REMOVE);
         check("external document rejected", !b.accepting("https://example.com/"));
-        check("returning to local defers", b.loadingDocument(local) == BridgeLifecycle.Action.NONE && b.needsInstall());
-        b.markInstalled();
+        check("returning to local reinstalls", b.loadingDocument(local) == BridgeLifecycle.Action.INSTALL && b.installed());
         check("returned document accepted", b.accepting(local));
         check("destroy removes", b.destroy() == BridgeLifecycle.Action.REMOVE);
         check("destroyed has no binding", !b.installed() && b.destroy() == BridgeLifecycle.Action.NONE);
-        check("fresh load after destroy defers", b.loadingDocument(local) == BridgeLifecycle.Action.NONE);
+        check("fresh load after destroy installs", b.loadingDocument(local) == BridgeLifecycle.Action.INSTALL);
 
         BridgeLifecycle wrong = new BridgeLifecycle();
         wrong.loadingDocument(local);
         check("mismatched finish rejected", !wrong.accepting(local + "other"));
 
         BridgeLifecycle reload = new BridgeLifecycle();
-        check("reload defers target document", reload.loadingDocument(local) == BridgeLifecycle.Action.NONE);
-        reload.markInstalled();
+        check("reload installs target document", reload.loadingDocument(local) == BridgeLifecycle.Action.INSTALL);
         check("page start after reload keeps binding", reload.pageStarted(local) == BridgeLifecycle.Action.NONE
                 && reload.installed());
         BridgeLifecycle external = new BridgeLifecycle();

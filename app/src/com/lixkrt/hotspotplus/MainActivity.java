@@ -112,6 +112,8 @@ public final class MainActivity extends Activity {
                 if (action == BridgeLifecycle.Action.REMOVE) {
                     web.removeJavascriptInterface("ksu");
                     web.removeJavascriptInterface("hspApp");
+                } else if (action == BridgeLifecycle.Action.INSTALL) {
+                    installBridges();
                 }
             }
 
@@ -154,9 +156,12 @@ public final class MainActivity extends Activity {
     private void showHtml(String html) {
         localHtml = html;
         App.ui(() -> {
-            if (bridge.loadingDocument(BASE_URL) == BridgeLifecycle.Action.REMOVE) {
+            BridgeLifecycle.Action action = bridge.loadingDocument(BASE_URL);
+            if (action == BridgeLifecycle.Action.REMOVE) {
                 web.removeJavascriptInterface("ksu");
                 web.removeJavascriptInterface("hspApp");
+            } else if (action == BridgeLifecycle.Action.INSTALL) {
+                installBridges();
             }
             web.loadUrl(BASE_URL);
         });

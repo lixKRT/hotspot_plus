@@ -31,14 +31,20 @@ final class BridgeLifecycle {
         return pending && trusted;
     }
 
-    /** An explicit trusted document load: bind once, then keep that object across reloads. */
+    /** An explicit trusted document load: install before load so the document sees the bridge. */
     Action loadingDocument(String target) {
         boolean local = WebPolicy.classifyDocument(target);
         if (!local) return navigating(target);
+        boolean had = installed;
         url = target;
         trusted = true;
-        if (!installed) pending = true;
-        return Action.NONE;
+        if (had) {
+            pending = false;
+            return Action.NONE;
+        }
+        installed = true;
+        pending = false;
+        return Action.INSTALL;
     }
 
     /** A page callback says a trusted URL is starting; never disturb an existing binding. */
@@ -47,8 +53,13 @@ final class BridgeLifecycle {
         if (!local) return navigating(target);
         url = target;
         trusted = true;
-        if (!installed) pending = true;
-        return Action.NONE;
+        if (installed) {
+            pending = false;
+            return Action.NONE;
+        }
+        installed = true;
+        pending = false;
+        return Action.INSTALL;
     }
 
     /** Navigation/untrusted content: drop the bridge before any document can call it. */

@@ -99,7 +99,7 @@ details summary{cursor:pointer;color:var(--sub)}
 <!-- 已连接设备 -->
 <div class="card">
   <h2><span>已连接设备 <span class="sub" id="clientCount"></span></span>
-    <span><label class="sub" style="font-weight:normal"><input type="checkbox" id="autoRef" checked> 自动刷新</label></span></h2>
+    <span><label class="sub" style="font-weight:normal" title="默认关闭。开启后每 30 秒自动刷新状态与设备列表，会周期性执行 root 命令和 dumpsys wifi；在调度器不稳定的内核上可能增加卡顿风险。需要更新时请点“刷新”。"><input type="checkbox" id="autoRef"> 自动刷新（每 30 秒；不推荐）</label></span></h2>
   <div id="clients"><div class="sub">—</div></div>
   <div class="btns"><button id="btnClients">刷新设备</button></div>
 </div>
@@ -516,8 +516,11 @@ $('btnRestoreDismiss').onclick = async () => {
   await loadConfig();
   checkRestorePrompt();
   refreshClients();
-  setInterval(() => { if (!busy && !document.hidden) refreshStatus(); }, 6000);
-  setInterval(() => { if ($('autoRef').checked && !document.hidden && lastStatus && lastStatus.ap) refreshClients(); }, 5000);
+  setInterval(() => {
+    if (!$('autoRef').checked || document.hidden) return;
+    if (!busy) refreshStatus();
+    if (lastStatus && lastStatus.ap) refreshClients();
+  }, 30000);
 })();
 </script>
 </body>
