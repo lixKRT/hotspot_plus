@@ -11,9 +11,17 @@ LOGDIR=$DATA/logs
 LOG=$LOGDIR/hsp.log
 CONF=$DATA/config.conf
 LEASES=$DATA/leases.conf
+LEASE_IMPORT=$MODDIR/webroot/lease-import.conf
 LEASE_DB=$DATA/udhcpd.leases
+STATE=$RUN/state
+GWSTATE=$RUN/gateway
 HSCTL_JAR=$MODDIR/bin/hsctl.jar
 FW_CHAIN=hsp_dhcp
+DHCPSTATE=$RUN/dhcp
+DHCP_RELOAD=$RUN/udhcpd.reload
+DHCP_RELOAD_MAX=${HSP_DHCP_RELOAD_MAX:-60}
+
+DHCP_STABLE_SECS=${HSP_DHCP_STABLE_SECS:-120}
 
 mkdir -p "$RUN" "$LOGDIR" 2>/dev/null
 
@@ -70,19 +78,20 @@ tmo() {
 ipt() { tmo 15 "iptables $*" "$IPT" -w 5 "$@"; }
 
 # ---------------------------------------------------------------- device info
-SDK=$(getprop ro.build.version.sdk)
-RELEASE=$(getprop ro.build.version.release)
-HYPEROS=$(getprop ro.mi.os.version.incremental)
-[ -n "$HYPEROS" ] || HYPEROS=$(getprop ro.build.version.incremental)
+SDK=$(getprop ro.build.version.sdk 2>/dev/null)
+RELEASE=$(getprop ro.build.version.release 2>/dev/null)
+HYPEROS=$(getprop ro.mi.os.version.incremental 2>/dev/null)
+[ -n "$HYPEROS" ] || HYPEROS=$(getprop ro.build.version.incremental 2>/dev/null)
+prop_get() { getprop "$1" 2>/dev/null; }
 
 # ---------------------------------------------------------------- config
 config_defaults() {
     FIXED_GATEWAY=1
-    GATEWAY=192.168.4.1
+    GATEWAY=192.168.42.1
     PREFIX=24
     DHCP_ENABLE=1
-    DHCP_START=192.168.4.100
-    DHCP_END=192.168.4.200
+    DHCP_START=192.168.42.100
+    DHCP_END=192.168.42.200
     LEASE_TIME=43200
     DNS=""
     ENFORCE_GATEWAY=1
@@ -99,20 +108,102 @@ load_config() {
     case "$PREFIX" in ''|*[!0-9]*) PREFIX=24 ;; esac
     case "$POLL_INTERVAL" in ''|*[!0-9]*) POLL_INTERVAL=3 ;; esac
     case "$LEASE_TIME" in ''|*[!0-9]*) LEASE_TIME=43200 ;; esac
+    if ! gateway_addr_valid "$GATEWAY" "$PREFIX"; then
+        log "WARN: invalid GATEWAY/PREFIX ($GATEWAY/$PREFIX); using 192.168.42.1/24"
+        GATEWAY=192.168.42.1; PREFIX=24
+    fi
+    if ! gateway_dhcp_valid "$GATEWAY" "$PREFIX" "$DHCP_START" "$DHCP_END"; then
+        log "WARN: invalid DHCP range ($DHCP_START-$DHCP_END) for $GATEWAY/$PREFIX; using 192.168.42.100-200"
+        DHCP_START=192.168.42.100; DHCP_END=192.168.42.200
+    fi
+}
+
+# ---------------------------------------------------------------- lifecycle state
+state_get() { # key
+    [ -f "$STATE" ] || return 1
+    sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -n1
+}
+state_set() { # key value
+    [ $# -ge 2 ] || return 1
+    mkdir -p "$RUN" 2>/dev/null
+    _stmp=$STATE.tmp.$$
+    if [ -f "$STATE" ]; then
+        grep -v "^$1=" "$STATE" > "$_stmp" 2>/dev/null || :
+    else
+        : > "$_stmp"
+    fi
+    printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ' | tr -d '\000')" >> "$_stmp"
+    mv -f "$_stmp" "$STATE"
+}
+
+record_lifecycle() { # action result [error]
+    state_set last_action "$1"
+    state_set last_result "$2"
+    state_set last_error "${3:-}"
+    state_set last_at "$(date +%s)"
+    log "lifecycle: action=$1 result=$2${3:+ error=$3}"
+}
+
+record_boot() { # decision result sim [error]
+    state_set boot_decision "$1"
+    state_set boot_result "$2"
+    state_set boot_sim "$3"
+    state_set boot_error "${4:-}"
+    state_set boot_at "$(date +%s)"
+    log "boot-auto: decision=$1 result=$2 sim=${3:-none}${4:+ error=$4}"
+}
+
+sim_has_loaded() { # comma-separated gsm.sim.state
+    [ -n "$1" ] || return 1
+    printf '%s\n' "$1" | awk -F',' '
+        { for (i = 1; i <= NF; i++) { gsub(/^[ \t\r]+|[ \t\r]+$/, "", $i); if ($i == "LOADED") found = 1 } }
+        END { exit !found }'
+}
+
+boot_autostart_decision() { # AUTO_START sim_state ap_running(0|1)
+    if [ "$1" != 1 ]; then
+        echo disabled
+    elif [ "$3" = 1 ]; then
+        echo already_on
+    elif sim_has_loaded "$2"; then
+        echo start
+    else
+        echo no_sim
+    fi
 }
 
 # ---------------------------------------------------------------- IPv4 math
 is_ipv4() {
-    echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+    case "$1" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
     _o=$1
     for _i in 1 2 3 4; do
-        _v=${_o%%.*}; _o=${_o#*.}
-        [ "$_v" -le 255 ] 2>/dev/null || return 1
+        _v=${_o%%.*}
+        case "$_v" in
+            0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) ;;
+            *) return 1 ;;
+        esac
+        if [ "$_i" -lt 4 ]; then
+            case "$_o" in *.*) _o=${_o#*.} ;; *) return 1 ;; esac
+        else
+            case "$_o" in *.*) return 1 ;; esac
+        fi
     done
     return 0
 }
+is_private_ipv4() {
+    is_ipv4 "$1" || return 1
+    _pa=${1%%.*}; _pr=${1#*.}
+    _pb=${_pr%%.*}
+    [ "$_pa" = 10 ] ||
+        { [ "$_pa" = 192 ] && [ "$_pb" = 168 ]; } ||
+        { [ "$_pa" = 172 ] && [ "$_pb" -ge 16 ] && [ "$_pb" -le 31 ]; }
+}
 is_mac() { echo "$1" | tr '-' ':' | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; }
 lc() { echo "$1" | tr 'A-F' 'a-f' | tr '-' ':'; }
+sanitize_remark() {
+    printf '%s' "$1" | tr '\n\r\t' '   ' | tr -d '\001-\010\013\014\016-\037' \
+        | tr -d '"$`\\' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//' | cut -c1-64
+}
 ip2int() {
     _a=${1%%.*}; _r=${1#*.}; _b=${_r%%.*}; _r=${_r#*.}; _c=${_r%%.*}; _d=${_r#*.}
     echo $(( (_a << 24) + (_b << 16) + (_c << 8) + _d ))
@@ -128,6 +219,54 @@ map_ip() {
     _off=$(( $(ip2int "$1") - $2 ))
     [ "$_off" -gt 0 ] && [ "$_off" -lt $(( $4 - 1 )) ] || return 1
     int2ip $(( $3 + _off ))
+}
+
+# lease_validate_line MAC IP [REMARK] -> canonical "mac ip remark" or "ERR ..." and rc 1.
+# A static address must be a usable host address in the configured private subnet.
+lease_validate_line() {
+    is_mac "$1" || { echo "ERR 无效 MAC: $1"; return 1; }
+    is_ipv4 "$2" || { echo "ERR 无效 IP: $2"; return 1; }
+    is_private_ipv4 "$2" || { echo "ERR 静态租约需在私有网段: $2"; return 1; }
+    _lv_mask=$(pfx2mask_int "$PREFIX")
+    _lv_net=$(( $(ip2int "$GATEWAY") & _lv_mask ))
+    _lv_size=$(( 1 << (32 - PREFIX) ))
+    _lv_off=$(( $(ip2int "$2") - _lv_net ))
+    if [ "$_lv_off" -le 0 ] || [ "$_lv_off" -ge $(( _lv_size - 1 )) ]; then
+        echo "ERR 地址 $2 不是 $(int2ip "$_lv_net")/$PREFIX 内的主机地址（不能是网络/广播/越界地址）"
+        return 1
+    fi
+    [ "$2" = "$GATEWAY" ] && { echo "ERR 地址 $2 是热点网关"; return 1; }
+    _lv_nm=$(sanitize_remark "${3:-}")
+    printf '%s %s%s\n' "$(lc "$1")" "$2" "${_lv_nm:+ $_lv_nm}"
+}
+
+# subnet_setup [actual_ip/prefix]: describe configured and observed subnets.
+# Sets SUBNET_STATUS (unavailable|configured|mapped), SUBNET_*_NET/CIDR, SUBNET_EXAMPLE.
+subnet_setup() {
+    SUBNET_STATUS=unavailable
+    SUBNET_CFG_NET=""; SUBNET_CFG_CIDR=""; SUBNET_ACTUAL_NET=""; SUBNET_ACTUAL_CIDR=""
+    SUBNET_CFG_SIZE=0; SUBNET_ACTUAL_SIZE=0; SUBNET_EXAMPLE=""
+    _ss_cm=$(pfx2mask_int "$PREFIX")
+    SUBNET_CFG_NET=$(( $(ip2int "$GATEWAY") & _ss_cm ))
+    SUBNET_CFG_SIZE=$(( 1 << (32 - PREFIX) ))
+    SUBNET_CFG_CIDR="$(int2ip "$SUBNET_CFG_NET")/$PREFIX"
+    [ -n "${1:-}" ] || return 0
+    _ss_ip=${1%/*}; _ss_pfx=${1#*/}
+    [ "$_ss_pfx" != "$1" ] || return 0
+    case "$_ss_pfx" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_ss_pfx" -ge 16 ] && [ "$_ss_pfx" -le 28 ] || return 0
+    is_ipv4 "$_ss_ip" || return 0
+    _ss_am=$(pfx2mask_int "$_ss_pfx")
+    SUBNET_ACTUAL_NET=$(( $(ip2int "$_ss_ip") & _ss_am ))
+    SUBNET_ACTUAL_SIZE=$(( 1 << (32 - _ss_pfx) ))
+    SUBNET_ACTUAL_CIDR="$(int2ip "$SUBNET_ACTUAL_NET")/$_ss_pfx"
+    if [ "$SUBNET_ACTUAL_NET" = "$SUBNET_CFG_NET" ] && [ "$_ss_pfx" = "$PREFIX" ]; then
+        SUBNET_STATUS=configured
+    else
+        SUBNET_STATUS=mapped
+        SUBNET_EXAMPLE=$(map_ip "$DHCP_START" "$SUBNET_CFG_NET" "$SUBNET_ACTUAL_NET" "$SUBNET_ACTUAL_SIZE") || SUBNET_EXAMPLE=""
+        [ -z "$SUBNET_EXAMPLE" ] || SUBNET_EXAMPLE="$DHCP_START -> $SUBNET_EXAMPLE"
+    fi
 }
 
 # ---------------------------------------------------------------- AP detection
@@ -180,6 +319,312 @@ ap_detect_fast() {
     ap_detect
 }
 
+# ---------------------------------------------------------------- fixed gateway policy
+# ADR-0007: module-start may request the gateway, retry twice (5s/15s) and then degrade;
+# system-start gets exactly one repair restart. Attempts are counted per hotspot session.
+is_private_ipv4() {
+    is_ipv4 "$1" || return 1
+    case "$1" in
+        10.*|192.168.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    esac
+    return 1
+}
+prefix_valid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 16 ] && [ "$1" -le 28 ]
+}
+in_subnet() { # ip network_int size (host part excludes network/broadcast)
+    _off=$(( $(ip2int "$1") - $2 ))
+    [ "$_off" -gt 0 ] && [ "$_off" -lt $(( $3 - 1 )) ]
+}
+gateway_addr_valid() { # gateway prefix
+    is_ipv4 "$1" || return 1
+    prefix_valid "$2" || return 1
+    is_private_ipv4 "$1" || return 1
+    _m=$(pfx2mask_int "$2"); _n=$(( $(ip2int "$1") & _m )); _sz=$(( 1 << (32 - $2) ))
+    in_subnet "$1" "$_n" "$_sz"
+}
+gateway_dhcp_valid() { # gateway prefix dhcp_start dhcp_end
+    gateway_addr_valid "$1" "$2" || return 1
+    is_ipv4 "$3" && is_ipv4 "$4" || return 1
+    _m=$(pfx2mask_int "$2"); _n=$(( $(ip2int "$1") & _m )); _sz=$(( 1 << (32 - $2) ))
+    in_subnet "$3" "$_n" "$_sz" && in_subnet "$4" "$_n" "$_sz" || return 1
+    _s=$(ip2int "$3"); _e=$(ip2int "$4"); _g=$(ip2int "$1")
+    [ "$_s" -le "$_e" ] || return 1
+    ! { [ "$_g" -ge "$_s" ] && [ "$_g" -le "$_e" ]; }
+}
+gateway_matches() { # cfg(ip/prefix) actual(ip/prefix)
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    [ "${1%/*}" = "${2%/*}" ] && [ "${1#*/}" = "${2#*/}" ]
+}
+
+# Attempt budget for one session. $1=origin $2=repairs already done.
+gw_repair_limit() {
+    case "$1" in
+        module) echo 2 ;;
+        system) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+gw_repair_delay() { # origin attempt_number (1-based)
+    case "$1" in
+        module) [ "$2" = 1 ] && echo 5 || echo 15 ;;
+        system) echo 0 ;;
+        *) return 1 ;;
+    esac
+}
+gateway_repair_plan() { # origin attempts_done -> "restart <delay>" | "degrade 0"
+    _lim=$(gw_repair_limit "$1")
+    [ "$_lim" -gt 0 ] || { echo "degrade 0"; return 0; }
+    if [ "$2" -ge "$_lim" ]; then echo "degrade 0"; return 0; fi
+    echo "restart $(gw_repair_delay "$1" $(( $2 + 1 )))"
+}
+
+gw_get() { # key
+    [ -f "$GWSTATE" ] || return 1
+    sed -n "s/^$1=//p" "$GWSTATE" 2>/dev/null | tail -n1
+}
+gw_set() { # key value
+    [ $# -ge 2 ] || return 1
+    mkdir -p "$RUN" 2>/dev/null
+    _gtmp=$GWSTATE.tmp.$$
+    if [ -f "$GWSTATE" ]; then
+        grep -v "^$1=" "$GWSTATE" > "$_gtmp" 2>/dev/null || :
+    else
+        : > "$_gtmp"
+    fi
+    printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ' | tr -d '\000')" >> "$_gtmp"
+    mv -f "$_gtmp" "$GWSTATE"
+}
+gw_active() { [ -f "$GWSTATE" ] && [ "$(gw_get active)" = 1 ]; }
+gw_pending() { [ "$(gw_get pending)" = 1 ]; }
+
+# Summary survives session end so `hsp status` can show the last outcome.
+gw_summary_write() { # result reason
+    state_set gw_result "$1"
+    state_set gw_reason "${2:-}"
+    state_set gw_attempts "$(gw_get attempts)"
+    state_set gw_limit "$(gw_get limit)"
+    state_set gw_origin "$(gw_get origin)"
+    state_set gw_final_gw "$(gw_get final_gw)"
+    state_set gw_degraded "$(gw_get degraded)"
+    state_set gw_at "$(date +%s)"
+}
+
+gw_session_begin() { # origin(module|system)
+    _go=${1:-system}
+    _gn=$(date +%s)
+    mkdir -p "$RUN" 2>/dev/null
+    rm -f "$GWSTATE" "$RUN/enforce_broken"
+    {
+        echo "active=1"
+        echo "session=$_gn-$$"
+        echo "origin=$_go"
+        echo "attempts=0"
+        echo "limit=$(gw_repair_limit "$_go")"
+        echo "pending=0"
+        echo "pending_at=0"
+        echo "hold=0"
+        echo "hold_at=0"
+        echo "seen=0"
+        echo "degraded=0"
+        echo "reason="
+        echo "result=starting"
+        echo "final_gw="
+        echo "next_at=0"
+        echo "at=$_gn"
+    } > "$GWSTATE"
+    state_set gw_result starting
+    state_set gw_reason ""
+    log "gateway: session begin origin=$_go limit=$(gw_repair_limit "$_go")"
+}
+
+gw_session_end() { # result reason
+    gw_active || return 0
+    gw_set hold 0
+    gw_set hold_at 0
+    gw_summary_write "${1:-ended}" "${2:-}"
+    log "gateway: session end result=${1:-ended} attempts=$(gw_get attempts) final=$(gw_get final_gw)${2:+ reason=$2}"
+    rm -f "$GWSTATE" "$RUN/enforce_broken"
+}
+
+gw_degrade() { # reason
+    gw_set hold 0
+    gw_set hold_at 0
+    gw_set degraded 1
+    gw_set result degraded
+    gw_set reason "$1"
+    gw_set next_at 0
+    gw_set pending 0
+    touch "$RUN/enforce_broken"
+    gw_summary_write degraded "$1"
+    log "gateway: DEGRADED origin=$(gw_get origin) attempts=$(gw_get attempts) final=$(gw_get final_gw) reason=$1"
+}
+
+gw_recovered() { # final
+    gw_set degraded 0
+    gw_set result ok
+    gw_set reason ""
+    gw_set next_at 0
+    gw_set final_gw "$1"
+    rm -f "$RUN/enforce_broken"
+    gw_summary_write ok ""
+    log "gateway: ok origin=$(gw_get origin) attempts=$(gw_get attempts) gateway=$1"
+}
+
+gw_spawn_repair() {
+    log "gateway: repair restart to apply $GATEWAY/$PREFIX (attempt $(gw_get attempts)/$(gw_get limit), origin $(gw_get origin))"
+    # Test hook: the caller drives `hsp repair` synchronously instead of a background child.
+    [ "$HSP_GW_NO_SPAWN" = 1 ] && return 0
+    setsid sh "$MODDIR/bin/hsp" repair >/dev/null 2>&1 < /dev/null 3>&- 9>&- &
+}
+
+gw_attempt_start() { # now
+    gw_set attempts $(( $(gw_get attempts) + 1 ))
+    gw_set pending 1
+    gw_set pending_phase stopping
+    gw_set pending_at "$1"
+    gw_set next_at 0
+    gw_set result repairing
+    gw_set reason "mismatch: want $GATEWAY/$PREFIX, got $(gw_get final_gw)"
+    log "gateway: repair attempt $(gw_get attempts)/$(gw_get limit) origin=$(gw_get origin) current=$(gw_get final_gw)"
+    gw_spawn_repair
+}
+
+gw_pending_started() { gw_set pending_phase starting; }
+
+# A user-requested restart/apply must keep the current session (ADR-0007: only an explicit
+# off -> on resets the budget). The daemon may see the AP down before the start completes,
+# so mark the session as manually restarting until the next observation.
+gw_hold_begin() {
+    gw_active || return 0
+    gw_set hold 1
+    gw_set hold_at "$(date +%s)"
+    log "gateway: manual restart requested; keeping session budget (attempts $(gw_get attempts)/$(gw_get limit), origin $(gw_get origin))"
+}
+gw_hold_clear() {
+    [ "$(gw_get hold)" = 1 ] || return 0
+    gw_set hold 0
+    gw_set hold_at 0
+}
+gw_holding() { [ "$(gw_get hold)" = 1 ]; }
+
+gw_observe() { # iface addr  (call when the hotspot is up)
+    _if=$1; _addr=$2
+    gw_active || gw_session_begin system
+    _origin=$(gw_get origin)
+    [ "$(gw_get seen)" = 1 ] || gw_set seen 1
+    if gw_holding; then
+        gw_hold_clear
+        log "gateway: manual restart returned with $_addr (attempts $(gw_get attempts)/$(gw_get limit))"
+    fi
+    if gw_pending; then
+        # Before the restart begins the old AP is still visible; only an observation made
+        # after the stop/start cycle counts as "the repair restart returned".
+        if [ "$(gw_get pending_phase)" != starting ]; then
+            log "gateway: repair restart in progress; ignoring observation $_addr"
+            return 1
+        fi
+        gw_set pending 0
+        gw_set pending_phase ""
+        gw_set pending_at 0
+        log "gateway: repair restart returned with $_addr (attempts $(gw_get attempts)/$(gw_get limit))"
+    fi
+    gw_set final_gw "$_addr"
+    gw_set iface "$_if"
+    if [ "$FIXED_GATEWAY" != 1 ] || [ "$ENFORCE_GATEWAY" != 1 ]; then
+        gw_set result disabled
+        gw_set reason "fixed gateway disabled"
+        gw_set next_at 0
+        gw_summary_write disabled "fixed gateway disabled"
+        log "gateway: fixed gateway disabled; not enforcing (gateway=$_addr)"
+        return 2
+    fi
+    if gateway_matches "$GATEWAY/$PREFIX" "$_addr"; then
+        gw_recovered "$_addr"
+        return 0
+    fi
+    if ! dhcp_capable; then
+        # Without our own DHCP a restart cannot change the gateway; do not churn the hotspot.
+        gw_degrade "fixed gateway unavailable: own DHCP is not capable"
+        return 3
+    fi
+    if [ "$(gw_get degraded)" = 1 ]; then
+        log "gateway: still mismatched ($_addr), session already degraded; no restart"
+        return 3
+    fi
+    _plan=$(gateway_repair_plan "$_origin" "$(gw_get attempts)")
+    case "$_plan" in
+        restart\ *)
+            _delay=${_plan#restart }
+            if [ "$_delay" = 0 ]; then
+                gw_attempt_start "$(date +%s)"
+            else
+                gw_set result waiting
+                gw_set reason "mismatch: want $GATEWAY/$PREFIX, got $_addr"
+                gw_set next_at $(( $(date +%s) + _delay ))
+                log "gateway: mismatch ($_addr); retry $(( $(gw_get attempts) + 1 ))/$(gw_get limit) in ${_delay}s"
+            fi ;;
+        *)
+            gw_degrade "mismatch: want $GATEWAY/$PREFIX, got $_addr; retries exhausted" ;;
+    esac
+    return 1
+}
+
+gw_tick() { # now current_addr -> 0 when a repair restart was triggered
+    gw_active || return 1
+    [ "$(gw_get degraded)" = 1 ] && return 1
+    gw_pending && return 1
+    _na=$(gw_get next_at)
+    _na=${_na:-0}
+    case "$_na" in ''|*[!0-9]*) _na=0 ;; esac
+    [ "$_na" -gt 0 ] && [ "$1" -ge "$_na" ] || return 1
+    if gateway_matches "$GATEWAY/$PREFIX" "$2"; then
+        gw_recovered "$2"
+        return 1
+    fi
+    gw_attempt_start "$1"
+    return 0
+}
+
+# Called when the AP goes down. A repair restart keeps the session alive while pending.
+gw_session_down() { # now
+    gw_active || return 0
+    if gw_holding; then
+        _ha=$(gw_get hold_at); _ha=${_ha:-0}
+        case "$_ha" in ''|*[!0-9]*) _ha=0 ;; esac
+        if [ $(( $1 - _ha )) -lt 120 ]; then
+            log "gateway: AP down during a manual restart; keeping session budget"
+            return 0
+        fi
+        gw_hold_clear
+    fi
+    if gw_pending; then
+        _pa=$(gw_get pending_at); _pa=${_pa:-0}
+        case "$_pa" in ''|*[!0-9]*) _pa=0 ;; esac
+        if [ $(( $1 - _pa )) -lt 120 ]; then
+            log "gateway: AP down while repair restart is in flight; keeping session"
+            return 0
+        fi
+        gw_set pending 0
+        gw_degrade "repair restart did not bring the hotspot back"
+        gw_session_end degraded "$(gw_get reason)"
+        return 0
+    fi
+    if [ "$(gw_get degraded)" = 1 ]; then
+        gw_session_end degraded "$(gw_get reason)"
+    elif [ "$(gw_get result)" = ok ]; then
+        gw_session_end ok ""
+    else
+        gw_session_end ended "$(gw_get reason)"
+    fi
+}
+
+gw_status_value() { # key -> active value, else persisted summary
+    if gw_active; then gw_get "$1"; else state_get "gw_$1"; fi
+}
+
 # ---------------------------------------------------------------- hsctl (dex) wrapper
 # Hard timeout per sub-command; HsCtl also has its own internal deadline (exit 4).
 hsctl() {
@@ -222,12 +667,287 @@ fw_check() {
     ipt -C OUTPUT -j $FW_CHAIN 2>/dev/null && \
     ipt -C $FW_CHAIN -o "$1" -p udp --sport 67 --dport 68 -m owner ! --uid-owner 0 -j DROP 2>/dev/null
 }
+fw_check_retry() { # iface [attempts]
+    _fr_n=${2:-2}
+    while [ "$_fr_n" -gt 0 ]; do
+        fw_check "$1" && return 0
+        _fr_n=$((_fr_n - 1))
+        [ "$_fr_n" -gt 0 ] && sleep 0.1
+    done
+    return 1
+}
 fw_del() {
     _n=0
-    while ipt -D OUTPUT -j $FW_CHAIN 2>/dev/null; do _n=$((_n+1)); [ $_n -gt 5 ] && break; done
+    while [ "$_n" -lt 8 ] && ipt -D OUTPUT -j $FW_CHAIN 2>/dev/null; do _n=$((_n+1)); done
     ipt -F $FW_CHAIN 2>/dev/null
     ipt -X $FW_CHAIN 2>/dev/null
     return 0
+}
+
+# ---------------------------------------------------------------- DHCP takeover state
+# The takeover is fail-closed: udhcpd is verified first, then the OUTPUT jump is installed.
+# Any failure removes the jump/chain, stops udhcpd, and leaves system DHCP as the responder.
+dhcp_get() { # key
+    [ -f "$DHCPSTATE" ] || return 1
+    sed -n "s/^$1=//p" "$DHCPSTATE" 2>/dev/null | tail -n1
+}
+dhcp_set() { # key value
+    [ $# -ge 2 ] || return 1
+    mkdir -p "$RUN" 2>/dev/null
+    _dtmp=$DHCPSTATE.tmp.$$
+    if [ -f "$DHCPSTATE" ]; then
+        grep -v "^$1=" "$DHCPSTATE" > "$_dtmp" 2>/dev/null || :
+    else
+        : > "$_dtmp"
+    fi
+    printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ' | tr -d '\000')" >> "$_dtmp"
+    mv -f "$_dtmp" "$DHCPSTATE"
+}
+dhcp_fail_limit() {
+    _dl=${HSP_DHCP_FAIL_LIMIT:-3}
+    case "$_dl" in ''|*[!0-9]*) _dl=3 ;; esac
+    [ "$_dl" -gt 0 ] 2>/dev/null || _dl=3
+    echo "$_dl"
+}
+dhcp_reload_begin() {
+    mkdir -p "$RUN" 2>/dev/null
+    date +%s > "$DHCP_RELOAD"
+}
+dhcp_reload_end() {
+    rm -f "$DHCP_RELOAD"
+}
+dhcp_reload_pending() {
+    [ -f "$DHCP_RELOAD" ] || return 1
+    _drm=$(cat "$DHCP_RELOAD" 2>/dev/null)
+    case "$_drm" in ''|*[!0-9]*) dhcp_reload_end; return 1 ;; esac
+    _drnow=$(date +%s)
+    _drage=$((_drnow - _drm))
+    [ "$_drage" -lt 0 ] && _drage=0
+    if [ "$_drage" -gt "$DHCP_RELOAD_MAX" ]; then
+        dhcp_reload_end
+        return 1
+    fi
+    return 0
+}
+dhcp_stable_secs() {
+    case "$DHCP_STABLE_SECS" in ''|*[!0-9]*) echo 120 ;; *) echo "$DHCP_STABLE_SECS" ;; esac
+}
+dhcp_session_begin() {
+    mkdir -p "$RUN" 2>/dev/null
+    dhcp_reload_end
+    {
+        _ds_now=$(date +%s)
+        echo "session=$(date +%s)-$$"
+        echo "state=idle"
+        echo "serving=0"
+        echo "degraded=0"
+        echo "failures=0"
+        echo "first_failure_at=0"
+        echo "last_failure_at=0"
+        echo "stable_since=0"
+        echo "reason="
+        echo "last_error="
+        echo "retry_available=0"
+        echo "retry_at=0"
+        echo "at=$_ds_now"
+    } > "$DHCPSTATE"
+    state_set dhcp_degraded 0
+    state_set dhcp_reason ""
+    state_set dhcp_last_error ""
+    log "dhcp: session begin"
+}
+dhcp_summary_write() {
+    state_set dhcp_mode "$(dhcp_get state)"
+    state_set dhcp_degraded "$(dhcp_get degraded)"
+    state_set dhcp_reason "$(dhcp_get reason)"
+    state_set dhcp_last_error "$(dhcp_get last_error)"
+    state_set dhcp_retry_available "$(dhcp_get retry_available)"
+    state_set dhcp_failures "$(dhcp_get failures)"
+    state_set dhcp_first_failure_at "$(dhcp_get first_failure_at)"
+    state_set dhcp_last_failure_at "$(dhcp_get last_failure_at)"
+    state_set dhcp_at "$(date +%s)"
+}
+dhcp_rollback_ordered() { # reason error [state]
+    fw_del
+    dhcp_stop
+    dhcp_reload_end
+    dhcp_set serving 0
+    dhcp_set state "${3:-failed}"
+    [ -n "$1" ] && dhcp_set reason "$1"
+    [ -n "$2" ] && dhcp_set last_error "$2"
+    log "dhcp: fail-closed (${1:-takeover failed}): removed $FW_CHAIN/OUTPUT, stopped udhcpd${2:+ error=$2}"
+}
+dhcp_window_begin() { # now: a new serving period starts the stability clock but keeps history
+    dhcp_set stable_since "$1"
+}
+dhcp_stable_check() { # now
+    _dc_now=$1; _dc_since=$(dhcp_get stable_since); _dc_since=${_dc_since:-0}
+    case "$_dc_since" in ''|*[!0-9]*) _dc_since=0 ;; esac
+    if [ "$(dhcp_get serving)" = 1 ] && [ "$_dc_since" -gt 0 ] &&
+        [ $((_dc_now - _dc_since)) -ge "$(dhcp_stable_secs)" ]; then
+        dhcp_set failures 0
+        dhcp_set first_failure_at 0
+        dhcp_set last_failure_at 0
+        dhcp_set stable_since "$_dc_now"
+        dhcp_summary_write
+        log "dhcp: stable for $(dhcp_stable_secs)s; failure window cleared"
+        return 0
+    fi
+    return 1
+}
+dhcp_record_failure() { # reason error
+    _dn=$(date +%s)
+    _df=$(dhcp_get failures); _df=${_df:-0}
+    case "$_df" in ''|*[!0-9]*) _df=0 ;; esac
+    _dff=$(dhcp_get first_failure_at); _dff=${_dff:-0}
+    case "$_dff" in ''|*[!0-9]*) _dff=0 ;; esac
+    _df=$((_df + 1))
+    [ "$_dff" -eq 0 ] && _dff=$_dn
+    dhcp_set failures "$_df"
+    dhcp_set first_failure_at "$_dff"
+    dhcp_set last_failure_at "$_dn"
+    dhcp_set stable_since 0
+    dhcp_set reason "$1"
+    dhcp_set last_error "$2"
+    if [ "$_df" -ge "$(dhcp_fail_limit)" ]; then
+        dhcp_degrade "$1" "$2"
+    else
+        dhcp_rollback_ordered "$1" "$2" degraded
+        dhcp_set retry_available 1
+        dhcp_set degraded 1
+        dhcp_set state degraded
+        dhcp_summary_write
+    fi
+}
+dhcp_degrade() { # reason error
+    dhcp_rollback_ordered "$1" "$2" degraded
+    dhcp_set degraded 1
+    dhcp_set retry_available 1
+    dhcp_set state degraded
+    dhcp_summary_write
+    log "dhcp: DEGRADED system DHCP owns replies; retry available${1:+ reason=$1}"
+}
+dhcp_crash() { # last_error
+    dhcp_record_failure "udhcpd 连续异常退出" "$1"
+}
+dhcp_takeover() { # iface addr
+    _dt_if=$1; _dt_addr=$2
+    if ! dhcp_capable; then
+        dhcp_rollback_ordered "自建 DHCP 不可用" "DHCP_ENABLE=0 / udhcpd 缺失 / iptables owner 不受支持"
+        dhcp_set retry_available 1
+        dhcp_summary_write
+        return 1
+    fi
+    if ! dhcp_start "$_dt_if" "$_dt_addr" || ! dhcp_running; then
+        dhcp_record_failure "udhcpd 启动失败" "udhcpd 未能保持运行"
+        return 1
+    fi
+    if ! fw_add "$_dt_if" || ! fw_check_retry "$_dt_if"; then
+        dhcp_record_failure "iptables 接管规则安装失败" "无法安装或验证 $FW_CHAIN/OUTPUT"
+        return 1
+    fi
+    dhcp_set serving 1
+    dhcp_set state serving
+    dhcp_set degraded 0
+    dhcp_window_begin "$(date +%s)"
+    dhcp_set reason ""
+    dhcp_set last_error ""
+    dhcp_set retry_available 0
+    dhcp_reload_end
+    dhcp_summary_write
+    log "dhcp: takeover confirmed: $DHCP_SUMMARY; $FW_CHAIN/OUTPUT installed"
+    return 0
+}
+dhcp_retry() { # [iface addr]
+    if ! dhcp_get degraded >/dev/null 2>&1 || [ "$(dhcp_get degraded)" != 1 ]; then
+        echo "自建 DHCP 未处于降级模式，无需重试"
+        return 1
+    fi
+    _dr_if=${1:-}; _dr_addr=${2:-}
+    if [ -z "$_dr_if" ]; then
+        ap_detect_fast >/dev/null 2>&1 || {
+            dhcp_set last_error "热点未开启，无法重试自建 DHCP"
+            dhcp_summary_write
+            echo "重试失败：热点未开启"
+            return 1
+        }
+        _dr_if=$AP_IF; _dr_addr=$AP_ADDR
+    fi
+    log "dhcp: retry requested for $_dr_if $_dr_addr"
+    if dhcp_takeover "$_dr_if" "$_dr_addr"; then
+        dhcp_set degraded 0
+        dhcp_set retry_available 0
+        dhcp_set state serving
+        dhcp_summary_write
+        log "dhcp: retry succeeded; static leases restored"
+        echo "自建 DHCP 已恢复，静态租约生效"
+        return 0
+    fi
+    dhcp_set degraded 1
+    dhcp_set retry_available 1
+    dhcp_set state degraded
+    dhcp_summary_write
+    echo "重试失败：$(dhcp_get last_error)；仍由系统 DHCP 分配地址，热点未重启"
+    return 1
+}
+dhcp_reset() {
+    _dr_now=$(date +%s)
+    dhcp_reload_end
+    _dr_degraded=$(dhcp_get degraded)
+    _dr_state=$(dhcp_get state)
+    dhcp_set failures 0
+    dhcp_set first_failure_at 0
+    dhcp_set last_failure_at 0
+    dhcp_set stable_since "$_dr_now"
+    if dhcp_running; then
+        dhcp_set degraded 0
+        dhcp_set reason ""
+        dhcp_set last_error ""
+        dhcp_set retry_available 0
+        dhcp_set serving 1
+        dhcp_set state serving
+    elif [ "$_dr_degraded" = 1 ]; then
+        dhcp_set degraded 0
+        dhcp_set state idle
+        dhcp_set retry_available 0
+        [ "$_dr_state" = degraded ] && dhcp_set reason ""
+    else
+        dhcp_set serving 0
+        dhcp_set state idle
+    fi
+    dhcp_summary_write
+    log "dhcp: user reset cleared failure window and degraded flag"
+}
+dhcp_health_check() { # now iface addr
+    _dhc_now=${1:-$(date +%s)}
+    _dhc_if=$2; _dhc_addr=$3
+    [ "$(dhcp_get serving)" = 1 ] || return 0
+    if dhcp_running; then
+        dhcp_reload_end
+        if [ "$(dhcp_get degraded)" = 1 ]; then
+            dhcp_set degraded 0
+            dhcp_set reason ""
+            dhcp_set last_error ""
+            dhcp_set retry_available 0
+            dhcp_set state serving
+            dhcp_summary_write
+            log "dhcp: healthy serving state cleared stale degraded flag"
+        fi
+        dhcp_stable_check "$_dhc_now"
+        if ! fw_check "$_dhc_if"; then
+            log "firewall rule missing, fail-closing DHCP"
+            dhcp_crash "接管规则丢失"
+            return 1
+        fi
+        return 0
+    fi
+    if dhcp_reload_pending; then
+        log "dhcp: expected module-initiated udhcpd reload; not counting a crash"
+        return 0
+    fi
+    log "udhcpd not running, fail-closing and retrying (fails=$(dhcp_get failures)/$(dhcp_fail_limit))"
+    dhcp_crash "udhcpd 进程已退出"
+    [ "$(dhcp_get degraded)" = 1 ] || dhcp_takeover "$_dhc_if" "$_dhc_addr"
 }
 
 # ---------------------------------------------------------------- udhcpd
@@ -242,12 +962,14 @@ dhcp_stop() {
         kill "$_p" 2>/dev/null   # SIGTERM -> udhcpd writes lease file and exits
         _i=0; while kill -0 "$_p" 2>/dev/null && [ $_i -lt 10 ]; do sleep 0.2; _i=$((_i+1)); done
         kill -9 "$_p" 2>/dev/null
+        # remove only this module's instances (match the exact generated config path)
+        for _q in $(pgrep -f "udhcpd -f $RUN/udhcpd.conf" 2>/dev/null); do kill "$_q" 2>/dev/null; done
     fi
-    # stray instances started by us (match our conf path)
-    for _q in $(pgrep -f "udhcpd -f $RUN/udhcpd.conf" 2>/dev/null); do kill "$_q" 2>/dev/null; done
     rm -f "$RUN/udhcpd.pid"
 }
 # Writes $RUN/udhcpd.conf for iface $1 with addr $2 (ip/prefix). Echo summary.
+# Static reservations are always inside the configured single subnet. When the platform
+# ignored the gateway request they keep the host part via map_ip().
 dhcp_write_conf() {
     _if=$1; _gw=${2%/*}; _pf=${2#*/}
     _mask=$(pfx2mask_int "$_pf")
@@ -266,6 +988,27 @@ dhcp_write_conf() {
     [ "$_net" != "$_cfgnet" ] && log "WARN: actual subnet $(int2ip $_net)/$_pf != configured $(int2ip $_cfgnet)/$PREFIX; static leases mapped by host part"
     _dns=$DNS; [ -n "$_dns" ] || _dns=$_gw
     _max=$(( $(ip2int "$_e") - $(ip2int "$_s") + 1 + 32 ))
+    _static=$RUN/static.leases.$$
+    _reserved=$RUN/reserved.ips.$$
+    : > "$_static"
+    : > "$_reserved"
+    if [ -f "$LEASES" ]; then
+        while read -r _mac _ip _rest; do
+            case "$_mac" in ''|'#'*) continue ;; esac
+            _vl=$(lease_validate_line "$_mac" "$_ip" "$_rest") || { log "static lease invalid: $_vl"; continue; }
+            _mac=${_vl%% *}
+            _ip=${_vl#* }; _ip=${_ip%% *}
+            _mip=$(map_ip "$_ip" "$_cfgnet" "$_net" "$_size") || { log "static lease $_mac $_ip skipped (outside subnet)"; continue; }
+            [ "$_mip" = "$_gw" ] && continue
+            if grep -qx "$_mip" "$_reserved" || grep -q "^$_mip " "$_reserved"; then
+                log "ERROR: static lease IP collision on mapped address $_mip (MAC $_mac); entry skipped"
+                continue
+            fi
+            _sstart=$(ip2int "$_s"); _send=$(ip2int "$_e"); _sip=$(ip2int "$_mip")
+            [ "$_sip" -ge "$_sstart" ] && [ "$_sip" -le "$_send" ] && echo "reserve $_mip" >> "$_reserved"
+            echo "static_lease $_mac $_mip" >> "$_static"
+        done < "$LEASES"
+    fi
     {
         echo "# generated by hotspot_plus $(date)"
         echo "interface $_if"
@@ -286,17 +1029,49 @@ dhcp_write_conf() {
         echo "opt lease $LEASE_TIME"
         # Android vendor option 43 "ANDROID_METERED" (same as Android's own DhcpServer/dnsmasq)
         [ "$METERED" = 1 ] && echo "opt 43 414e44524f49445f4d455445524544"
-        if [ -f "$LEASES" ]; then
-            while read -r _mac _ip _rest; do
-                case "$_mac" in ''|'#'*) continue ;; esac
-                is_mac "$_mac" || continue
-                _mip=$(map_ip "$_ip" "$_cfgnet" "$_net" "$_size") || { log "static lease $_mac $_ip skipped (outside subnet)"; continue; }
-                [ "$_mip" = "$_gw" ] && continue
-                echo "static_lease $(lc "$_mac") $_mip"
-            done < "$LEASES"
-        fi
+        cat "$_static"
     } > "$RUN/udhcpd.conf"
+    rm -f "$_static" "$_reserved"
     DHCP_SUMMARY="$_if $_s-$_e gw=$_gw dns=$_dns"
+}
+
+# Remove dynamic lease records that now collide with a static reservation. This prevents a
+# client's old address from being offered to another MAC after a rebind. The daemon owns
+# lease writes; callers stop it before invoking this so it cannot rewrite the file in place.
+lease_scrub_conflicts() { # [lease-file ...]
+    [ -f "$LEASE_DB" ] || return 0
+    [ -n "$(dhcp_pid 2>/dev/null)" ] && dhcp_stop 2>/dev/null
+    _res=$RUN/static.reserved.$$
+    : > "$_res"
+    for _lf in "${@:-$LEASES}"; do
+        [ -f "$_lf" ] || continue
+        while read -r _smac _sip _rest; do
+            case "$_smac" in ''|'#'*|Mac) continue ;; esac
+            _sv=$(lease_validate_line "$_smac" "$_sip" "${_rest:-}") || continue
+            _sv_ip=${_sv#* }; _sv_ip=${_sv_ip%% *}
+            echo "$_sv_ip" >> "$_res"
+        done < "$_lf"
+    done
+    [ -s "$_res" ] || { rm -f "$_res"; return 0; }
+    _tmp=$LEASE_DB.scrub.$$
+    awk -v reserved="$(tr '\n' ' ' < "$_res")" '
+        BEGIN { n = split(reserved, a, " "); for (i = 1; i <= n; i++) if (a[i] != "") skip[a[i]] = 1 }
+        NR == 1 { print; next }
+        {
+            ip = ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ? $2 : substr($0, 19, 16)
+            gsub(/^ +| +$/, "", ip)
+            if (ip in skip) next
+        }
+        { print }
+    ' "$LEASE_DB" > "$_tmp"
+    _before=$(wc -l < "$LEASE_DB" 2>/dev/null || echo 0)
+    _after=$(wc -l < "$_tmp" 2>/dev/null || echo 0)
+    mv -f "$_tmp" "$LEASE_DB"
+    rm -f "$_res"
+    if [ $((_before - _after)) -gt 0 ]; then
+        log "lease scrub: removed $((_before - _after)) stale lease(s) that collide with static reservations"
+    fi
+    return 0
 }
 dhcp_start() {
     _if=$1; _addr=$2
@@ -501,7 +1276,7 @@ unstick() {
         case "$_c" in *hspd*) continue ;; esac   # never kill the daemon here
         kill "$_l" 2>/dev/null && _killed="$_killed $_l(fd:${_c%% *})"
     done
-    rm -f "$LOCKF" "$HOLDF" "$RUN"/hsctl.*.out "$RUN/started_by_hsp"; rmdir "$LOCKD" 2>/dev/null
+    rm -f "$LOCKF" "$HOLDF" "$RUN"/hsctl.*.out; rmdir "$LOCKD" 2>/dev/null
     log "UNSTICK done; killed:${_killed:- none}"
     echo "已清除操作锁；结束的进程:${_killed:- 无}"
 }

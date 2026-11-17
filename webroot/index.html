@@ -56,11 +56,22 @@ details summary{cursor:pointer;color:var(--sub)}
 #opBanner.stuck{background:rgba(220,38,38,.12);color:var(--bad)}
 #opBox{max-height:300px}
 .opok{color:var(--ok)}.opbad{color:var(--bad)}
+#restoreCard{display:none;border:1px solid var(--acc)}
 </style>
 </head>
 <body>
 <h1>热点增强 <span class="sub" id="ver"></span></h1>
-<div id="banner">未检测到 KernelSU WebUI 环境（window.ksu 不存在），页面仅供预览。</div>
+<div id="banner">薄壳桥不可用：当前页面没有可信的 root 执行通道，操作已禁用。</div>
+
+<!-- 恢复提示：只在全新安装且存在兼容备份时显示，绝不自动恢复 -->
+<div class="card" id="restoreCard">
+  <h2>发现可恢复的备份</h2>
+  <div class="sub" id="restoreInfo">将恢复配置和静态租约。当前为新安装，没有用户配置会被覆盖。</div>
+  <div class="btns">
+    <button class="primary" id="btnRestore">确认恢复</button>
+    <button id="btnRestoreDismiss">稍后再说</button>
+  </div>
+</div>
 
 <!-- 状态 / 开关 -->
 <div class="card">
@@ -73,6 +84,7 @@ details summary{cursor:pointer;color:var(--sub)}
   </div>
   <div class="kv" id="kv"></div>
   <div class="warnbox" id="warn"></div>
+  <div class="btns" id="dhcpRetryWrap" style="display:none"><button class="op" id="btnDhcpRetry">重试自建 DHCP</button></div>
   <div id="opBanner"></div>
   <div class="btns"><button id="btnRefresh">刷新</button><button class="op" id="btnRestart">重启热点</button>
     <button class="danger" id="btnUnstick">清除卡住的操作</button></div>
@@ -87,7 +99,7 @@ details summary{cursor:pointer;color:var(--sub)}
 <!-- 已连接设备 -->
 <div class="card">
   <h2><span>已连接设备 <span class="sub" id="clientCount"></span></span>
-    <span><label class="sub" style="font-weight:normal"><input type="checkbox" id="autoRef" checked> 自动刷新</label></span></h2>
+    <span><label class="sub" style="font-weight:normal" title="默认关闭。开启后每 30 秒自动刷新状态与设备列表，会周期性执行 root 命令和 dumpsys wifi；在调度器不稳定的内核上可能增加卡顿风险。需要更新时请点“刷新”。"><input type="checkbox" id="autoRef"> 自动刷新（每 30 秒；不推荐）</label></span></h2>
   <div id="clients"><div class="sub">—</div></div>
   <div class="btns"><button id="btnClients">刷新设备</button></div>
 </div>
@@ -98,7 +110,7 @@ details summary{cursor:pointer;color:var(--sub)}
   <div class="row"><label>固定热点网关<div class="sub">开启热点时请求固定地址（需自建 DHCP）</div></label>
     <label class="switch"><input type="checkbox" id="FIXED_GATEWAY"><span class="slider"></span></label></div>
   <div class="grid2">
-    <div class="field"><span class="sub">网关 IP</span><input type="text" id="GATEWAY" inputmode="decimal" placeholder="192.168.4.1"></div>
+    <div class="field"><span class="sub">网关 IP</span><input type="text" id="GATEWAY" inputmode="decimal" placeholder="192.168.42.1"></div>
     <div class="field"><span class="sub">前缀长度</span>
       <select id="PREFIX"><option>24</option><option>23</option><option>22</option><option>20</option><option>16</option><option>25</option><option>26</option><option>27</option><option>28</option></select></div>
   </div>
@@ -143,18 +155,40 @@ details summary{cursor:pointer;color:var(--sub)}
 <script>
 'use strict';
 const HSP = '/data/adb/modules/hotspot_plus/bin/hsp';
+const LEASE_IMPORT = '/data/adb/modules/hotspot_plus/webroot/lease-import.conf';
 const $ = (id) => document.getElementById(id);
-const hasKsu = typeof window.ksu !== 'undefined' && window.ksu && typeof window.ksu.exec === 'function';
+let hasKsu = !!(window.ksu && typeof window.ksu.exec === 'function');
 if (!hasKsu) $('banner').style.display = 'block';
+const bridgeReady = new Promise((resolve) => {
+  if (hasKsu) { resolve(true); return; }
+  let waited = 0;
+  const timer = setInterval(() => {
+    if (bridgeProbe()) { clearInterval(timer); resolve(true); return; }
+    if ((waited += 50) >= 3000) { clearInterval(timer); resolve(false); }
+  }, 50);
+});
+function bridgeProbe() {
+  if (window.ksu && typeof window.ksu.exec === 'function') {
+    hasKsu = true; $('banner').style.display = 'none'; return true;
+  }
+  return false;
+}
+window.hspBridgeReady = () => { if (bridgeProbe()) refreshStatus(); };
 
 // ---- KernelSU exec wrapper (same protocol as the `kernelsu` npm package) ----
 let cbSeq = 0;
 function exec(cmd, timeoutMs) {
   return new Promise((resolve) => {
-    if (!hasKsu) { resolve({ errno: -1, stdout: '', stderr: 'no ksu' }); return; }
+    if (!hasKsu) {
+      resolve({ errno: -1, stdout: '', stderr: 'no ksu' });
+      return;
+    }
     const name = `hsp_cb_${Date.now()}_${cbSeq++}`;
     let done = false;
-    const timer = setTimeout(() => { if (!done) { done = true; delete window[name]; resolve({ errno: -2, stdout: '', stderr: 'timeout' }); } }, timeoutMs || 90000);
+    const timer = setTimeout(() => {
+      if (done) return; done = true; delete window[name];
+      resolve({ errno: -2, stdout: '', stderr: 'timeout' });
+    }, timeoutMs || 90000);
     window[name] = (errno, stdout, stderr) => {
       if (done) return; done = true; clearTimeout(timer); delete window[name];
       resolve({ errno, stdout: stdout || '', stderr: stderr || '' });
@@ -162,8 +196,7 @@ function exec(cmd, timeoutMs) {
     try { ksu.exec(cmd, '{}', name); } catch (e) { done = true; clearTimeout(timer); delete window[name]; resolve({ errno: -1, stdout: '', stderr: String(e) }); }
   });
 }
-const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
-const hsp = (args, t) => exec(`LOCK_WAIT=20 sh ${HSP} ${args}`, t); // short lock wait: UI never queues behind a stuck op
+const hsp = (args, t) => exec(`${HSP} ${args}`, t); // fixed argv only
 function toast(msg) {
   msg = String(msg || '').trim(); if (!msg) return;
   try { if (hasKsu && ksu.toast) { ksu.toast(msg); return; } } catch (e) {}
@@ -220,12 +253,25 @@ async function refreshStatus() {
   $('ver').textContent = s.version || '';
   if (!busy) $('apSwitch').checked = !!s.ap;
   $('apText').textContent = busy ? `正在执行：${opLabel}…` : (s.ap ? '热点已开启' : '热点已关闭');
-  $('apDot').className = 'dot ' + (s.ap ? (s.gateway_ok || !s.fixed_gateway ? 'ok' : 'warn') : '');
+  $('apDot').className = 'dot ' + (s.ap ? (s.gateway_ok || !s.fixed_gateway ? 'ok' : (s.gateway_degraded ? 'bad' : 'warn')) : '');
   $('apSub').textContent = s.ap ? `${s.iface} · ${s.addr}` : `Android ${s.release} (SDK ${s.sdk})`;
   const yes = (b) => (b ? '是' : '否');
+  const repairText = () => {
+    const r = s.gateway_result || 'not_run';
+    const tries = `${s.gateway_attempts || 0}/${s.gateway_limit || 0}`;
+    const origin = s.gateway_origin === 'module' ? '模块启动' : (s.gateway_origin === 'system' ? '系统启动' : '—');
+    if (s.gateway_repair) return `重启中（${origin}，第 ${tries} 次）`;
+    if (r === 'waiting') return `等待重试（${origin}，已用 ${tries}，约 ${s.gateway_next_in || 0}s 后重启）`;
+    if (r === 'degraded') return `已降级（${origin}，尝试 ${tries} 次）`;
+    if (r === 'ok') return `已生效（${origin}，尝试 ${tries} 次）`;
+    if (r === 'disabled') return '未启用固定网关';
+    if (r === 'starting') return '本次会话待观察';
+    return `无修复记录（尝试 ${tries} 次）`;
+  };
   const rows = [
     ['配置网关', `${s.gateway_cfg}/${s.prefix_cfg}` + (s.fixed_gateway ? '' : '（未启用固定）')],
-    ['自建 DHCP', s.dhcp_enable ? (s.dhcp_running ? '运行中' : (s.ap ? '未运行' : '待命')) : '已关闭'],
+    ['网关修复', repairText()],
+    ['自建 DHCP', s.dhcp_enable ? (s.dhcp_degraded ? '已降级 · 系统 DHCP 接管' : (s.dhcp_running ? '运行中' : (s.ap ? '未运行' : '待命'))) : '已关闭'],
     ['拦截系统 DHCP', s.ap ? yes(s.fw_ok) : '—'],
     ['守护进程', s.daemon ? '运行中' : '未运行'],
     ['操作锁', s.op_busy ? `占用：${s.op_name || '?'} (pid ${s.op_pid || '?'}, ${s.op_age || '?'}s)` : '空闲'],
@@ -235,8 +281,15 @@ async function refreshStatus() {
   const w = [];
   if (!s.udhcpd_available) w.push('busybox 缺少 udhcpd：静态绑定/固定网关不可用。');
   if (!s.daemon) w.push('守护进程未运行（可点“重启守护进程”）。');
-  if (s.ap && s.fixed_gateway && !s.gateway_ok) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致` + (s.enforce_broken ? '：系统未采纳静态地址请求（见日志）。' : '，可点“重启热点”。'));
-  if (s.ap && s.dhcp_enable && !s.dhcp_running) w.push('自建 DHCP 未运行，当前由系统 DHCP 分配地址（静态绑定不生效）。');
+  if (s.ap && s.fixed_gateway && !s.gateway_ok) {
+    const tries = `${s.gateway_attempts || 0}/${s.gateway_limit || 0}`;
+    if (s.gateway_degraded) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致：已尝试 ${tries} 次仍失败，本次会话降级（静态租约按实际网段映射，不再自动重启）。`);
+    else if (s.gateway_repair) w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致：正在重启修复（第 ${tries} 次）。`);
+    else w.push(`当前网关 ${s.addr.split('/')[0]} 与配置 ${s.gateway_cfg} 不一致` + (s.gateway_result === 'waiting' ? `：约 ${s.gateway_next_in || 0}s 后自动重试（已用 ${tries} 次）。` : '，可点“重启热点”。'));
+  }
+  if (s.ap && s.dhcp_enable && s.dhcp_degraded) w.push(`自建 DHCP 已降级：${s.dhcp_reason || '接管失败'}。当前由系统 DHCP 分配地址，静态绑定暂不生效。${s.dhcp_last_error ? '最近错误：' + s.dhcp_last_error + '。' : ''}${s.dhcp_retry_available ? '可点“重试自建 DHCP”恢复，不会重启热点。' : ''}`);
+  else if (s.ap && s.dhcp_enable && !s.dhcp_running) w.push('自建 DHCP 未运行，当前由系统 DHCP 分配地址（静态绑定不生效）。');
+  $('dhcpRetryWrap').style.display = s.ap && s.dhcp_retry_available ? 'flex' : 'none';
   if (s.last_issue && w.length) w.push('最近日志：' + s.last_issue);
   $('warn').style.display = w.length ? 'block' : 'none';
   $('warn').textContent = w.join('\n');
@@ -265,11 +318,20 @@ async function setHotspot(on) {
   refreshClients();
 }
 $('apSwitch').addEventListener('change', (e) => setHotspot(e.target.checked));
-$('btnRefresh').onclick = () => { refreshStatus(); refreshClients(); };
+async function refreshAll() {
+  await refreshStatus();
+  if (!formBusy() && !formDirty()) await loadConfig(false); // re-read persisted config; keep unsaved edits
+  refreshClients();
+}
+$('btnRefresh').onclick = refreshAll;
 $('btnRestart').onclick = () => runOp('重启热点', async (call) => {
   $('apText').textContent = '正在重启…';
   const r = await call('restart', 300000); toast(lastLine(r));
   refreshClients();
+});
+$('btnDhcpRetry').onclick = () => runOp('重试自建 DHCP', async (call) => {
+  const r = await call('dhcp retry', 45000); toast(lastLine(r) || (r.errno === 0 ? '自建 DHCP 已恢复' : '重试失败'));
+  if (r.errno === 0) refreshClients();
 });
 let unstickArmed = 0;
 $('btnUnstick').onclick = async () => {
@@ -321,12 +383,29 @@ $('btnClients').onclick = refreshClients;
 // ---- config ----
 const BOOL_KEYS = ['FIXED_GATEWAY', 'DHCP_ENABLE', 'ENFORCE_GATEWAY', 'AUTO_START', 'METERED'];
 const TEXT_KEYS = ['GATEWAY', 'PREFIX', 'DHCP_START', 'DHCP_END', 'LEASE_TIME', 'DNS', 'AP_IFACE'];
-async function loadConfig() {
+let cfgForm = '';        // snapshot of the last persisted values this form was rendered from
+const formBusy = () => busy || !!(lastStatus && lastStatus.op_busy);
+function formSnapshot(c) {
+  const o = {};
+  BOOL_KEYS.forEach((k) => (o[k] = c[k] === '1'));
+  TEXT_KEYS.forEach((k) => (o[k] = c[k] || ''));
+  return o;
+}
+function formDirty() {
+  if (!cfgForm) return false;
+  return BOOL_KEYS.some((k) => $(k).checked !== cfgForm[k]) ||
+    TEXT_KEYS.some((k) => $(k).value.trim() !== String(cfgForm[k]).trim());
+}
+// force=false: only overwrite untouched controls, so a status poll or a stray 刷新
+// cannot silently discard edits the user has not saved yet.
+async function loadConfig(force = true) {
   const r = await hsp('config', 15000);
   const c = parseJson(r.stdout);
   if (!c) { toast('读取配置失败'); return; }
-  BOOL_KEYS.forEach((k) => ($(k).checked = c[k] === '1'));
-  TEXT_KEYS.forEach((k) => ($(k).value = c[k] || ''));
+  const next = formSnapshot(c);
+  BOOL_KEYS.forEach((k) => { if (force || $(k).checked === cfgForm[k]) $(k).checked = next[k]; });
+  TEXT_KEYS.forEach((k) => { if (force || $(k).value.trim() === String(cfgForm[k]).trim()) $(k).value = next[k]; });
+  cfgForm = next;
   $('leases').innerHTML = '';
   (c.leases || []).forEach((l) => addLeaseRow(l.mac, l.ip, l.name));
 }
@@ -341,14 +420,19 @@ function validateCfg() {
 $('btnSaveCfg').onclick = () => {
   if (!validateCfg()) { toast('请检查标红的输入'); return; }
   const args = [];
-  BOOL_KEYS.forEach((k) => args.push(shq(`${k}=${$(k).checked ? 1 : 0}`)));
-  TEXT_KEYS.forEach((k) => args.push(shq(`${k}=${$(k).value.trim().replace(/\s+/g, '')}`)));
+  BOOL_KEYS.forEach((k) => args.push(`${k}=${$(k).checked ? 1 : 0}`));
+  TEXT_KEYS.forEach((k) => args.push(`${k}=${$(k).value.trim().replace(/\s+/g, '')}`));
   runOp('保存并应用配置', async (call) => {
     const r = await call('set ' + args.join(' '), 15000);
-    if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
+    if (r.errno !== 0) {
+      toast(lastLine(r) || '保存失败');
+      await loadConfig();   // the save was rejected: show what is actually persisted
+      return;
+    }
     toast('已保存，正在应用…');
     const a = await call('apply', 300000);
     toast(lastLine(a));
+    await loadConfig();
   });
 };
 
@@ -361,7 +445,7 @@ function addLeaseRow(mac, ip, name, fromClient) {
   }
   const d = document.createElement('div'); d.className = 'lease';
   d.innerHTML = `<input class="m" type="text" placeholder="aa:bb:cc:dd:ee:ff" autocapitalize="off">
-    <input class="i" type="text" inputmode="decimal" placeholder="192.168.4.10">
+    <input class="i" type="text" inputmode="decimal" placeholder="192.168.42.10">
     <input class="n" type="text" placeholder="备注"><button class="danger">删除</button>`;
   d.querySelector('.m').value = mac || ''; d.querySelector('.i').value = ip || ''; d.querySelector('.n').value = name || '';
   d.querySelector('button').onclick = () => d.remove();
@@ -373,7 +457,7 @@ $('btnSaveLeases').onclick = async () => {
   const lines = [], macs = new Set(), ips = new Set(); let ok = true;
   for (const row of $('leases').children) {
     const m = row.querySelector('.m'), i = row.querySelector('.i'), n = row.querySelector('.n');
-    const mac = normMac(m.value), ip = i.value.trim(), name = n.value.replace(/[\t\r\n"$`\\]/g, ' ').trim().slice(0, 64);
+    const mac = normMac(m.value), ip = i.value.trim(), name = n.value.replace(/[^\p{L}\p{N} ._()\-]/gu, ' ').replace(/ +/g, ' ').trim().slice(0, 64);
     if (!mac && !ip) continue;
     const mBad = !MACRE.test(mac) || macs.has(mac), iBad = !IPRE.test(ip) || ips.has(ip);
     m.classList.toggle('bad', mBad); i.classList.toggle('bad', iBad);
@@ -381,8 +465,9 @@ $('btnSaveLeases').onclick = async () => {
     macs.add(mac); ips.add(ip); lines.push(`${mac} ${ip}${name ? ' ' + name : ''}`);
   }
   if (!ok) { toast('MAC/IP 格式错误或重复（已标红）'); return; }
+  lines.sort();
   await runOp('保存静态绑定', async (call) => {
-    const r = await call('lease import ' + shq(b64utf8(lines.join('\n') + '\n')), 15000);
+    const r = await call('lease stage ' + LEASE_IMPORT + ' import=' + b64utf8(lines.join('\n') + '\n'), 15000);
     if (r.errno !== 0) { toast(lastLine(r) || '保存失败'); return; }
     toast(lastLine(r));
     const a = await call('apply', 300000);
@@ -400,13 +485,42 @@ $('btnDiag').onclick = async () => {
 };
 $('btnDaemon').onclick = () => runOp('重启守护进程', async (call) => { const r = await call('daemon restart', 30000); toast(lastLine(r)); });
 
+// ---- restore prompt (explicit confirmation only; never auto-restores) ----
+let restoreLatest = '';
+async function checkRestorePrompt() {
+  const r = await hsp('restore-prompt', 15000);
+  const out = (r.stdout || '').trim().split('\n');
+  const val = (k) => (out.find((l) => l.startsWith(k + '=')) || '').slice(k.length + 1);
+  if (val('prompt') !== '1') return;
+  restoreLatest = val('latest');
+  $('restoreCard').style.display = 'block';
+  $('restoreInfo').textContent = `找到 ${val('count') || '1'} 个兼容备份（${restoreLatest}）。恢复会覆盖当前配置和静态租约。`;
+}
+$('btnRestore').onclick = () => {
+  if (!restoreLatest) { toast('没有可恢复的备份'); return; }
+  runOp('恢复备份', async (call) => {
+    const r = await call(`restore ${shq(restoreLatest)} --yes`, 30000);
+    toast(r.errno === 0 ? '已恢复，正在重新加载' : (lastLine(r) || '恢复失败'));
+    if (r.errno === 0) { $('restoreCard').style.display = 'none'; await loadConfig(); }
+  });
+};
+$('btnRestoreDismiss').onclick = async () => {
+  await hsp('restore-dismiss', 10000);
+  $('restoreCard').style.display = 'none';
+};
+
 // ---- init ----
 (async () => {
+  if (!(await bridgeReady)) $('apSub').textContent = 'root 桥不可用';
   await refreshStatus();
   await loadConfig();
+  checkRestorePrompt();
   refreshClients();
-  setInterval(() => { if (!busy && !document.hidden) refreshStatus(); }, 6000);
-  setInterval(() => { if ($('autoRef').checked && !document.hidden && lastStatus && lastStatus.ap) refreshClients(); }, 5000);
+  setInterval(() => {
+    if (!$('autoRef').checked || document.hidden) return;
+    if (!busy) refreshStatus();
+    if (lastStatus && lastStatus.ap) refreshClients();
+  }, 30000);
 })();
 </script>
 </body>
