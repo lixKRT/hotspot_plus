@@ -76,24 +76,28 @@ installer_is_manager_neutral() {
 }
 
 hsctl_jar_matches_source() {
+    _hsctl_cwd=$(pwd)
+    cd "$ROOT" || return 1
+    _hsctl_finish() { cd "$_hsctl_cwd" 2>/dev/null; }
     _missing=
     for _tool in javac jar java sha256sum; do
         command -v "$_tool" >/dev/null 2>&1 || _missing="$_missing $_tool"
     done
     [ -n "$PYTHON" ] || _missing="$_missing python"
-    command -v zip >/dev/null 2>&1 || _missing="$_missing zip"
     [ -z "$_missing" ] || {
         printf 'SKIP: hsctl source/artifact check needs:%s\n' "$_missing"
         [ "${HSP_REQUIRE_HSCTL_REBUILD:-0}" = 1 ] && return 1
+        _hsctl_finish
         return 77
     }
     _r8=${R8:-/tmp/tools/r8-8.13.19.jar}
     if [ ! -f "$_r8" ]; then
         printf 'SKIP: hsctl source/artifact check needs R8 8.13.19 (R8=%s)\n' "$_r8"
         [ "${HSP_REQUIRE_HSCTL_REBUILD:-0}" = 1 ] && return 1
+        _hsctl_finish
         return 77
     fi
-    "$PYTHON" - "$ROOT/bin/hsctl.jar" <<'PY' || return 1
+    "$PYTHON" - bin/hsctl.jar <<'PY' || { _hsctl_finish; return 1; }
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:
     entries = [n for n in z.namelist() if not n.endswith("/")]
@@ -102,18 +106,19 @@ if entries != ["classes.dex"]:
     sys.exit(1)
 PY
     _hsctl_tmp=$TMPROOT/hsctl-rebuild
-    mkdir -p "$_hsctl_tmp/dex" || return 1
+    mkdir -p "$_hsctl_tmp/dex" || { _hsctl_finish; return 1; }
     B=$_hsctl_tmp/dex OUT=$_hsctl_tmp/hsctl.jar R8=$_r8 \
         sh "$ROOT/src/build-dex.sh" >/dev/null || {
         printf 'FAIL: hsctl rebuild from src/java failed (R8=%s)\n' "$_r8"
+        _hsctl_finish
         return 1
     }
-    "$PYTHON" - "$_hsctl_tmp/hsctl.jar" "$_hsctl_tmp/built.dex" <<'PY' || return 1
+    "$PYTHON" - "$_hsctl_tmp/hsctl.jar" "$_hsctl_tmp/built.dex" <<'PY' || { _hsctl_finish; return 1; }
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z, open(sys.argv[2], "wb") as out:
     out.write(z.read("classes.dex"))
 PY
-    "$PYTHON" - "$ROOT/bin/hsctl.jar" "$_hsctl_tmp/shipped.dex" <<'PY' || return 1
+    "$PYTHON" - bin/hsctl.jar "$_hsctl_tmp/shipped.dex" <<'PY' || { _hsctl_finish; return 1; }
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z, open(sys.argv[2], "wb") as out:
     out.write(z.read("classes.dex"))
@@ -123,21 +128,24 @@ PY
     [ "$_built_hash" = "$_shipped_hash" ] || {
         printf 'FAIL: bin/hsctl.jar classes.dex differs from current src/java rebuild\n'
         printf '  built=%s\n  shipped=%s\n' "$_built_hash" "$_shipped_hash"
+        _hsctl_finish
         return 1
     }
     _zip_tmp=$TMPROOT/hsctl-rebuild-zip
-    mkdir -p "$_zip_tmp/dex" || return 1
+    mkdir -p "$_zip_tmp/dex" || { _hsctl_finish; return 1; }
     B=$_zip_tmp/dex OUT=$_zip_tmp/hsctl.jar R8=$_r8 \
-        sh "$ROOT/src/build-dex.sh" >/dev/null || return 1
-    "$PYTHON" - "$_zip_tmp/hsctl.jar" "$_zip_tmp/built.dex" <<'PY' || return 1
+        sh "$ROOT/src/build-dex.sh" >/dev/null || { _hsctl_finish; return 1; }
+    "$PYTHON" - "$_zip_tmp/hsctl.jar" "$_zip_tmp/built.dex" <<'PY' || { _hsctl_finish; return 1; }
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z, open(sys.argv[2], "wb") as out:
     out.write(z.read("classes.dex"))
 PY
     [ "$(sha256sum "$_zip_tmp/built.dex" | cut -d' ' -f1)" = "$_shipped_hash" ] || {
         printf 'FAIL: zip and jar packaging produce different classes.dex\n'
+        _hsctl_finish
         return 1
     }
+    _hsctl_finish
 }
 
 package_omits_private_and_binary_artifacts() {
