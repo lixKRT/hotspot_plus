@@ -578,6 +578,155 @@ manual_retry_recovers_degraded_state() {
     [ "$_ok" = 1 ]
 }
 
+degraded_health_check_never_retakes_over() {
+    _dhcp_env degraded-health || return 1
+    _dhcp_eval 'dhcp_session_begin
+        dhcp_set state degraded
+        dhcp_set degraded 1
+        dhcp_set attempts 3
+        dhcp_set retry_available 1
+        dhcp_set next_retry_at "$(($(date +%s) - 1))"
+        dhcp_summary_write' || return 1
+    mkdir "$_dt/data/run/dhcp-health.lockdir" || return 1
+    _cr_lock_owner=$(_dhcp_eval 'echo $$')
+    _dhcp_eval 'dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' >/dev/null 2>&1 || return 1
+    [ "$(_dhcp_state state)" = degraded ] &&
+        [ "$(_dhcp_state degraded)" = 1 ] &&
+        [ "$(_dhcp_state attempts)" = 3 ] &&
+        [ "$(cat "$_dt/busybox.log" 2>/dev/null | grep -c '^start ')" = 0 ] &&
+        ! grep -q -- ' -A hsp_dhcp' "$_dt/iptables.log" 2>/dev/null
+}
+
+automatic_retry_requires_pending_timer() {
+    _dhcp_env retry-zero || return 1
+    _dhcp_eval 'dhcp_session_begin
+        dhcp_set state retrying
+        dhcp_set attempts 1
+        dhcp_set next_retry_at 0
+        dhcp_summary_write
+        dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' >/dev/null 2>&1 || return 1
+    [ "$(_dhcp_state state)" = retrying ] &&
+        [ "$(_dhcp_state attempts)" = 1 ] &&
+        [ "$(cat "$_dt/busybox.log" 2>/dev/null | grep -c '^start ')" = 0 ] &&
+        ! grep -q -- ' -A hsp_dhcp' "$_dt/iptables.log" 2>/dev/null
+}
+
+degraded_takeover_requires_explicit_manual_retry() {
+    _dhcp_env degraded-guard || return 1
+    _dhcp_eval 'dhcp_session_begin
+        dhcp_set state degraded
+        dhcp_set degraded 1
+        dhcp_set attempts 3
+        dhcp_set retry_available 1
+        dhcp_summary_write
+        dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1 && return 1
+    [ "$(cat "$_dt/busybox.log" 2>/dev/null | grep -c '^start ')" = 0 ] &&
+        ! grep -q -- ' -A hsp_dhcp' "$_dt/iptables.log" 2>/dev/null &&
+        _dhcp_eval 'HSP_DHCP_MANUAL_RETRY=1 dhcp_session_begin --preserve
+            dhcp_set state degraded
+            dhcp_set degraded 1
+            dhcp_set attempts 3
+            dhcp_set retry_available 1
+            dhcp_summary_write
+            HSP_DHCP_MANUAL_RETRY=1 dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+}
+
+preserve_session_keeps_degraded_budget() {
+    _dhcp_env preserve-session || return 1
+    _dhcp_eval 'dhcp_session_begin
+        dhcp_set state degraded
+        dhcp_set degraded 1
+        dhcp_set attempts 3
+        dhcp_set retry_available 1
+        _before=$(dhcp_get session)
+        dhcp_session_begin --preserve
+        [ "$(dhcp_get session)" = "$_before" ] &&
+        [ "$(dhcp_get state)" = degraded ] &&
+        [ "$(dhcp_get degraded)" = 1 ] &&
+        [ "$(dhcp_get attempts)" = 3 ] &&
+        [ "$(dhcp_get retry_available)" = 1 ] &&
+        [ "$(state_get dhcp_degraded)" = 1 ]' || return 1
+    _dhcp_eval 'dhcp_session_begin
+        [ "$(dhcp_get state)" = idle ] &&
+        [ "$(dhcp_get degraded)" = 0 ] &&
+        [ "$(dhcp_get attempts)" = 0 ]' || return 1
+    _dhcp_cleanup_process
+}
+
+concurrent_retry_and_health_check_serialize_takeover() {
+    _dhcp_env concurrent || return 1
+    _dhcp_eval 'dhcp_session_begin
+        dhcp_set state retrying
+        dhcp_set attempts 1
+        dhcp_set next_retry_at "$(($(date +%s) - 1))"
+        dhcp_summary_write' || return 1
+    _cbg_retry=$_dt/concurrent-retry.sh
+    _cbg_health=$_dt/concurrent-health.sh
+    cat > "$_cbg_retry" <<'EOF'
+#!/bin/sh
+. "$MODDIR/lib/common.sh"
+load_config
+dhcp_retry wlan2 192.168.42.1/24
+EOF
+    cat > "$_cbg_health" <<'EOF'
+#!/bin/sh
+. "$MODDIR/lib/common.sh"
+load_config
+dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24
+EOF
+    chmod +x "$_cbg_retry" "$_cbg_health"
+    env _CR_LOCK_OWNER="$_cr_lock_owner" \
+        PATH="$_dt/fake:$PATH" MODDIR="$_dt/mod" HSP_DATA="$_dt/data" \
+        HSP_APP_PROCESS="$_dt/fake/app_process" IPB="$_dt/fake/ip" \
+        IPT="$_dt/fake/iptables" HSP_BUSYBOX="$_dt/fake/busybox" \
+        HSP_FLOCK= \
+        HSP_HEALTH_LOCK_MKDIR=1 \
+        HSP_FAKE_UDHCPD="$_dt/fake/udhcpd" \
+        DHCP_FAKE_CONTROL="$_dt/dhcp-mode" \
+        FAKE_PROC_DIR="$_dt/proc" \
+        HSP_DHCP_FAIL_LIMIT=3 \
+        HSP_DHCP_RETRY_DELAYS="1 1 1" \
+        HSP_HEALTH_LOCK_WAIT=10 \
+        IPT_LOG="$_dt/iptables.log" BUSY_LOG="$_dt/busybox.log" ACTION_LOG="$_dt/actions.log" \
+        IPT_STATE="$_dt/ipt-state" \
+        sh "$_cbg_retry" > "$_dt/retry.out" 2>&1 &
+    _cr_retry_pid=$!
+    env _CR_LOCK_OWNER="$_cr_lock_owner" \
+        PATH="$_dt/fake:$PATH" MODDIR="$_dt/mod" HSP_DATA="$_dt/data" \
+        HSP_APP_PROCESS="$_dt/fake/app_process" IPB="$_dt/fake/ip" \
+        IPT="$_dt/fake/iptables" HSP_BUSYBOX="$_dt/fake/busybox" \
+        HSP_FLOCK= \
+        HSP_HEALTH_LOCK_MKDIR=1 \
+        HSP_FAKE_UDHCPD="$_dt/fake/udhcpd" \
+        DHCP_FAKE_CONTROL="$_dt/dhcp-mode" \
+        FAKE_PROC_DIR="$_dt/proc" \
+        HSP_DHCP_FAIL_LIMIT=3 \
+        HSP_DHCP_RETRY_DELAYS="1 1 1" \
+        HSP_HEALTH_LOCK_WAIT=10 \
+        IPT_LOG="$_dt/iptables.log" BUSY_LOG="$_dt/busybox.log" ACTION_LOG="$_dt/actions.log" \
+        IPT_STATE="$_dt/ipt-state" \
+        sh "$_cbg_health" > "$_dt/health.out" 2>&1 &
+    _cr_health_pid=$!
+    sleep 1
+    _cr_pre_udhcpd=$(cat "$_dt/busybox.log" 2>/dev/null | grep -c '^start ')
+    _cr_pre_jump=$(cat "$_dt/iptables.log" 2>/dev/null | grep -c -- ' -I OUTPUT 1 -j hsp_dhcp')
+    rm -rf "$_dt/data/run/dhcp-health.lockdir"
+    wait "$_cr_retry_pid"; _cr_retry_rc=$?
+    wait "$_cr_health_pid"; _cr_health_rc=$?
+    [ "$_cr_retry_rc" = 0 ] || [ "$_cr_health_rc" = 0 ] || return 1
+    [ "$_cr_pre_jump" = 0 ] || return 1
+    _cr_live=0
+    for _cr_f in "$_dt/proc"/*; do
+        [ -f "$_cr_f" ] || continue
+        _cr_pid=${_cr_f##*/}
+        kill -0 "$_cr_pid" 2>/dev/null && _cr_live=$((_cr_live + 1))
+    done
+    [ "$_cr_live" -le 1 ] &&
+        [ "$_cr_pre_udhcpd" -le 1 ] &&
+        [ "$(grep -c -- ' -I OUTPUT 1 -j hsp_dhcp' "$_dt/iptables.log" 2>/dev/null)" -le 1 ] || return 1
+    [ ! -d "$_dt/data/run/dhcp-health.lockdir" ]
+}
+
 cli_retry_is_wired_to_existing_entry() {
     grep -q 'dhcp retry' "$ROOT/webroot/index.html" &&
         grep -q 'dhcp)' "$ROOT/bin/hsp" &&
@@ -609,5 +758,10 @@ run_case "DHCP cleanup is idempotent and exact" _dhcp_case cleanup_is_idempotent
 run_case "consecutive failures reach degraded budget" _dhcp_case consecutive_failures_reach_degraded_budget
 run_case "initial failure then retry serves" _dhcp_case initial_failure_then_retry_serves
 run_case "manual retry recovers degraded state" _dhcp_case manual_retry_recovers_degraded_state
+run_case "degraded health check never retakes over" _dhcp_case degraded_health_check_never_retakes_over
+run_case "automatic retry requires a pending timer" _dhcp_case automatic_retry_requires_pending_timer
+run_case "degraded takeover requires manual retry" _dhcp_case degraded_takeover_requires_explicit_manual_retry
+run_case "preserve session keeps degraded budget" _dhcp_case preserve_session_keeps_degraded_budget
+run_case "concurrent retry and health check serialize takeover" _dhcp_case concurrent_retry_and_health_check_serialize_takeover
 run_case "CLI retry entry is wired" _dhcp_case cli_retry_is_wired_to_existing_entry
 run_case "UI shows Chinese degraded warning and retry" _dhcp_case ui_shows_chinese_degraded_warning_and_retry

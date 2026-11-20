@@ -781,9 +781,19 @@ dhcp_stable_check() { # now
     log "dhcp: stable for ${DHCP_STABLE_SECS}s; retry budget reset"
     return 0
 }
-dhcp_session_begin() {
+dhcp_session_begin() { # [--preserve]
+    _ds_preserve=0
+    case "${1:-}" in
+        --preserve|preserve) _ds_preserve=1 ;;
+    esac
     mkdir -p "$RUN" 2>/dev/null
     _ds_now=$(date +%s)
+    if [ "$_ds_preserve" = 1 ] && [ -f "$DHCPSTATE" ]; then
+        dhcp_set at "$_ds_now"
+        dhcp_summary_write
+        log "dhcp: session probe preserved (state=$(dhcp_get state) attempts=$(dhcp_get attempts)/$(dhcp_get limit))"
+        return 0
+    fi
     {
         echo "session=$_ds_now-$$"
         echo "state=idle"
@@ -824,6 +834,8 @@ dhcp_summary_write() {
     state_set dhcp_at "$(date +%s)"
 }
 dhcp_rollback_ordered() { # reason error [state]
+    _dro_locked=0
+    dhcp_lock_held || { health_lock || return 1; _dro_locked=1; }
     fw_del
     dhcp_stop
     dhcp_set serving 0
@@ -831,6 +843,18 @@ dhcp_rollback_ordered() { # reason error [state]
     [ -n "$1" ] && dhcp_set reason "$1"
     [ -n "$2" ] && dhcp_set last_error "$2"
     log "dhcp: fail-closed (${1:-takeover failed}): removed $FW_CHAIN/OUTPUT before stopping udhcpd${2:+ error=$2}"
+    [ "$_dro_locked" = 1 ] && health_unlock
+    return 0
+}
+dhcp_lock_held() {
+    [ -n "${HEALTH_LOCK:-}" ]
+}
+dhcp_lock() { # serialize hspd takeover/rollback with `hsp dhcp retry`
+    dhcp_lock_held && return 0
+    health_lock
+}
+dhcp_unlock() {
+    health_unlock
 }
 dhcp_record_failure() { # reason error
     _dn=$(date +%s)
@@ -873,12 +897,28 @@ dhcp_degrade() { # reason error
     log "dhcp: DEGRADED system DHCP owns replies; retry available reason=${1:-unknown}"
 }
 dhcp_crash() { # last_error
-    case "$(dhcp_get state)" in serving|retrying) ;; *) return 0 ;; esac
+    case "$(dhcp_get state)" in serving) ;; *) return 0 ;; esac
     dhcp_record_failure "udhcpd 连续异常退出" "$1"
 }
 dhcp_takeover() { # iface addr
     _dt_if=$1; _dt_addr=$2
     [ -n "$_dt_if" ] && [ -n "$_dt_addr" ] || return 1
+    if [ "$(dhcp_get state)" = degraded ] && [ "$HSP_DHCP_MANUAL_RETRY" != 1 ]; then
+        log "dhcp: automatic takeover refused; session is degraded and needs manual retry"
+        return 1
+    fi
+    dhcp_lock || return 1
+    _dt_rc=0
+    _dhcp_takeover_locked "$_dt_if" "$_dt_addr" || _dt_rc=$?
+    dhcp_unlock
+    return $_dt_rc
+}
+_dhcp_takeover_locked() {
+    _dt_if=$1; _dt_addr=$2
+    if [ "$(dhcp_get state)" = degraded ] && [ "$HSP_DHCP_MANUAL_RETRY" != 1 ]; then
+        log "dhcp: automatic takeover refused; session is degraded and needs manual retry"
+        return 1
+    fi
     if ! dhcp_capable; then
         dhcp_rollback_ordered "自建 DHCP 不可用" "DHCP_ENABLE=0 / udhcpd 缺失 / iptables owner 不受支持"
         dhcp_set retry_available 1
@@ -920,13 +960,19 @@ dhcp_retry() { # [iface addr]
     fi
     _dr_reason=$(dhcp_get reason)
     log "dhcp: manual retry requested for $_dr_if $_dr_addr"
+    health_lock || {
+        echo "重试失败：另一个 DHCP 操作正在进行"
+        return 1
+    }
     dhcp_session_begin
-    if dhcp_takeover "$_dr_if" "$_dr_addr"; then
+    if HSP_DHCP_MANUAL_RETRY=1 _dhcp_takeover_locked "$_dr_if" "$_dr_addr"; then
+        health_unlock
         log "dhcp: manual retry succeeded; static leases restored"
         echo "自建 DHCP 已恢复，静态租约生效"
         return 0
     fi
     dhcp_degrade "${_dr_reason:-udhcpd 连续异常退出}" "$(dhcp_get last_error)"
+    health_unlock
     echo "重试失败：$(dhcp_get last_error)；仍由系统 DHCP 分配地址，热点未重启"
     return 1
 }
@@ -963,6 +1009,9 @@ dhcp_health_check() { # now iface addr
     _dhc_if=$2; _dhc_addr=$3
     [ -n "$_dhc_if" ] && [ -n "$_dhc_addr" ] || return 0
     _dhc_state=$(dhcp_get state)
+    if [ "$_dhc_state" = degraded ] || [ "$(dhcp_get degraded)" = 1 ]; then
+        return 0
+    fi
     case "$_dhc_state" in
         serving)
             if dhcp_running; then
@@ -978,25 +1027,16 @@ dhcp_health_check() { # now iface addr
             dhcp_crash "udhcpd 进程已退出"
             return 1 ;;
         retrying)
-            if dhcp_running && fw_check "$_dhc_if"; then
-                dhcp_set serving 1
-                dhcp_set state serving
-                dhcp_set degraded 0
-                dhcp_set reason ""
-                dhcp_set last_error ""
-                dhcp_set retry_available 0
-                dhcp_set next_retry_at 0
-                dhcp_set stable_since "$_dhc_now"
-                dhcp_summary_write
-                log "dhcp: recovered during retry window"
-                return 0
-            fi
             _dhc_next=$(dhcp_get next_retry_at)
             case "$_dhc_next" in ''|*[!0-9]*) _dhc_next=0 ;; esac
-            if [ "$_dhc_next" -gt 0 ] && [ "$_dhc_now" -ge "$_dhc_next" ]; then
-                log "dhcp: retry due (attempt $(dhcp_get attempts)/$(dhcp_fail_limit))"
-                dhcp_takeover "$_dhc_if" "$_dhc_addr" || return 1
+            [ "$_dhc_next" -gt 0 ] && [ "$_dhc_now" -ge "$_dhc_next" ] || return 0
+            if dhcp_running || fw_check "$_dhc_if"; then
+                log "dhcp: retrying state has partial ownership; fail-closing before retry"
+                dhcp_record_failure "DHCP 接管状态不一致" "重试期间发现遗留 udhcpd 或 OUTPUT 跳转"
+                return 1
             fi
+            log "dhcp: retry due (attempt $(dhcp_get attempts)/$(dhcp_fail_limit))"
+            dhcp_takeover "$_dhc_if" "$_dhc_addr" || return 1
             return 0 ;;
         *)
             return 0 ;;
@@ -1024,6 +1064,44 @@ dhcp_stop() {
     # stray instances started by us (match our conf path)
     for _q in $(pgrep -f "udhcpd -f $RUN/udhcpd.conf" 2>/dev/null); do kill "$_q" 2>/dev/null; done
     rm -f "$RUN/udhcpd.pid"
+}
+
+# ---------------------------------------------------------------- DHCP health lock
+# The daemon holds this only around a takeover/rollback sequence, never for its whole lifetime.
+# A manual `hsp dhcp retry` takes the same lock so it cannot race the daemon's fail-close path.
+HEALTHLOCKF=$RUN/dhcp-health.lock
+HEALTHLOCKD=$RUN/dhcp-health.lockdir
+HEALTH_LOCK=""
+health_lock() {
+    [ -n "${HEALTH_LOCK:-}" ] && return 0
+    _hl_flock=${FLOCK_BIN:-}
+    [ "${HSP_HEALTH_LOCK_MKDIR:-0}" = 1 ] && _hl_flock=""
+    _hl_t0=$(date +%s)
+    _hl_wait=${HSP_HEALTH_LOCK_WAIT:-10}
+    while :; do
+        if [ -n "$_hl_flock" ] && [ "$_hl_flock" != ":" ]; then
+            if (exec 8>>"$HEALTHLOCKF"; $_hl_flock -n 8 9>&-) 2>/dev/null; then
+                HEALTH_LOCK=flock
+                return 0
+            fi
+        else
+            if mkdir "$HEALTHLOCKD" 2>/dev/null; then
+                echo "$$" > "$HEALTHLOCKD/pid"
+                HEALTH_LOCK=mkdir
+                return 0
+            fi
+            _hl_pid=$(cat "$HEALTHLOCKD/pid" 2>/dev/null)
+            [ -n "$_hl_pid" ] && ! kill -0 "$_hl_pid" 2>/dev/null && rmdir "$HEALTHLOCKD" 2>/dev/null && continue
+        fi
+        [ $(( $(date +%s) - _hl_t0 )) -ge "$_hl_wait" ] && return 1
+        sleep 0.2
+    done
+}
+health_unlock() {
+    case "${HEALTH_LOCK:-}" in
+        mkdir) rm -f "$HEALTHLOCKD/pid"; rmdir "$HEALTHLOCKD" 2>/dev/null ;;
+    esac
+    HEALTH_LOCK=""
 }
 
 # Android's static-gateway request carries a fixed placeholder client address. On a cold

@@ -33,6 +33,7 @@ rm -f "$RUN/fw_ok"
 gw_active && [ "$(gw_get result)" = repairing ] && gw_set pending 0
 
 CUR=""          # "iface addr" of the session we are serving
+SESSION_KEY=""  # persisted DHCP session identity; preserved across address changes
 FP=""           # last address fingerprint
 TL=""           # cached tethered iface list
 TICK=0
@@ -45,6 +46,7 @@ cleanup() {
     [ -n "$MON_PID" ] && kill "$MON_PID" 2>/dev/null
     dhcp_stop; fw_del
     rm -f "$RUN/hspd.pid" "$RUN/ev" "$RUN/session"
+    SESSION_KEY=""
     exit 0
 }
 trap cleanup INT TERM
@@ -66,6 +68,7 @@ session_down() {
     fw_del
     dhcp_stop
     CUR=""
+    SESSION_KEY=""
     PROBE_FAILED=""
     rm -f "$RUN/session"
     dhcp_set state idle
@@ -77,10 +80,19 @@ session_down() {
 
 session_up() {
     log "AP up: $AP_IF $AP_ADDR"
+    _su_same=0
+    if [ "$SESSION_KEY" = "$AP_IF $AP_ADDR" ] && [ -f "$DHCPSTATE" ]; then
+        _su_same=1
+    fi
     CUR="$AP_IF $AP_ADDR"
+    SESSION_KEY="$AP_IF $AP_ADDR"
     PROBE_FAILED=""
     echo "$CUR $(date +%s)" > "$RUN/session"
-    dhcp_session_begin
+    if [ "$_su_same" = 1 ]; then
+        dhcp_session_begin --preserve
+    else
+        dhcp_session_begin
+    fi
     gw_observe "$AP_IF" "$AP_ADDR"
     # A repair restart in flight leaves the address about to change; a only-scheduled retry
     # keeps the hotspot usable, so DHCP still serves the (mapped) actual subnet meanwhile.
@@ -152,11 +164,7 @@ while :; do
                 load_config
                 log "reload requested"
                 rm -f "$RUN/fw_ok"
-                if [ -n "$CUR" ]; then
-                    fw_del
-                    dhcp_stop
-                    serve_dhcp
-                fi ;;
+                [ -n "$CUR" ] && serve_dhcp ;;
             up|down) FP="" ;;   # force re-detection
         esac
         sleep 0.3
