@@ -11,30 +11,42 @@ TAG=hspd
 # shellcheck source=../lib/common.sh
 . "$MODDIR/lib/common.sh"
 
-if [ -n "$(daemon_pid)" ]; then echo "already running"; exit 0; fi
+_other=""
+for _p in $(daemon_pids); do
+    [ "$_p" = "$$" ] && continue
+    _other="$_p"
+done
+if [ -n "$_other" ]; then
+    # Keep exactly one watcher. A stale pidfile or a daemon started by an older
+    # module revision must not leave two DHCP owners racing on the same AP.
+    log "daemon singleton: replacing existing hspd pid=$_other"
+    kill "$_other" 2>/dev/null || true
+    _w=0
+    while kill -0 "$_other" 2>/dev/null && [ "$_w" -lt 10 ]; do sleep 0.3; _w=$((_w+1)); done
+    kill -9 "$_other" 2>/dev/null || true
+fi
 echo $$ > "$RUN/hspd.pid"
 load_config
 log "daemon start (pid $$) Android $RELEASE SDK $SDK HyperOS $HYPEROS busybox=$BB udhcpd=$(bb_has udhcpd && echo yes || echo no)"
 rm -f "$RUN/fw_ok"
-if [ ! -f "$DHCPSTATE" ] || ! grep -q '^session=' "$DHCPSTATE" 2>/dev/null; then
-    dhcp_session_begin
-fi
 # A daemon restart must not grant a second repair budget to an already degraded session.
 gw_active && [ "$(gw_get result)" = repairing ] && gw_set pending 0
 
 CUR=""          # "iface addr" of the session we are serving
+SESSION_KEY=""  # persisted DHCP session identity; preserved across address changes
 FP=""           # last address fingerprint
 TL=""           # cached tethered iface list
 TICK=0
 TL_AT=0
-DHCP_FAILS=0
 MON_PID=""
+PROBE_FAILED=""
 
 cleanup() {
     log "daemon exit"
     [ -n "$MON_PID" ] && kill "$MON_PID" 2>/dev/null
-    fw_del; dhcp_stop
+    dhcp_stop; fw_del
     rm -f "$RUN/hspd.pid" "$RUN/ev" "$RUN/session"
+    SESSION_KEY=""
     exit 0
 }
 trap cleanup INT TERM
@@ -55,19 +67,50 @@ session_down() {
     [ -n "$CUR" ] && log "AP down / changed: $CUR"
     fw_del
     dhcp_stop
-    CUR=""; DHCP_FAILS=0
+    CUR=""
+    SESSION_KEY=""
+    PROBE_FAILED=""
     rm -f "$RUN/session"
+    dhcp_set state idle
+    dhcp_set serving 0
+    dhcp_set next_retry_at 0
+    dhcp_summary_write
     gw_session_down "$(date +%s)"
 }
 
 session_up() {
     log "AP up: $AP_IF $AP_ADDR"
+    _su_same=0
+    if [ "$SESSION_KEY" = "$AP_IF $AP_ADDR" ] && [ -f "$DHCPSTATE" ]; then
+        _su_same=1
+    fi
     CUR="$AP_IF $AP_ADDR"
+    SESSION_KEY="$AP_IF $AP_ADDR"
+    PROBE_FAILED=""
     echo "$CUR $(date +%s)" > "$RUN/session"
+    if [ "$_su_same" = 1 ]; then
+        dhcp_session_begin --preserve
+    else
+        dhcp_session_begin
+    fi
     gw_observe "$AP_IF" "$AP_ADDR"
     # A repair restart in flight leaves the address about to change; a only-scheduled retry
     # keeps the hotspot usable, so DHCP still serves the (mapped) actual subnet meanwhile.
     gw_pending && return
+    if [ "$DHCP_ENABLE" = 1 ]; then
+        # Probe once per hotspot session. A failed probe has already handed DHCP back
+        # to the system; repeating it on every poll would only add wakeups.
+        [ -n "$PROBE_FAILED" ] && return
+        # Do not call wait_hotspot_ready here: on this ROM Tethering may never put a
+        # default route in the AP's table. Wait for the actual AP interface to have
+        # IPv4, then sample the system DHCP listener at most once.
+        if ! wait_dhcp_ready "$AP_IF" "${HSP_DHCP_READY_WAIT:-12}"; then
+            log "ERROR: AP interface probe failed for $AP_IF; system DHCP keeps the hotspot usable"
+            dhcp_degrade "AP 接口探测失败" "$AP_IF 未就绪或 mApInterfaceName 不匹配"
+            PROBE_FAILED=1
+            return
+        fi
+    fi
     serve_dhcp
 }
 
@@ -75,17 +118,19 @@ serve_dhcp() {
     if ! dhcp_capable; then
         [ "$DHCP_ENABLE" = 1 ] && log "WARN: own DHCP unavailable (udhcpd=$(bb_has udhcpd && echo y || echo n) fw_ok=$(cat "$RUN/fw_ok" 2>/dev/null)); Android DhcpServer stays in charge"
         fw_del; dhcp_stop
-        dhcp_set serving 0
+        dhcp_set state degraded
+        dhcp_set degraded 1
+        dhcp_set reason "自建 DHCP 不可用"
+        dhcp_set last_error "DHCP_ENABLE=0 / udhcpd 缺失 / iptables owner 不受支持"
+        dhcp_set retry_available 1
+        dhcp_set next_retry_at 0
         dhcp_summary_write
         return
     fi
     if dhcp_takeover "$AP_IF" "$AP_ADDR"; then
         log "Android DhcpServer replies on $AP_IF are now blocked (chain $FW_CHAIN)"
-        DHCP_FAILS=0
-    else
-        DHCP_FAILS=$(dhcp_get failures)
-        [ -n "$DHCP_FAILS" ] || DHCP_FAILS=0
-        log "ERROR: DHCP takeover failed; system DHCP restored (failures=$DHCP_FAILS, limit=$(dhcp_fail_limit))"
+        dhcp_release_placeholder_clients "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
+        dhcp_drop_stale_placeholder "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
     fi
 }
 
@@ -104,11 +149,9 @@ while :; do
         elif gw_tick "$NOW" "$AP_ADDR"; then
             log "gateway: repair restart dispatched; pausing DHCP health checks"
         elif [ "$DHCP_ENABLE" = 1 ] && ! gw_pending; then
-            # health checks for the running session
-            if dhcp_capable && [ "$(dhcp_get serving)" = 1 ]; then
-                dhcp_health_check "$NOW" "$AP_IF" "$AP_ADDR"
-                DHCP_FAILS=$(dhcp_get failures); [ -n "$DHCP_FAILS" ] || DHCP_FAILS=0
-            fi
+            dhcp_health_check "$NOW" "$AP_IF" "$AP_ADDR"
+            [ $((TICK % 5)) -eq 0 ] && dhcp_running &&
+                dhcp_drop_stale_placeholder "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
         fi
     else
         [ -n "$CUR" ] && session_down
@@ -121,9 +164,7 @@ while :; do
                 load_config
                 log "reload requested"
                 rm -f "$RUN/fw_ok"
-                if [ -n "$CUR" ]; then
-                    serve_dhcp
-                fi ;;
+                [ -n "$CUR" ] && serve_dhcp ;;
             up|down) FP="" ;;   # force re-detection
         esac
         sleep 0.3

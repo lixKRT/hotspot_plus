@@ -67,7 +67,7 @@ FIXED_GATEWAY="$3"
 ENFORCE_GATEWAY="$4"
 GATEWAY="$1"
 PREFIX="$2"
-DHCP_ENABLE="1"
+DHCP_ENABLE="${HSP_TEST_DHCP:-1}"
 DHCP_START="192.168.42.100"
 DHCP_END="192.168.42.200"
 AP_IFACE="wlan2"
@@ -193,7 +193,7 @@ module_requests_gateway_and_accepts_it() {
     _gw_run -- on > "$_gw/out" 2>&1 || return 1
     _s=$(_gw_status)
     [ "$(_restarts)" = 1 ] &&
-        grep -q '^start .*--static 192.168.42.1/24' "$_gw/hsctl.log" &&
+        grep -q '^start .*--static 192.168.42.1/24 192.168.42.254/24' "$_gw/hsctl.log" &&
         [ "$(printf '%s' "$_s" | _jq 'd["gateway_result"]')" = ok ] &&
         [ "$(printf '%s' "$_s" | _jq 'd["gateway_attempts"]')" = 0 ] &&
         [ "$(printf '%s' "$_s" | _jq 'd["gateway_origin"]')" = module ] &&

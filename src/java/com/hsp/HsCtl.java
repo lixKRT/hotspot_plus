@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit;
  * (android.net.ITetheringConnector) - exactly what TetheringManager.startTethering() does.
  *
  * Commands:
- *   start [--static LOCAL/PFX CLIENT/PFX] [--pkg NAME] [--timeout SEC] [--no-exempt]
+ *   start [--static LOCAL/PFX [CLIENT/PFX]] [--pkg NAME] [--timeout SEC] [--no-exempt]
  *   stop  [--pkg NAME] [--timeout SEC]
  *   state                 -> ap_state=<int> ap_state_name=<..>   (IWifiManager.getWifiApEnabledState)
  *   config                -> saved SoftApConfiguration (ssid/passphrase base64, security, band)
@@ -120,7 +120,13 @@ public final class HsCtl {
         String local = null, client = null;
         boolean exempt = true;
         for (int i = 1; i < a.length; i++) {
-            if ("--static".equals(a[i]) && i + 2 < a.length) { local = a[++i]; client = a[++i]; }
+            if ("--static".equals(a[i]) && i + 1 < a.length) {
+                local = a[++i];
+                // Android requires a static client address together with the local
+                // address; keep the old two-argument form but derive the placeholder
+                // here so callers cannot accidentally leave it unset.
+                if (i + 1 < a.length && a[i + 1].indexOf('/') > 0) client = a[++i];
+            }
             else if ("--pkg".equals(a[i]) && i + 1 < a.length) { pkg = a[++i]; }
             else if ("--timeout".equals(a[i]) && i + 1 < a.length) { timeout = Integer.parseInt(a[++i]); }
             else if ("--no-exempt".equals(a[i])) { exempt = false; }
@@ -324,7 +330,8 @@ public final class HsCtl {
     static int start(String pkg, String local, String client, boolean exempt, int timeout) throws Throwable {
         Object conn = asInterface("android.net.ITetheringConnector$Stub", getService("tethering"));
         Object parcel = newWifiParcel(exempt, pkg); // softApConfig null => Wi-Fi uses the user's saved hotspot config
-        if (local != null && client != null) {
+        if (local != null) {
+            if (client == null) client = placeholder(local);
             setField(parcel, "localIPv4Address", newLinkAddress(local));
             setField(parcel, "staticClientAddress", newLinkAddress(client));
             System.out.println("static_local=" + local + " static_client=" + client);
@@ -367,6 +374,21 @@ public final class HsCtl {
         System.out.println("calling=" + m2);
         m2.invoke(conn, buildArgs(m2, newWifiParcel(false, pkg), TETHERING_WIFI, pkg, l2));
         return await(rb2, timeout, "stop_request");
+    }
+
+    /** Last usable host address of the local prefix; Android's static DHCP needs one. */
+    static String placeholder(String local) {
+        int slash = local.indexOf('/');
+        if (slash < 0) return local;
+        String ip = local.substring(0, slash);
+        int prefix = Integer.parseInt(local.substring(slash + 1));
+        String[] p = ip.split("\\.");
+        if (p.length != 4 || prefix < 1 || prefix > 30) throw new IllegalArgumentException("bad static local: " + local);
+        long v = 0;
+        for (String s : p) v = (v << 8) | Integer.parseInt(s);
+        long host = (1L << (32 - prefix)) - 2;
+        v = (v & ~((1L << (32 - prefix)) - 1)) | host;
+        return ((v >> 24) & 255) + "." + ((v >> 16) & 255) + "." + ((v >> 8) & 255) + "." + (v & 255);
     }
 
     static Object wifi() throws Throwable {
