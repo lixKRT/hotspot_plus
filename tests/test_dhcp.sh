@@ -8,7 +8,7 @@ _dhcp_env() { # name -> temp MODDIR + DATA
     _dt=$TMPROOT/dhcp-$1
     rm -rf "$_dt"
     mkdir -p "$_dt/mod/bin" "$_dt/mod/lib" "$_dt/mod/defaults" \
-        "$_dt/data/run" "$_dt/data/logs" "$_dt/fake"
+        "$_dt/data/run" "$_dt/data/logs" "$_dt/fake" "$_dt/proc"
     cp "$ROOT/bin/hsp" "$ROOT/bin/hspd" "$_dt/mod/bin/"
     cp "$ROOT/lib/common.sh" "$_dt/mod/lib/"
     cp "$ROOT/module.prop" "$_dt/mod/"
@@ -86,6 +86,14 @@ exit 1
 EOF
     cat > "$_dt/fake/udhcpd" <<'EOF'
 #!/bin/sh
+_marker=
+if [ -n "${FAKE_PROC_DIR:-}" ]; then
+    mkdir -p "$FAKE_PROC_DIR" 2>/dev/null
+    _marker=$FAKE_PROC_DIR/$$
+    printf 'udhcpd %s\n' "$*" > "$_marker"
+fi
+_cleanup_marker() { [ -n "$_marker" ] && rm -f "$_marker"; }
+trap '_cleanup_marker' 0
 printf 'start %s\n' "$$" >> "$BUSY_LOG"
 printf 'udhcpd-start\n' >> "$ACTION_LOG"
 _mode=${DHCP_FAKE_MODE:-success}
@@ -98,11 +106,36 @@ case "$_mode" in
         [ "$_mode" = crash-once ] && echo success > "$DHCP_FAKE_CONTROL"
         exit 1 ;;
     success)
-        trap 'printf "stop %s\n" "$$" >> "$BUSY_LOG"; printf "udhcpd-stop\n" >> "$ACTION_LOG"; exit 0' TERM INT
+        trap '_cleanup_marker; printf "stop %s\n" "$$" >> "$BUSY_LOG"; printf "udhcpd-stop\n" >> "$ACTION_LOG"; exit 0' TERM INT
         while :; do sleep 1; done ;;
     *)
         exit 1 ;;
 esac
+EOF
+    cat > "$_dt/fake/pgrep" <<'EOF'
+#!/bin/sh
+_pat=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f) ;;
+        *) _pat=$1 ;;
+    esac
+    shift
+done
+[ -n "$_pat" ] && [ -n "${FAKE_PROC_DIR:-}" ] && [ -d "$FAKE_PROC_DIR" ] || exit 1
+_found=0
+for _f in "$FAKE_PROC_DIR"/*; do
+    [ -f "$_f" ] || continue
+    _pid=${_f##*/}
+    case "$_pid" in ''|*[!0-9]*) continue ;; esac
+    if grep -Fq -- "$_pat" "$_f" 2>/dev/null && kill -0 "$_pid" 2>/dev/null; then
+        printf '%s\n' "$_pid"
+        _found=1
+    else
+        rm -f "$_f"
+    fi
+done
+[ "$_found" = 1 ]
 EOF
     cat > "$_dt/fake/getprop" <<'EOF'
 #!/bin/sh
@@ -122,6 +155,7 @@ printf '%s\n' "$*" >> "$HSCTL_LOG"
 exit 0
 EOF
     chmod +x "$_dt/fake/ip" "$_dt/fake/iptables" "$_dt/fake/busybox" "$_dt/fake/udhcpd" \
+        "$_dt/fake/pgrep" \
         "$_dt/fake/getprop" "$_dt/fake/dumpsys" "$_dt/fake/setsid" \
         "$_dt/fake/app_process"
 }
@@ -137,6 +171,7 @@ _dhcp_run() { # [VAR=value ...] -- hsp args...
         HSP_FLOCK=: LOCK_WAIT=3 HSP_START_WAIT=0 \
         HSP_FAKE_UDHCPD="$_dt/fake/udhcpd" \
         DHCP_FAKE_CONTROL="$_dt/dhcp-mode" \
+        FAKE_PROC_DIR="$_dt/proc" \
         HSP_DHCP_FAIL_LIMIT=3 HSP_GW_NO_SPAWN=1 \
         HSP_DHCP_RETRY_DELAYS="1 1 1" \
         IPT_LOG="$_dt/iptables.log" BUSY_LOG="$_dt/busybox.log" ACTION_LOG="$_dt/actions.log" \
@@ -153,6 +188,7 @@ _dhcp_eval() { # shell body evaluated with common.sh loaded
         HSP_FLOCK=: \
         HSP_FAKE_UDHCPD="$_dt/fake/udhcpd" \
         DHCP_FAKE_CONTROL="$_dt/dhcp-mode" \
+        FAKE_PROC_DIR="$_dt/proc" \
         HSP_DHCP_FAIL_LIMIT=3 \
         HSP_DHCP_RETRY_DELAYS="1 1 1" \
         IPT_LOG="$_dt/iptables.log" BUSY_LOG="$_dt/busybox.log" ACTION_LOG="$_dt/actions.log" \
@@ -174,9 +210,26 @@ _dhcp_json() { # expression
 }
 
 _dhcp_cleanup_process() {
+    [ -n "${_dt:-}" ] || return 0
     _p=$(cat "$_dt/data/run/udhcpd.pid" 2>/dev/null)
     [ -n "$_p" ] && kill "$_p" 2>/dev/null
     _dhcp_eval 'dhcp_stop' >/dev/null 2>&1
+    if [ -d "$_dt/proc" ]; then
+        for _f in "$_dt/proc"/*; do
+            [ -f "$_f" ] || continue
+            _q=${_f##*/}
+            kill -9 "$_q" 2>/dev/null
+            rm -f "$_f"
+        done
+    fi
+}
+
+_dhcp_case() { # function -> always clean up this case's fake udhcpd
+    _dt=
+    _dhcp_case_rc=0
+    "$1" || _dhcp_case_rc=$?
+    _dhcp_cleanup_process
+    return "$_dhcp_case_rc"
 }
 
 _jump_present() { [ -f "$_dt/ipt-state/jump" ]; }
@@ -520,23 +573,23 @@ ui_shows_chinese_degraded_warning_and_retry() {
         grep -q 'dhcp_last_error' "$ROOT/webroot/index.html"
 }
 
-run_case "DHCP starts and verifies before OUTPUT jump" dhcp_takeover_starts_and_verifies_before_jump
-run_case "udhcpd start failure installs no takeover" udhcpd_start_failure_installs_no_takeover
-run_case "firewall failure removes jump before dhcp stop" firewall_failure_removes_jump_before_stopping_udhcpd
-run_case "repeated udhcpd crashes become degraded" repeated_crashes_enter_visible_degraded_mode
-run_case "crash/retry cycles keep an accumulated window" repeated_crash_retry_cycles_eventually_degrade
-run_case "long idle does not clear accumulated failures" failures_after_long_idle_still_accumulate
-run_case "stable health period clears failure window" stable_health_period_clears_failure_window
-run_case "status exposes DHCP degraded and retry" status_exposes_dhcp_degraded_and_retry
-run_case "DHCP retry restores leases without restart" retry_success_restores_static_leases_without_restart
-run_case "DHCP retry failure is bounded and visible" retry_failure_stays_degraded_and_never_restarts_hotspot
-run_case "lease reloads while serving stay healthy" lease_add_and_delete_while_serving_do_not_degrade
-run_case "explicit reset clears degraded state" explicit_reset_clears_stale_degraded_state
-run_case "actual udhcpd kill still degrades" actual_udhcpd_kill_still_degrades
-run_case "healthy serving clears stale degraded" serving_state_clears_stale_degraded_flag
-run_case "DHCP cleanup is idempotent and exact" cleanup_is_idempotent_and_targets_only_hsp_chain
-run_case "consecutive failures reach degraded budget" consecutive_failures_reach_degraded_budget
-run_case "initial failure then retry serves" initial_failure_then_retry_serves
-run_case "manual retry recovers degraded state" manual_retry_recovers_degraded_state
-run_case "CLI retry entry is wired" cli_retry_is_wired_to_existing_entry
-run_case "UI shows Chinese degraded warning and retry" ui_shows_chinese_degraded_warning_and_retry
+run_case "DHCP starts and verifies before OUTPUT jump" _dhcp_case dhcp_takeover_starts_and_verifies_before_jump
+run_case "udhcpd start failure installs no takeover" _dhcp_case udhcpd_start_failure_installs_no_takeover
+run_case "firewall failure removes jump before dhcp stop" _dhcp_case firewall_failure_removes_jump_before_stopping_udhcpd
+run_case "repeated udhcpd crashes become degraded" _dhcp_case repeated_crashes_enter_visible_degraded_mode
+run_case "crash/retry cycles keep an accumulated window" _dhcp_case repeated_crash_retry_cycles_eventually_degrade
+run_case "long idle does not clear accumulated failures" _dhcp_case failures_after_long_idle_still_accumulate
+run_case "stable health period clears failure window" _dhcp_case stable_health_period_clears_failure_window
+run_case "status exposes DHCP degraded and retry" _dhcp_case status_exposes_dhcp_degraded_and_retry
+run_case "DHCP retry restores leases without restart" _dhcp_case retry_success_restores_static_leases_without_restart
+run_case "DHCP retry failure is bounded and visible" _dhcp_case retry_failure_stays_degraded_and_never_restarts_hotspot
+run_case "lease reloads while serving stay healthy" _dhcp_case lease_add_and_delete_while_serving_do_not_degrade
+run_case "explicit reset clears degraded state" _dhcp_case explicit_reset_clears_stale_degraded_state
+run_case "actual udhcpd kill still degrades" _dhcp_case actual_udhcpd_kill_still_degrades
+run_case "healthy serving clears stale degraded" _dhcp_case serving_state_clears_stale_degraded_flag
+run_case "DHCP cleanup is idempotent and exact" _dhcp_case cleanup_is_idempotent_and_targets_only_hsp_chain
+run_case "consecutive failures reach degraded budget" _dhcp_case consecutive_failures_reach_degraded_budget
+run_case "initial failure then retry serves" _dhcp_case initial_failure_then_retry_serves
+run_case "manual retry recovers degraded state" _dhcp_case manual_retry_recovers_degraded_state
+run_case "CLI retry entry is wired" _dhcp_case cli_retry_is_wired_to_existing_entry
+run_case "UI shows Chinese degraded warning and retry" _dhcp_case ui_shows_chinese_degraded_warning_and_retry
