@@ -18,6 +18,18 @@
 
 缺少证据的项目记录为“未验证”，不能算部分通过。
 
+## 默认值与证据口径
+
+| 键 | 仓库默认 | 设备 `132961d2` 运行时 | 说明 |
+|---|---|---|---|
+| `FIXED_GATEWAY` | `1` | `1` | 请求固定网关；需要自建 DHCP 可用 |
+| `DHCP_ENABLE` | `1` | `1` | 运行模块自己的 `udhcpd`，静态租约依赖它 |
+| `ENFORCE_GATEWAY` | `0` | `1`（用户覆盖） | 默认关闭，避免系统启动热点时自动重启造成接口重建竞态 |
+| `AUTO_START` | `0` | `1`（用户覆盖） | 开机自动开热点默认关闭（ADR-0002） |
+
+上表的运行时值来自设备 `132961d2` 的用户覆盖，不是仓库默认值。文档不得把它们写成默认行为。
+`defaults/config.conf`、`lib/common.sh` 的 `config_defaults()` 和本表必须保持 `1/1/0/0` 一致。
+
 ## Issue #5 固定网关与有界修复
 
 | 项目 | 状态 | 证据 / 缺口 |
@@ -35,19 +47,44 @@
 
 | 项目 | 状态 | 证据 / 缺口 |
 |---|---|---|
-| 默认不请求固定网关、不接管系统 DHCP、不自动重启 | PASS（离线） | `defaults/config.conf` 与 `lib/common.sh` 均为 `FIXED_GATEWAY=0`、`DHCP_ENABLE=0`、`ENFORCE_GATEWAY=0`；`tests/test_lifecycle.sh` 断言 |
-| 启动等待 Tethering 默认路由/接口就绪 | PASS（离线） | `bin/hsp` 的 `wait_hotspot_ready` 与 `bin/hspd` 的 DHCP 接管前检查；`tests/test_lifecycle.sh` 断言 |
-| 设备端观察 `wlan2 No such device` 后不再抢跑 `udhcpd` | PASS（真机） | 修复包重启后日志无 `udhcpd` 抢跑；热点启动、客户端关联和 DHCP 分配均成功 |
-| Wi‑Fi 客户端经系统 DHCP 获得地址 | PASS（真机） | 客户端 `10.65.242.238` 由系统 DhcpServer 分配；`dumpsys tethering` 显示 `wlan2` downstream |
-| Wi‑Fi 客户端转发/NAT | PASS（真机） | `tetherctrl_FORWARD` 的 `wlan2 → rmnet_data2` 和 `tetherctrl_nat_POSTROUTING` 计数持续增长；存在实际 HTTPS 外网连接 |
-| USB 共享 P2P 连接对 BPF 的干扰 | **UNVERIFIED / RISK** | 测试期间 USB 客户端 `10.17.25.53` 仍产生大量 UDP/TCP 连接并触发 BPF `ENOENT`；`E2BIG` 在本次开机日志为 0，但高负载下仍需复测 |
+| 默认固定网关/自建 DHCP 开启，强制重启和开机自启关闭 | PASS（离线） | `defaults/config.conf` 与 `lib/common.sh` 为 `FIXED_GATEWAY=1`、`DHCP_ENABLE=1`、`ENFORCE_GATEWAY=0`、`AUTO_START=0`；`ENFORCE_GATEWAY=0` 避免接口重建竞态；`tests/test_lifecycle.sh` 断言 |
+| 启动等待 Tethering 默认路由/接口就绪 | PASS（离线） | `bin/hsp` 的 `wait_hotspot_ready`；02 的接口探针相关离线用例走 `wait_dhcp_ready`，接管前必须确认 `AP_IF` 有 IPv4 |
+| 设备端观察 `wlan2 No such device` 后不再抢跑 `udhcpd` | **UNVERIFIED / 旧包** | 旧包（设备中间版本，非本次 diff）日志无 `udhcpd` 抢跑；本次完整 diff 未做精确包真机安装验证 |
+| Wi‑Fi 客户端经系统 DHCP 获得地址 | **UNVERIFIED / 旧包** | 旧包上的系统 DHCP 客户端地址证据；本次 diff 未做精确包真机验收 |
+| Wi‑Fi 客户端转发/NAT | **UNVERIFIED / 旧包** | 旧包上的 `tetherctrl_FORWARD`/NAT 计数证据；本次 diff 未做精确包真机验收 |
+| USB 共享 P2P 连接对 BPF 的干扰 | **UNVERIFIED / RISK** | 旧包测试期间 USB 客户端仍产生大量 UDP/TCP 连接并触发 BPF `ENOENT`；`E2BIG` 在本次开机日志为 0，但高负载下仍需复测 |
 
 ## 自建 DHCP + 静态固定 IP
 
 | 项目 | 状态 | 证据 / 缺口 |
 |---|---|---|
-| 固定网关请求被 Android 16 采纳 | PASS（真机） | `wlan2 192.168.42.1/24`，`gateway_ok=true` |
-| `udhcpd` 同时监听并下发静态租约 | PASS（真机） | `V40` 拿到 `192.168.42.106`；`dumpleases` 可见租约 |
-| 系统 DhcpServer 应答被拦截 | PASS（真机） | `hsp_dhcp` 链存在，规则匹配 `sport 67 -> dport 68` |
-| 绑定设备被系统占位地址 `.254` 先占 | **KNOWN GAP** | 冷启动时可能出现；模块接管后释放邻居项让客户端重租，但需要客户端重连/续租才能真正换回绑定 IP |
-| 静态 MAC 每次重连都保持固定 IP | **PARTIAL** | `.106` 已验证；`.105` 需在客户端重连后确认，设备当前无客户端在线 |
+| 固定网关请求被 Android 16 采纳 | **UNVERIFIED / 旧包** | `132961d2` 中间版本观测到 `wlan2 192.168.42.1/24`、`gateway_ok=true`；该版本没有本次完整 diff，不能作为本次真机 PASS |
+| `udhcpd` 同时监听并下发静态租约 | **UNVERIFIED / 旧包** | `132961d2` 中间版本观测到静态租约 `.105/.106`；本次 diff 未做精确包真机验收 |
+| 系统 DhcpServer 应答被拦截 | **UNVERIFIED / 旧包** | `132961d2` 中间版本观测到 `hsp_dhcp` 链；真实 Android `iptables owner` 行为未在本次 diff 验证 |
+| 绑定设备被系统占位地址 `.254` 先占 | **KNOWN GAP** | 冷启动时可能出现；模块接管后释放邻居项并清理残留占位，但客户端可能需要断开重连才能换回绑定 IP |
+| 静态 MAC 每次重连都保持固定 IP | **UNVERIFIED / 旧包** | `.106` 在旧包上验证过；`.105` 缺少本次 diff 的重连证据，设备当前无客户端在线 |
+
+## 本次 DHCP 修复的离线证据
+
+本节的结论只来自离线测试和仓库文件检查，**未做本次完整 diff 的精确包真机安装验证**。
+
+| 项目 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| DHCP 生命周期 | PASS（离线） | `idle → serving → retrying → degraded`；有界 3 次，失败间隔 2/5/15 秒；每次失败先 `fw_del` 再 `dhcp_stop`；`dhcp retry` 只重建自建 DHCP；`status --json` 暴露 `dhcp_mode/dhcp_degraded/dhcp_reason/dhcp_retry_available` 等字段 |
+| AP 接口探针和 `dumpsys wifi` 次数 | PASS（离线） | `wait_dhcp_ready` 按实际 `AP_IF` 检查；`dumpsys wifi` 每次探测最多 1 次；探测失败进入 degraded；`hsp on` 不再等待默认路由 |
+| `hsctl.jar` 与源码一致 | PASS（离线） | 仓库 `bin/hsctl.jar` 的 SHA-256 为 `2357d4be84330934dea0a9a18dad000c3be45d9bbec1ba97b5de1409d6884107`；dex 含 `placeholder` / `bad static local` 字符串；`tests/test_packaging.sh` 在当前源码可重建时比较 dex 哈希，工具或 R8 缺失时明确 skip |
+| 本次 diff 精确包真机验收 | **UNVERIFIED** | 设备 `132961d2` 是部分中间版本：`bin/hsp` 有 `wait_hotspot_ready` 但没有 `daemon_pids`；`bin/hspd` 有 `DHCP_TRIED`、`dhcp_release_placeholder_clients`，但没有 `wait_dhcp_ready`、`dhcp_drop_stale_placeholder`、daemon singleton；`lib/common.sh` 也缺少这些新函数。该包不能代表当前 HEAD |
+| 真实 Android `iptables owner` | **UNVERIFIED** | 离线 fake `iptables` 只证明命令顺序和规则内容；未在本次 diff 上验证内核 `owner` 匹配的实际行为 |
+| `udhcpd` 退出时序 | **UNVERIFIED** | 离线 fake 进程证明了有界重试和降级路径；真实 `udhcpd` 的退出/回收时序未验证 |
+| WebUI 联调（降级提示和重试） | **UNVERIFIED** | 离线测试只检查页面存在中文降级提示和重试入口；未做本次 diff 的 WebUI 真机联调 |
+
+### 测试汇总
+
+| 范围 | 结果 | 说明 |
+|---|---|---|
+| DHCP 生命周期 | WSL 20/20 | `tests/test_dhcp.sh` 的 20 个 `run_case` 全部通过 |
+| 02 独立接口探针 | WSL 6/6 | `tests/test_iface_probe.sh` 的 6 个 `run_case` 全部通过 |
+| 生命周期 | WSL 22/22 | `tests/test_lifecycle.sh` 的 22 个 `run_case` 全部通过 |
+| Git Bash | 部分 skip | Git Bash 缺少可靠的 `setsid` 进程语义，依赖真实进程生命周期的 DHCP 用例会 skip；**skip 不是全绿**，不能据此宣称完整 `tests/run.sh` 通过 |
+
+完整 `tests/run.sh` **未宣称全绿**：本次没有运行完整套件；不能根据上面的分项结果推断整套件通过。

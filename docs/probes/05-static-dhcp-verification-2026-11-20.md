@@ -2,6 +2,13 @@
 
 日期：2026-11-20。设备：OnePlus 8T KB2000，Android 16 / SDK 36。
 
+## 包版本与证据范围
+
+- **包版本**：设备中间版本 `132961d2`，不是本次完整 diff。该包缺少 `wait_dhcp_ready`、`dhcp_drop_stale_placeholder`、`daemon_pids` 和 daemon singleton；因此本记录中的静态租约、DHCP 拦截和 `.254` 处理证据不能代替当前 HEAD 的精确包验收。
+- **设备配置**：`FIXED_GATEWAY=1`、`DHCP_ENABLE=1`、`ENFORCE_GATEWAY=0`；`AUTO_START=1` 是用户覆盖。仓库默认是 `1/1/0/0`（`AUTO_START=0`）。
+- **是否本次 diff**：否。本记录是旧包/中间版本的最终观察，保留为历史证据；当前 HEAD 仍需精确包真机安装验证。
+- **证据限制**：设备当时运行态健康（`wlan2 192.168.42.1/24`、1 个 `hspd`、1 个 `udhcpd`、`.105/.106` 邻居、无 `.254`）不能作为本次 diff 的真机 PASS。
+
 ## 工作配置
 
 ```text

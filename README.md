@@ -8,7 +8,7 @@
 > 上游没有许可证文件；来源与再分发状态见 [仓库说明](docs/REPOSITORY.md)。
 >
 > 设计已定稿，见 [术语表](GLOSSARY.md)、[架构决策](docs/adr/README.md) 和
-> [验收标准](docs/ACCEPTANCE.md)。当前代码仍是上游状态，适配尚未开始。
+> [验收标准](docs/ACCEPTANCE.md)。v0.3.0 适配仍在实施，真机验收状态以验收文档为准。
 
 给 **一加 8T KB2000（Android 16，Magisk 31.1）** 适配的 Magisk / KernelSU 模块，增强 Wi‑Fi 个人热点：
 
@@ -75,14 +75,14 @@
 - 副作用（源码确认）：这个 API 同时要求一个 `staticClientAddress`，系统的 `DhcpServer` 会进入 **single‑client 模式**，只发这一个地址。所以本模块：
   - 用子网最后一个可用地址（.254）当占位 client 地址；
   - 只有在**自建 DHCP 可用**时才发静态地址请求。否则不固定网关，避免系统只给 1 台设备分配地址。
-- **Android 16 默认策略**：`FIXED_GATEWAY=1`、`DHCP_ENABLE=1`、`ENFORCE_GATEWAY=0`，默认启用固定网关和自建 DHCP（静态租约）。`ENFORCE_GATEWAY` 只是“系统启动的热点网关不符时自动重启”的选项，默认关闭以免引入接口重建竞态。
+- **仓库默认策略**：`FIXED_GATEWAY=1`、`DHCP_ENABLE=1`、`ENFORCE_GATEWAY=0`、`AUTO_START=0`，默认启用固定网关和自建 DHCP（静态租约），不自动重启系统启动的热点，也不开机自启。`ENFORCE_GATEWAY=0` 用于避免接口重建竞态。
 - 修复策略（ADR-0007，按热点会话计数，不会形成重启循环）：
   - 模块启动：请求配置网关；若未生效，最多再重启两次，间隔约 5 秒、15 秒，仍不符则本次会话降级（DHCP 按实际网段映射，不再自动重启）。
   - 系统启动：用系统开关/快捷开关打开且网关不符时，只做**一次**修复重启；仍不符立即降级，不叠加模块启动的重试额度。
   - 用户主动关闭再开启会创建新会话并获得新额度；`hsp status` 的 `gateway_attempts/gateway_limit/gateway_final/gateway_degraded/gateway_reason` 记录尝试与结果。
-  - 本机 Android 16 已实测采纳静态地址请求：`wlan2` 为 `192.168.42.1/24`，`udhcpd` 与静态租约正常工作。
+  - 设备 `132961d2` 的中间版本曾实测采纳静态地址请求：`wlan2` 为 `192.168.42.1/24`，`udhcpd` 与静态租约正常工作。该包不是本次完整 diff，不能作为本次真机验收。
   - 系统 DhcpServer 需要同时拿到一个 `staticClientAddress`；本模块使用 `.254` 作为占位。**这不是发给用户的地址**，动态池默认是 `.100–.200`。
-  - 冷启动时系统可能在 `udhcpd` 接管前把占位地址先发给客户端。模块在接管后会释放该邻居项，让绑定客户端重新租约；若设备端仍显示 `.254`，让该设备断开重连一次即可拿到绑定地址。
+  - 冷启动时系统可能在 `udhcpd` 接管前把占位地址先发给客户端。模块在接管后会释放该邻居项，并在后续健康检查中清理残留占位；客户端仍可能需要“断开重连”一次才能拿到绑定地址。
 - 评估过但没采用的方案：
   - Tethering 资源 overlay：Android 16 的 `config.xml` 里没有固定 Wi‑Fi 前缀的资源（只有 P2P 的 `config_tether_enable_legacy_wifi_p2p_dedicated_ip`）。
   - DeviceConfig：没有对应开关。
@@ -98,6 +98,9 @@
      系统 DhcpServer 用普通 UDP socket 发包（源码确认：`SO_REUSEADDR` + `SO_BINDTODEVICE` + `sendto`），运行在 network_stack(1073) 或 system(1000) 进程里，所以能被 owner 匹配拦下。udhcpd 设置了 `SO_REUSEADDR` 和 `SO_BINDTODEVICE`，可以和它同时绑定 67 端口；广播 DISCOVER 两边都会收到，但只有 udhcpd 的应答能发出去。
   3. udhcpd 下发：router = 网关，DNS = 网关（由系统 dnsmasq 转发；也可在 `DNS=` 里自定义），option 43 `ANDROID_METERED`（和系统行为一致）。
   4. 如果实际网段和配置不同（例如 ROM 忽略了固定网关），静态租约和地址池会**保留主机号、映射到实际网段**。
+  5. DHCP 采用有界生命周期：`idle → serving → retrying → degraded`。启动、接管或 `udhcpd` 连续异常退出时，最多尝试 3 次，失败间隔为 2/5/15 秒；每次失败先撤掉 `hsp_dhcp` 拦截跳转，再停止 `udhcpd`，避免两个 DHCP 响应者同时工作。
+  6. 失败额度耗尽后进入 `degraded`，**系统 DHCP 继续分配地址，热点不重启**；静态租约暂不生效。恢复自建 DHCP 用 `hsp dhcp retry`，它只重建模块自己的 DHCP，不会重启热点；如果重试仍失败，保持降级并由系统 DHCP 服务。
+  7. `hsp status` 的 `dhcp_mode` 表示 `idle/serving/retrying/degraded`；`dhcp_degraded` 表示是否已降级；`dhcp_reason` 给出原因；`dhcp_retry_available` 表示是否可手动重试。另有 `dhcp_attempts/dhcp_limit/dhcp_next_retry_at/dhcp_last_error` 供诊断。
 - 安全兜底：只有在 udhcpd 正常运行**之后**才加拦截规则；udhcpd 退出时守护进程会自动重启它，连续失败就删掉规则，交还系统 DHCP。内核不支持 `owner` 匹配时，根本不启用自建 DHCP。
 
 ### 4. 已连接设备列表
@@ -176,6 +179,7 @@ su -c "$H backup list"   # 列出有效备份包
 su -c "$H restore <备份目录> --yes"   # 显式确认后恢复配置和静态租约
 su -c "$H backup export <备份目录>"   # 显式导出 tar.gz 到 /sdcard/Download
 su -c "$H apply"         # 应用配置
+su -c "$H dhcp retry"    # 降级时只重建自建 DHCP，不重启热点
 su -c "$H log 200"
 su -c "$H diag"          # 生成诊断文件
 su -c "$H daemon restart"
@@ -256,20 +260,38 @@ su -c "$H unstick"       # 清除卡住的操作（结束残留 hsp/hsctl 进程
 >
 > 以下是 v0.1 的完整测试步骤（地址已换成新网段）。
 
+以下命令均使用绝对路径 `H=/data/adb/modules/hotspot_plus/bin/hsp`。仓库默认是 `FIXED_GATEWAY=1`、`DHCP_ENABLE=1`、`ENFORCE_GATEWAY=0`、`AUTO_START=0`，测试时不要假设默认 `0/0/0`。
+
 1. 安装 zip → 重启 → `su -c sh /data/adb/modules/hotspot_plus/diag.sh`，保存 `/sdcard/Download/hotspot_plus_diag_*.txt`（基线；热点密码已打码）。
-2. `su -c "/data/adb/modules/hotspot_plus/bin/hsp hsctl probe"`：应该看到 `tethering_binder=ok`、`startTethering` 的方法签名、`ap_state=11 (DISABLED)`。
-3. **先测纯开关**：默认已经是 `hsp set FIXED_GATEWAY=0 DHCP_ENABLE=0`，直接 `hsp on`：
+2. `su -c "$H hsctl probe"`：应该看到 `tethering_binder=ok`、`startTethering` 的方法签名、`ap_state=11 (DISABLED)`。
+3. **先测纯开关（临时写入配置，测完恢复）**：为了让后台守护进程也按纯开关模式工作，显式关闭固定网关和自建 DHCP，再应用：
+   ```sh
+   su -c "$H set FIXED_GATEWAY=0 DHCP_ENABLE=0"
+   su -c "$H apply"
+   su -c "$H on"
+   su -c "$H status"
+   ```
    - 预期输出 `start_result=0 (NO_ERROR)` 和「热点已开启：wlan? 地址」；
    - 用其他设备连接，确认 SSID/密码没变、能上网；
    - `hsp clients` 能看到设备的 IP 和 MAC；
-   - `hsp off` 能关闭。
-4. **再测自建 DHCP**：`hsp set DHCP_ENABLE=1`（固定网关也建议同时设 `FIXED_GATEWAY=1 ENFORCE_GATEWAY=1`），`hsp apply`（或重开热点）：
+   - `su -c "$H off"` 能关闭；**测完执行** `su -c "$H set FIXED_GATEWAY=1 DHCP_ENABLE=1"` 和 `su -c "$H apply"` 恢复仓库默认 `1/1/0`，再做下一步。
+4. **再测自建 DHCP（仓库默认）**：`FIXED_GATEWAY=1`、`DHCP_ENABLE=1`、`ENFORCE_GATEWAY=0`，执行 `su -c "$H on"` 或 `su -c "$H restart"`：
    - `hsp status` 应显示「DHCP running=yes」「防火墙拦截系统DHCP: yes」；
    - 客户端「忘记网络」后重连，应拿到 .100–.200 的地址；
    - 用 `hsp lease add <客户端MAC> 192.168.x.10 测试` 加一条绑定，`hsp apply` 后客户端重连，应拿到 .10。
-5. **再测固定网关**：`hsp set FIXED_GATEWAY=1`，`hsp restart`：网关应变为 192.168.42.1。
+5. **确认固定网关**：保持 `FIXED_GATEWAY=1`，执行 `su -c "$H restart"`：网关应变为 192.168.42.1。
    - 如果不对：日志里会有 `ROM ignores TetheringRequest static address`，请回传 diag。
-6. **测强制模式**：用系统快捷开关关掉再打开热点，约 5–10 秒后应被自动重启到 192.168.42.1，`hsp log` 里有对应记录。
+6. **可选测强制模式（会临时写入配置，测完必须恢复）**：用系统快捷开关关掉再打开热点，然后临时开启强制网关：
+   ```sh
+   su -c "$H set ENFORCE_GATEWAY=1"
+   su -c "$H apply"
+   ```
+   约 5–10 秒后应被自动重启到 192.168.42.1，`hsp log` 里有对应记录。**测完执行**：
+   ```sh
+   su -c "$H set ENFORCE_GATEWAY=0"
+   su -c "$H apply"
+   ```
+   恢复仓库默认，避免以后系统启动热点时继续自动重启。
 7. 开着 VPN 再测一次客户端上网。
 8. 任一步失败：`hsp diag`，连同第 1 步的基线一起发回。
 
