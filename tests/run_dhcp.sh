@@ -21,15 +21,20 @@ run_case() {
     shift
     TOTAL=$((TOTAL + 1))
     case "$name" in
-        "actual udhcpd kill still degrades"|"lease reloads while serving stay healthy"|"DHCP retry failure is bounded and visible"|"explicit reset clears degraded state")
+        "actual udhcpd kill still degrades"|"lease reloads while serving stay healthy")
             if [ "$GIT_BASH" = 1 ]; then
                 printf 'SKIP %s (Git Bash lacks setsid process semantics; run in WSL)\n' "$name"
                 SKIPPED=$((SKIPPED + 1))
                 return 0
             fi ;;
     esac
-    if "$@"; then
+    "$@"
+    _rc=$?
+    if [ "$_rc" -eq 0 ]; then
         printf 'ok   %s\n' "$name"
+    elif [ "$_rc" -eq 77 ]; then
+        printf 'SKIP %s\n' "$name"
+        SKIPPED=$((SKIPPED + 1))
     else
         printf 'FAIL %s\n' "$name"
         FAIL=$((FAIL + 1))
