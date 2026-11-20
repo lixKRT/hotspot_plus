@@ -6,10 +6,10 @@ PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
 _dhcp_env() { # name -> temp MODDIR + DATA
     _dt=$TMPROOT/dhcp-$1
-    trap '_dhcp_cleanup_process' EXIT HUP INT TERM
     rm -rf "$_dt"
     mkdir -p "$_dt/mod/bin" "$_dt/mod/lib" "$_dt/mod/defaults" \
-        "$_dt/data/run" "$_dt/data/logs" "$_dt/fake" "$_dt/proc"
+        "$_dt/data/run" "$_dt/data/logs" "$_dt/fake" "$_dt/proc" ||
+        { echo "test setup: cannot create $_dt" >&2; return 1; }
     cp "$ROOT/bin/hsp" "$ROOT/bin/hspd" "$_dt/mod/bin/"
     cp "$ROOT/lib/common.sh" "$_dt/mod/lib/"
     cp "$ROOT/module.prop" "$_dt/mod/"
@@ -237,7 +237,6 @@ _dhcp_cleanup_process() {
 
 _dhcp_case() { # function -> always clean up this case's fake udhcpd
     _dt=
-    trap '_dhcp_cleanup_process' EXIT HUP INT TERM
     _dhcp_case_rc=0
     "$1" || _dhcp_case_rc=$?
     _dhcp_cleanup_process
@@ -248,7 +247,6 @@ _dhcp_case() { # function -> always clean up this case's fake udhcpd
             _dhcp_case_rc=1
         fi
     fi
-    trap - EXIT HUP INT TERM
     return "$_dhcp_case_rc"
 }
 
