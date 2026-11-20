@@ -11,10 +11,18 @@ trap 'rm -rf "$TMPROOT"' EXIT HUP INT TERM
 FAIL=0
 TOTAL=0
 SKIPPED=0
-case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*) GIT_BASH=1 ;;
-    *) GIT_BASH=0 ;;
-esac
+SETSID_OK=1
+if command -v setsid >/dev/null 2>&1; then
+    _setsid_probe=$TMPROOT/setsid-probe-$$
+    if ! setsid sh -c "echo \$\$ > '$_setsid_probe'" >/dev/null 2>&1; then
+        SETSID_OK=0
+    else
+        _probe_pid=$(cat "$_setsid_probe" 2>/dev/null)
+        [ -n "$_probe_pid" ] && kill -0 "$_probe_pid" 2>/dev/null && SETSID_OK=0
+    fi
+else
+    SETSID_OK=0
+fi
 
 run_case() {
     name=$1
@@ -22,8 +30,8 @@ run_case() {
     TOTAL=$((TOTAL + 1))
     case "$name" in
         "actual udhcpd kill still degrades"|"lease reloads while serving stay healthy")
-            if [ "$GIT_BASH" = 1 ]; then
-                printf 'SKIP %s (Git Bash lacks setsid process semantics; run in WSL)\n' "$name"
+            if [ "$SETSID_OK" != 1 ]; then
+                printf 'SKIP %s (setsid process semantics unavailable; run in WSL)\n' "$name"
                 SKIPPED=$((SKIPPED + 1))
                 return 0
             fi ;;
