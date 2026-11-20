@@ -6,6 +6,7 @@ PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
 _dhcp_env() { # name -> temp MODDIR + DATA
     _dt=$TMPROOT/dhcp-$1
+    trap '_dhcp_cleanup_process' EXIT HUP INT TERM
     rm -rf "$_dt"
     mkdir -p "$_dt/mod/bin" "$_dt/mod/lib" "$_dt/mod/defaults" \
         "$_dt/data/run" "$_dt/data/logs" "$_dt/fake" "$_dt/proc"
@@ -78,7 +79,7 @@ case "$1" in
         printf 'udhcpd\ndumpleases\nflock\n'
         exit 0 ;;
     udhcpd)
-        exec "$HSP_FAKE_UDHCPD" udhcpd "$@" ;;
+        exec "$HSP_FAKE_UDHCPD" udhcpd "$@" </dev/null >>"$BUSY_LOG" 2>&1 ;;
     dumpleases)
         exit 0 ;;
 esac
@@ -218,17 +219,36 @@ _dhcp_cleanup_process() {
         for _f in "$_dt/proc"/*; do
             [ -f "$_f" ] || continue
             _q=${_f##*/}
-            kill -9 "$_q" 2>/dev/null
+            case "$_q" in ''|*[!0-9]*) continue ;; esac
+            kill "$_q" 2>/dev/null
+            _wi=0
+            while kill -0 "$_q" 2>/dev/null && [ "$_wi" -lt 10 ]; do sleep 0.1; _wi=$((_wi+1)); done
+            if kill -0 "$_q" 2>/dev/null; then
+                kill -9 "$_q" 2>/dev/null
+                _wi=0
+                while kill -0 "$_q" 2>/dev/null && [ "$_wi" -lt 10 ]; do sleep 0.1; _wi=$((_wi+1)); done
+            fi
             rm -f "$_f"
         done
     fi
+    rm -f "$_dt/data/run/udhcpd.pid"
+    return 0
 }
 
 _dhcp_case() { # function -> always clean up this case's fake udhcpd
     _dt=
+    trap '_dhcp_cleanup_process' EXIT HUP INT TERM
     _dhcp_case_rc=0
     "$1" || _dhcp_case_rc=$?
     _dhcp_cleanup_process
+    if [ -n "${_dt:-}" ] && [ -d "$_dt/proc" ]; then
+        _stray=$(ls -1 "$_dt/proc" 2>/dev/null)
+        if [ -n "$_stray" ]; then
+            echo "test isolation: stray fake udhcpd pids in $_dt: $_stray" >&2
+            _dhcp_case_rc=1
+        fi
+    fi
+    trap - EXIT HUP INT TERM
     return "$_dhcp_case_rc"
 }
 
