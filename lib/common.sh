@@ -14,8 +14,11 @@ LEASES=$DATA/leases.conf
 LEASE_DB=$DATA/udhcpd.leases
 STATE=$RUN/state
 GWSTATE=$RUN/gateway
+DHCPSTATE=$RUN/dhcp
 HSCTL_JAR=$MODDIR/bin/hsctl.jar
 FW_CHAIN=hsp_dhcp
+
+DHCP_STABLE_SECS=${HSP_DHCP_STABLE_SECS:-120}
 
 mkdir -p "$RUN" "$LOGDIR" 2>/dev/null
 
@@ -680,6 +683,15 @@ fw_check() {
     ipt -C OUTPUT -j $FW_CHAIN 2>/dev/null && \
     ipt -C $FW_CHAIN -o "$1" -p udp --sport 67 --dport 68 -m owner ! --uid-owner 0 -j DROP 2>/dev/null
 }
+fw_check_retry() { # iface [attempts]
+    _fr_n=${2:-2}
+    while [ "$_fr_n" -gt 0 ]; do
+        fw_check "$1" && return 0
+        _fr_n=$((_fr_n - 1))
+        [ "$_fr_n" -gt 0 ] && sleep 0.1
+    done
+    return 1
+}
 fw_del() {
     _n=0
     while ipt -D OUTPUT -j $FW_CHAIN 2>/dev/null; do _n=$((_n+1)); [ $_n -gt 5 ] && break; done
@@ -688,10 +700,295 @@ fw_del() {
     return 0
 }
 
+# ---------------------------------------------------------------- DHCP lifecycle
+# One state file per hotspot session. udhcpd is verified before the DROP jump is installed.
+# Every failure removes the jump before stopping udhcpd, then schedules a bounded retry.
+# Once the budget is exhausted the session stays usable on system DHCP and reports degraded.
+dhcp_get() { # key
+    [ -f "$DHCPSTATE" ] || return 1
+    sed -n "s/^$1=//p" "$DHCPSTATE" 2>/dev/null | tail -n1
+}
+dhcp_set() { # key value
+    [ $# -ge 2 ] || return 1
+    mkdir -p "$RUN" 2>/dev/null
+    _dtmp=$DHCPSTATE.tmp.$$
+    if [ -f "$DHCPSTATE" ]; then
+        grep -v "^$1=" "$DHCPSTATE" > "$_dtmp" 2>/dev/null || :
+    else
+        : > "$_dtmp"
+    fi
+    printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ' | tr -d '\000')" >> "$_dtmp"
+    mv -f "$_dtmp" "$DHCPSTATE"
+}
+dhcp_fail_limit() {
+    _dl=${HSP_DHCP_FAIL_LIMIT:-3}
+    case "$_dl" in ''|*[!0-9]*) _dl=3 ;; esac
+    [ "$_dl" -gt 0 ] 2>/dev/null || _dl=3
+    echo "$_dl"
+}
+dhcp_retry_delay() { # attempt number (1-based)
+    _drd=${HSP_DHCP_RETRY_DELAYS:-"2 5 15"}
+    set -- $_drd
+    _drd_n=$#
+    [ "$_drd_n" -gt 0 ] || { echo 15; return 0; }
+    _drd_i=$1
+    [ "$_drd_i" -gt 0 ] 2>/dev/null || _drd_i=1
+    [ "$_drd_i" -gt "$_drd_n" ] && _drd_i=$_drd_n
+    eval "echo \${$_drd_i}"
+}
+dhcp_retry_pending() {
+    _drp=$(dhcp_get next_retry_at)
+    case "$_drp" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_drp" -gt 0 ]
+}
+dhcp_stable_check() { # now
+    _dc_now=$1
+    _dc_since=$(dhcp_get stable_since)
+    case "$_dc_since" in ''|*[!0-9]*) _dc_since=0 ;; esac
+    [ "$(dhcp_get state)" = serving ] || return 1
+    [ "$(dhcp_get serving)" = 1 ] || return 1
+    [ "$_dc_since" -gt 0 ] || return 1
+    [ $((_dc_now - _dc_since)) -ge "$DHCP_STABLE_SECS" ] || return 1
+    dhcp_set attempts 0
+    dhcp_set first_failure_at 0
+    dhcp_set last_failure_at 0
+    dhcp_set next_retry_at 0
+    dhcp_set stable_since "$_dc_now"
+    dhcp_summary_write
+    log "dhcp: stable for ${DHCP_STABLE_SECS}s; retry budget reset"
+    return 0
+}
+dhcp_session_begin() {
+    mkdir -p "$RUN" 2>/dev/null
+    _ds_now=$(date +%s)
+    {
+        echo "session=$_ds_now-$$"
+        echo "state=idle"
+        echo "serving=0"
+        echo "degraded=0"
+        echo "attempts=0"
+        echo "limit=$(dhcp_fail_limit)"
+        echo "first_failure_at=0"
+        echo "last_failure_at=0"
+        echo "next_retry_at=0"
+        echo "stable_since=0"
+        echo "reason="
+        echo "last_error="
+        echo "retry_available=0"
+        echo "at=$_ds_now"
+    } > "$DHCPSTATE"
+    state_set dhcp_mode idle
+    state_set dhcp_degraded 0
+    state_set dhcp_reason ""
+    state_set dhcp_last_error ""
+    state_set dhcp_retry_available 0
+    state_set dhcp_attempts 0
+    state_set dhcp_limit "$(dhcp_fail_limit)"
+    state_set dhcp_next_retry_at 0
+    log "dhcp: session begin limit=$(dhcp_fail_limit)"
+}
+dhcp_summary_write() {
+    state_set dhcp_mode "$(dhcp_get state)"
+    state_set dhcp_degraded "$(dhcp_get degraded)"
+    state_set dhcp_reason "$(dhcp_get reason)"
+    state_set dhcp_last_error "$(dhcp_get last_error)"
+    state_set dhcp_retry_available "$(dhcp_get retry_available)"
+    state_set dhcp_attempts "$(dhcp_get attempts)"
+    state_set dhcp_limit "$(dhcp_get limit)"
+    state_set dhcp_next_retry_at "$(dhcp_get next_retry_at)"
+    state_set dhcp_first_failure_at "$(dhcp_get first_failure_at)"
+    state_set dhcp_last_failure_at "$(dhcp_get last_failure_at)"
+    state_set dhcp_at "$(date +%s)"
+}
+dhcp_rollback_ordered() { # reason error [state]
+    fw_del
+    dhcp_stop
+    dhcp_set serving 0
+    dhcp_set state "${3:-failed}"
+    [ -n "$1" ] && dhcp_set reason "$1"
+    [ -n "$2" ] && dhcp_set last_error "$2"
+    log "dhcp: fail-closed (${1:-takeover failed}): removed $FW_CHAIN/OUTPUT before stopping udhcpd${2:+ error=$2}"
+}
+dhcp_record_failure() { # reason error
+    _dn=$(date +%s)
+    _df=$(dhcp_get attempts); _df=${_df:-0}
+    case "$_df" in ''|*[!0-9]*) _df=0 ;; esac
+    _dff=$(dhcp_get first_failure_at); _dff=${_dff:-0}
+    case "$_dff" in ''|*[!0-9]*) _dff=0 ;; esac
+    _df=$((_df + 1))
+    [ "$_dff" -eq 0 ] && _dff=$_dn
+    dhcp_set attempts "$_df"
+    dhcp_set first_failure_at "$_dff"
+    dhcp_set last_failure_at "$_dn"
+    dhcp_set stable_since 0
+    dhcp_set reason "$1"
+    dhcp_set last_error "$2"
+    if [ "$_df" -ge "$(dhcp_fail_limit)" ]; then
+        dhcp_rollback_ordered "$1" "$2" degraded
+        dhcp_set degraded 1
+        dhcp_set retry_available 1
+        dhcp_set next_retry_at 0
+        dhcp_set state degraded
+        dhcp_summary_write
+        log "dhcp: DEGRADED system DHCP owns replies; retry available reason=${1:-unknown}"
+        return 0
+    fi
+    dhcp_rollback_ordered "$1" "$2" retrying
+    dhcp_set degraded 0
+    dhcp_set retry_available 1
+    dhcp_set next_retry_at $((_dn + $(dhcp_retry_delay "$_df")))
+    dhcp_summary_write
+    log "dhcp: retry $((_df + 1))/$(dhcp_fail_limit) in $(( $(dhcp_get next_retry_at) - _dn ))s; system DHCP owns replies meanwhile"
+}
+dhcp_degrade() { # reason error
+    dhcp_rollback_ordered "$1" "$2" degraded
+    dhcp_set degraded 1
+    dhcp_set retry_available 1
+    dhcp_set next_retry_at 0
+    dhcp_set state degraded
+    dhcp_summary_write
+    log "dhcp: DEGRADED system DHCP owns replies; retry available reason=${1:-unknown}"
+}
+dhcp_crash() { # last_error
+    case "$(dhcp_get state)" in serving|retrying) ;; *) return 0 ;; esac
+    dhcp_record_failure "udhcpd 连续异常退出" "$1"
+}
+dhcp_takeover() { # iface addr
+    _dt_if=$1; _dt_addr=$2
+    [ -n "$_dt_if" ] && [ -n "$_dt_addr" ] || return 1
+    if ! dhcp_capable; then
+        dhcp_rollback_ordered "自建 DHCP 不可用" "DHCP_ENABLE=0 / udhcpd 缺失 / iptables owner 不受支持"
+        dhcp_set retry_available 1
+        dhcp_set degraded 1
+        dhcp_set state degraded
+        dhcp_summary_write
+        return 1
+    fi
+    if ! dhcp_start "$_dt_if" "$_dt_addr" || ! dhcp_running; then
+        dhcp_record_failure "udhcpd 启动失败" "udhcpd 未能保持运行"
+        return 1
+    fi
+    if ! fw_add "$_dt_if" || ! fw_check_retry "$_dt_if"; then
+        dhcp_record_failure "iptables 接管规则安装失败" "无法安装或验证 $FW_CHAIN/OUTPUT"
+        return 1
+    fi
+    dhcp_set serving 1
+    dhcp_set state serving
+    dhcp_set degraded 0
+    dhcp_set stable_since "$(date +%s)"
+    dhcp_set reason ""
+    dhcp_set last_error ""
+    dhcp_set retry_available 0
+    dhcp_set next_retry_at 0
+    dhcp_summary_write
+    log "dhcp: takeover confirmed: $DHCP_SUMMARY; $FW_CHAIN/OUTPUT installed"
+    return 0
+}
+dhcp_retry() { # [iface addr]
+    _dr_if=${1:-}; _dr_addr=${2:-}
+    if [ -z "$_dr_if" ]; then
+        ap_detect_fast >/dev/null 2>&1 || {
+            dhcp_set last_error "热点未开启，无法重试自建 DHCP"
+            dhcp_summary_write
+            echo "重试失败：热点未开启"
+            return 1
+        }
+        _dr_if=$AP_IF; _dr_addr=$AP_ADDR
+    fi
+    _dr_reason=$(dhcp_get reason)
+    log "dhcp: manual retry requested for $_dr_if $_dr_addr"
+    dhcp_session_begin
+    if dhcp_takeover "$_dr_if" "$_dr_addr"; then
+        log "dhcp: manual retry succeeded; static leases restored"
+        echo "自建 DHCP 已恢复，静态租约生效"
+        return 0
+    fi
+    dhcp_degrade "${_dr_reason:-udhcpd 连续异常退出}" "$(dhcp_get last_error)"
+    echo "重试失败：$(dhcp_get last_error)；仍由系统 DHCP 分配地址，热点未重启"
+    return 1
+}
+dhcp_reset() {
+    _dr_now=$(date +%s)
+    _dr_degraded=$(dhcp_get degraded)
+    _dr_state=$(dhcp_get state)
+    dhcp_set attempts 0
+    dhcp_set first_failure_at 0
+    dhcp_set last_failure_at 0
+    dhcp_set next_retry_at 0
+    dhcp_set stable_since "$_dr_now"
+    if dhcp_running; then
+        dhcp_set degraded 0
+        dhcp_set reason ""
+        dhcp_set last_error ""
+        dhcp_set retry_available 0
+        dhcp_set serving 1
+        dhcp_set state serving
+    elif [ "$_dr_degraded" = 1 ]; then
+        dhcp_set degraded 0
+        dhcp_set state idle
+        dhcp_set retry_available 0
+        [ "$_dr_state" = degraded ] && dhcp_set reason ""
+    else
+        dhcp_set serving 0
+        dhcp_set state idle
+    fi
+    dhcp_summary_write
+    log "dhcp: user reset cleared failure budget and degraded flag"
+}
+dhcp_health_check() { # now iface addr
+    _dhc_now=${1:-$(date +%s)}
+    _dhc_if=$2; _dhc_addr=$3
+    [ -n "$_dhc_if" ] && [ -n "$_dhc_addr" ] || return 0
+    _dhc_state=$(dhcp_get state)
+    case "$_dhc_state" in
+        serving)
+            if dhcp_running; then
+                dhcp_stable_check "$_dhc_now"
+                if ! fw_check "$_dhc_if"; then
+                    log "dhcp: takeover rule missing; fail-closing"
+                    dhcp_crash "接管规则丢失"
+                    return 1
+                fi
+                return 0
+            fi
+            log "dhcp: udhcpd exited while serving; removing $FW_CHAIN before retry"
+            dhcp_crash "udhcpd 进程已退出"
+            return 1 ;;
+        retrying)
+            if dhcp_running && fw_check "$_dhc_if"; then
+                dhcp_set serving 1
+                dhcp_set state serving
+                dhcp_set degraded 0
+                dhcp_set reason ""
+                dhcp_set last_error ""
+                dhcp_set retry_available 0
+                dhcp_set next_retry_at 0
+                dhcp_set stable_since "$_dhc_now"
+                dhcp_summary_write
+                log "dhcp: recovered during retry window"
+                return 0
+            fi
+            _dhc_next=$(dhcp_get next_retry_at)
+            case "$_dhc_next" in ''|*[!0-9]*) _dhc_next=0 ;; esac
+            if [ "$_dhc_next" -gt 0 ] && [ "$_dhc_now" -ge "$_dhc_next" ]; then
+                log "dhcp: retry due (attempt $(dhcp_get attempts)/$(dhcp_fail_limit))"
+                dhcp_takeover "$_dhc_if" "$_dhc_addr" || return 1
+            fi
+            return 0 ;;
+        *)
+            return 0 ;;
+    esac
+}
+
 # ---------------------------------------------------------------- udhcpd
 dhcp_pid() {
     _p=$(cat "$RUN/udhcpd.pid" 2>/dev/null)
-    [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && grep -q udhcpd "/proc/$_p/cmdline" 2>/dev/null && echo "$_p"
+    [ -n "$_p" ] || return 0
+    kill -0 "$_p" 2>/dev/null || return 0
+    # setsid(1) normally execs in place. Some test shells keep an intermediate shell and
+    # would hide the real applet from the child's cmdline; trust the pidfile only then.
+    [ "$HSP_DHCP_PIDFILE_TRUST" = 1 ] && { echo "$_p"; return 0; }
+    grep -q udhcpd "/proc/$_p/cmdline" 2>/dev/null && echo "$_p"
 }
 dhcp_running() { [ -n "$(dhcp_pid)" ]; }
 dhcp_stop() {

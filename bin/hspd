@@ -37,8 +37,6 @@ FP=""           # last address fingerprint
 TL=""           # cached tethered iface list
 TICK=0
 TL_AT=0
-DHCP_FAILS=0
-DHCP_TRIED=0
 MON_PID=""
 
 cleanup() {
@@ -64,18 +62,22 @@ fi
 
 session_down() {
     [ -n "$CUR" ] && log "AP down / changed: $CUR"
-    dhcp_stop
     fw_del
-    CUR=""; DHCP_FAILS=0; DHCP_TRIED=0
+    dhcp_stop
+    CUR=""
     rm -f "$RUN/session"
+    dhcp_set state idle
+    dhcp_set serving 0
+    dhcp_set next_retry_at 0
+    dhcp_summary_write
     gw_session_down "$(date +%s)"
 }
 
 session_up() {
     log "AP up: $AP_IF $AP_ADDR"
     CUR="$AP_IF $AP_ADDR"
-    DHCP_TRIED=0
     echo "$CUR $(date +%s)" > "$RUN/session"
+    dhcp_session_begin
     gw_observe "$AP_IF" "$AP_ADDR"
     # A repair restart in flight leaves the address about to change; a only-scheduled retry
     # keeps the hotspot usable, so DHCP still serves the (mapped) actual subnet meanwhile.
@@ -84,7 +86,7 @@ session_up() {
         # Do not call wait_hotspot_ready here: on this ROM Tethering may never put a
         # default route in the AP's table. Wait for the interface itself plus the
         # system DHCP listener, which is the real precondition for udhcpd.
-        if ! wait_dhcp_ready 12; then
+        if ! wait_dhcp_ready "${HSP_DHCP_READY_WAIT:-12}"; then
             # Don't block takeover on this probe: udhcpd itself refuses to start if
             # wlan2 is still being recreated, and retrying here would leave two DHCP
             # responders active until the next poll. Proceed and let the real start
@@ -98,24 +100,20 @@ session_up() {
 serve_dhcp() {
     if ! dhcp_capable; then
         [ "$DHCP_ENABLE" = 1 ] && log "WARN: own DHCP unavailable (udhcpd=$(bb_has udhcpd && echo y || echo n) fw_ok=$(cat "$RUN/fw_ok" 2>/dev/null)); Android DhcpServer stays in charge"
-        dhcp_stop; fw_del
+        fw_del; dhcp_stop
+        dhcp_set state degraded
+        dhcp_set degraded 1
+        dhcp_set reason "自建 DHCP 不可用"
+        dhcp_set last_error "DHCP_ENABLE=0 / udhcpd 缺失 / iptables owner 不受支持"
+        dhcp_set retry_available 1
+        dhcp_set next_retry_at 0
+        dhcp_summary_write
         return
     fi
-    if dhcp_start "$AP_IF" "$AP_ADDR"; then
-        DHCP_TRIED=1
-        if fw_add "$AP_IF"; then
-            log "Android DhcpServer replies on $AP_IF are now blocked (chain $FW_CHAIN)"
-            DHCP_FAILS=0
-            [ "$DHCP_ENABLE" = 1 ] && dhcp_release_placeholder_clients "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
-            [ "$DHCP_ENABLE" = 1 ] && dhcp_drop_stale_placeholder "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
-        else
-            log "ERROR: iptables rule failed; stopping udhcpd so Android DhcpServer keeps working"
-            dhcp_stop; fw_del
-        fi
-    else
-        DHCP_TRIED=1
-        DHCP_FAILS=$((DHCP_FAILS+1))
-        fw_del
+    if dhcp_takeover "$AP_IF" "$AP_ADDR"; then
+        log "Android DhcpServer replies on $AP_IF are now blocked (chain $FW_CHAIN)"
+        dhcp_release_placeholder_clients "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
+        dhcp_drop_stale_placeholder "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
     fi
 }
 
@@ -134,16 +132,9 @@ while :; do
         elif gw_tick "$NOW" "$AP_ADDR"; then
             log "gateway: repair restart dispatched; pausing DHCP health checks"
         elif [ "$DHCP_ENABLE" = 1 ] && ! gw_pending; then
-            # health checks for the running session
-            if [ "$DHCP_TRIED" = 0 ] && dhcp_capable && ! dhcp_running; then
-                log "udhcpd not running; one startup attempt for this session"
-                serve_dhcp
-            elif dhcp_running && [ $((TICK % 5)) -eq 0 ] && ! fw_check "$AP_IF"; then
-                log "firewall rule missing, re-adding"
-                fw_add "$AP_IF" || { dhcp_stop; fw_del; }
-            elif dhcp_running && [ $((TICK % 5)) -eq 0 ]; then
+            dhcp_health_check "$NOW" "$AP_IF" "$AP_ADDR"
+            [ $((TICK % 5)) -eq 0 ] && dhcp_running &&
                 dhcp_drop_stale_placeholder "$AP_IF" "$AP_ADDR" "$(last_usable_ip "$AP_ADDR")"
-            fi
         fi
     else
         [ -n "$CUR" ] && session_down
@@ -156,7 +147,11 @@ while :; do
                 load_config
                 log "reload requested"
                 rm -f "$RUN/fw_ok"
-                if [ -n "$CUR" ]; then serve_dhcp; fi ;;
+                if [ -n "$CUR" ]; then
+                    fw_del
+                    dhcp_stop
+                    serve_dhcp
+                fi ;;
             up|down) FP="" ;;   # force re-detection
         esac
         sleep 0.3

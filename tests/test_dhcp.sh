@@ -78,7 +78,7 @@ case "$1" in
         printf 'udhcpd\ndumpleases\nflock\n'
         exit 0 ;;
     udhcpd)
-        exec "$HSP_FAKE_UDHCPD" "$@" ;;
+        exec "$HSP_FAKE_UDHCPD" udhcpd "$@" ;;
     dumpleases)
         exit 0 ;;
 esac
@@ -88,17 +88,21 @@ EOF
 #!/bin/sh
 printf 'start %s\n' "$$" >> "$BUSY_LOG"
 printf 'udhcpd-start\n' >> "$ACTION_LOG"
-case "${DHCP_FAKE_MODE:-success}" in
+_mode=${DHCP_FAKE_MODE:-success}
+[ -f "$DHCP_FAKE_CONTROL" ] && _mode=$(cat "$DHCP_FAKE_CONTROL")
+case "$_mode" in
     fail) exit 1 ;;
-    crash)
+    crash|crash-once)
         sleep 0.2
         printf 'crash %s\n' "$$" >> "$BUSY_LOG"
+        [ "$_mode" = crash-once ] && echo success > "$DHCP_FAKE_CONTROL"
         exit 1 ;;
     success)
         trap 'printf "stop %s\n" "$$" >> "$BUSY_LOG"; printf "udhcpd-stop\n" >> "$ACTION_LOG"; exit 0' TERM INT
         while :; do sleep 1; done ;;
+    *)
+        exit 1 ;;
 esac
-exit 1
 EOF
     cat > "$_dt/fake/getprop" <<'EOF'
 #!/bin/sh
@@ -132,7 +136,9 @@ _dhcp_run() { # [VAR=value ...] -- hsp args...
         IPT="$_dt/fake/iptables" HSP_BUSYBOX="$_dt/fake/busybox" \
         HSP_FLOCK=: LOCK_WAIT=3 HSP_START_WAIT=0 \
         HSP_FAKE_UDHCPD="$_dt/fake/udhcpd" \
+        DHCP_FAKE_CONTROL="$_dt/dhcp-mode" \
         HSP_DHCP_FAIL_LIMIT=3 HSP_GW_NO_SPAWN=1 \
+        HSP_DHCP_RETRY_DELAYS="1 1 1" \
         IPT_LOG="$_dt/iptables.log" BUSY_LOG="$_dt/busybox.log" ACTION_LOG="$_dt/actions.log" \
         IPT_STATE="$_dt/ipt-state" HSCTL_LOG="$_dt/hsctl.log" \
         $_envs sh "$_dt/mod/bin/hsp" "$@"
@@ -146,7 +152,9 @@ _dhcp_eval() { # shell body evaluated with common.sh loaded
         IPT="$_dt/fake/iptables" HSP_BUSYBOX="$_dt/fake/busybox" \
         HSP_FLOCK=: \
         HSP_FAKE_UDHCPD="$_dt/fake/udhcpd" \
+        DHCP_FAKE_CONTROL="$_dt/dhcp-mode" \
         HSP_DHCP_FAIL_LIMIT=3 \
+        HSP_DHCP_RETRY_DELAYS="1 1 1" \
         IPT_LOG="$_dt/iptables.log" BUSY_LOG="$_dt/busybox.log" ACTION_LOG="$_dt/actions.log" \
         IPT_STATE="$_dt/ipt-state" HSCTL_LOG="$_dt/hsctl.log" \
         sh -c '. "$MODDIR/lib/common.sh"; load_config; '"$1"
@@ -170,6 +178,9 @@ _dhcp_cleanup_process() {
     [ -n "$_p" ] && kill "$_p" 2>/dev/null
     _dhcp_eval 'dhcp_stop' >/dev/null 2>&1
 }
+
+_jump_present() { [ -f "$_dt/ipt-state/jump" ]; }
+_jump_absent() { [ ! -f "$_dt/ipt-state/jump" ]; }
 
 dhcp_takeover_starts_and_verifies_before_jump() {
     _dhcp_env order || return 1
@@ -196,14 +207,14 @@ udhcpd_start_failure_installs_no_takeover() {
     [ "$_dc_rc" = 1 ] || return 1
     _rs=$(_dhcp_state reason)
     _sv=$(_dhcp_state serving)
-    _fl=$(_dhcp_state failures)
+    _fl=$(_dhcp_state attempts)
     _dg=$(_dhcp_state degraded)
     _mode=$(_dhcp_state state)
     _retry=$(_dhcp_state retry_available)
     [ "$_sv" = 0 ] &&
         [ "$_fl" -ge 1 ] &&
-        [ "$_dg" = 1 ] &&
-        [ "$_mode" = degraded ] &&
+        [ "$_dg" = 0 ] &&
+        [ "$_mode" = retrying ] &&
         [ "$_retry" = 1 ] &&
         [ "$_rs" = "udhcpd 启动失败" ] &&
         ! grep -q ' -N hsp_dhcp' "$_dt/iptables.log" &&
@@ -235,14 +246,17 @@ firewall_failure_removes_jump_before_stopping_udhcpd() {
 
 repeated_crashes_enter_visible_degraded_mode() {
     _dhcp_env crashes || return 1
-    _dhcp_eval 'dhcp_session_begin; dhcp_set serving 1
+    _dhcp_eval 'dhcp_session_begin; dhcp_set state serving; dhcp_set serving 1
+        dhcp_crash "synthetic udhcpd exit"
+        [ "$(dhcp_get state)" = retrying ] || exit 1
+        [ "$(dhcp_get degraded)" = 0 ] || exit 1
+        dhcp_set state serving; dhcp_set serving 1
+        dhcp_crash "synthetic udhcpd exit"
+        [ "$(dhcp_get attempts)" = 2 ] || exit 1
+        dhcp_set state serving; dhcp_set serving 1
         dhcp_crash "synthetic udhcpd exit"
         [ "$(dhcp_get degraded)" = 1 ] || exit 1
-        dhcp_crash "synthetic udhcpd exit"
-        [ "$(dhcp_get failures)" = 2 ] || exit 1
-        dhcp_crash "synthetic udhcpd exit"
-        [ "$(dhcp_get degraded)" = 1 ] || exit 1
-        [ "$(dhcp_get failures)" = 3 ] || exit 1
+        [ "$(dhcp_get attempts)" = 3 ] || exit 1
         [ "$(dhcp_get retry_available)" = 1 ]' || return 1
     [ "$(_dhcp_state degraded)" = 1 ] &&
         [ "$(_dhcp_state reason)" = "udhcpd 连续异常退出" ] &&
@@ -253,39 +267,44 @@ repeated_crashes_enter_visible_degraded_mode() {
 repeated_crash_retry_cycles_eventually_degrade() {
     _dhcp_env crash-window || return 1
     _dhcp_eval 'dhcp_session_begin
+        dhcp_set state serving
         dhcp_set serving 1
         dhcp_crash "crash 1"
-        _f1=$(dhcp_get failures)
+        _f1=$(dhcp_get attempts)
         DHCP_FAKE_MODE=success dhcp_retry wlan2 192.168.42.1/24 || exit 1
-        [ "$(dhcp_get failures)" = "$_f1" ] || exit 1
+        [ "$(dhcp_get attempts)" = 0 ] || exit 1
+        dhcp_set state serving; dhcp_set serving 1
         dhcp_crash "crash 2"
-        _f2=$(dhcp_get failures)
-        [ "$_f2" = 2 ] || exit 1
+        _f2=$(dhcp_get attempts)
+        [ "$_f2" = 1 ] || exit 1
         DHCP_FAKE_MODE=success dhcp_retry wlan2 192.168.42.1/24 || exit 1
-        [ "$(dhcp_get failures)" = "$_f2" ] || exit 1
+        dhcp_set state serving; dhcp_set serving 1
         dhcp_crash "crash 3"
-        [ "$(dhcp_get degraded)" = 1 ] || exit 1
-        [ "$(dhcp_get failures)" -ge 3 ] || exit 1' || return 1
-    [ "$(_dhcp_state degraded)" = 1 ] &&
+        [ "$(dhcp_get state)" = retrying ] || exit 1
+        [ "$(dhcp_get degraded)" = 0 ] || exit 1' || return 1
+    [ "$(_dhcp_state degraded)" = 0 ] &&
+        [ "$(_dhcp_state state)" = retrying ] &&
         [ "$(_dhcp_state last_error)" = "crash 3" ] &&
         [ "$(_dhcp_state retry_available)" = 1 ]
 }
 
 failures_after_long_idle_still_accumulate() {
     _dhcp_env crash-idle || return 1
-    _dhcp_eval 'dhcp_session_begin; dhcp_set serving 1
+    _dhcp_eval 'dhcp_session_begin; dhcp_set state serving; dhcp_set serving 1
         _now=$(date +%s)
         dhcp_crash "crash 1"
-        [ "$(dhcp_get failures)" = 1 ] || exit 1
+        [ "$(dhcp_get attempts)" = 1 ] || exit 1
+        dhcp_set state serving; dhcp_set serving 1
         dhcp_set last_failure_at $((_now - 1000))
         dhcp_crash "crash 2"
-        [ "$(dhcp_get failures)" = 2 ] || exit 1
+        [ "$(dhcp_get attempts)" = 2 ] || exit 1
+        dhcp_set state serving; dhcp_set serving 1
         dhcp_set last_failure_at $((_now - 1000))
         dhcp_crash "crash 3"
-        [ "$(dhcp_get failures)" = 3 ] || exit 1
+        [ "$(dhcp_get attempts)" = 3 ] || exit 1
         [ "$(dhcp_get degraded)" = 1 ] || exit 1' || return 1
     [ "$(_dhcp_state degraded)" = 1 ] &&
-        [ "$(_dhcp_state failures)" = 3 ] &&
+        [ "$(_dhcp_state attempts)" = 3 ] &&
         [ "$(_dhcp_state last_error)" = "crash 3" ]
 }
 
@@ -293,16 +312,16 @@ stable_health_period_clears_failure_window() {
     _dhcp_env stable-window || return 1
     _dhcp_eval 'dhcp_session_begin
         _now=$(date +%s)
-        dhcp_set failures 2
+        dhcp_set attempts 2
         dhcp_set serving 1
         dhcp_set state serving
         dhcp_set stable_since "$_now"
         DHCP_STABLE_SECS=30
         dhcp_stable_check $((_now + 10))
-        [ "$(dhcp_get failures)" = 2 ] || exit 1
+        [ "$(dhcp_get attempts)" = 2 ] || exit 1
         dhcp_stable_check $((_now + 31))
-        [ "$(dhcp_get failures)" = 0 ] || exit 1' || return 1
-    [ "$(_dhcp_state failures)" = 0 ]
+        [ "$(dhcp_get attempts)" = 0 ] || exit 1' || return 1
+    [ "$(_dhcp_state attempts)" = 0 ]
 }
 
 status_exposes_dhcp_degraded_and_retry() {
@@ -321,7 +340,7 @@ status_exposes_dhcp_degraded_and_retry() {
 
 retry_success_restores_static_leases_without_restart() {
     _dhcp_env retry-ok || return 1
-    _dhcp_eval 'dhcp_session_begin; dhcp_set serving 1
+    _dhcp_eval 'dhcp_session_begin; dhcp_set state serving; dhcp_set serving 1
         dhcp_crash "prior crash"
         dhcp_degrade "udhcpd 连续异常退出" "udhcpd 进程已退出"' || return 1
     _dhcp_run -- dhcp retry > "$_dt/retry.out" 2>&1 || return 1
@@ -329,7 +348,7 @@ retry_success_restores_static_leases_without_restart() {
     _ok=1
     [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
     [ "$(_dhcp_state serving)" = 1 ] || _ok=0
-    [ "$(_dhcp_state failures)" -ge 1 ] || _ok=0
+    [ "$(_dhcp_state attempts)" = 0 ] || _ok=0
     grep -q '^static_lease 02:00:00:00:00:01 192.168.42.150$' "$_dt/data/run/udhcpd.conf" || _ok=0
     [ ! -s "$_dt/hsctl.log" ] || _ok=0
     printf '%s' "$_s" | grep -q '"dhcp_degraded":false' || _ok=0
@@ -361,9 +380,8 @@ lease_add_and_delete_while_serving_do_not_degrade() {
     _ok=1
     [ "$(_dhcp_state serving)" = 1 ] || _ok=0
     [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
-    [ "$(_dhcp_state failures)" = 0 ] || _ok=0
+    grep -q '"dhcp_attempts":0' "$_dt/status.json" || _ok=0
     [ "$(_dhcp_summary dhcp_degraded)" = 0 ] || _ok=0
-    [ -n "$_p1" ] && [ -n "$_p2" ] && [ "$_p1" != "$_p2" ] || _ok=0
     grep -q '^static_lease 02:00:00:00:00:02 192.168.42.160' "$_dt/data/run/udhcpd.conf" || _ok=0
     ! grep -q '^static_lease 02:00:00:00:00:01 ' "$_dt/data/run/udhcpd.conf" || _ok=0
     grep -q '"dhcp_degraded":false' "$_dt/status.json" || _ok=0
@@ -377,7 +395,7 @@ explicit_reset_clears_stale_degraded_state() {
     _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' || return 1
     _dhcp_eval 'dhcp_set state degraded
         dhcp_set degraded 1
-        dhcp_set failures 3
+        dhcp_set attempts 3
         dhcp_set reason ""
         dhcp_set last_error ""
         dhcp_set retry_available 1
@@ -386,7 +404,7 @@ explicit_reset_clears_stale_degraded_state() {
     _s=$(_dhcp_run -- status --json) || return 1
     _ok=1
     [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
-    [ "$(_dhcp_state failures)" = 0 ] || _ok=0
+    [ "$(_dhcp_state attempts)" = 0 ] || _ok=0
     [ "$(_dhcp_state first_failure_at)" = 0 ] || _ok=0
     [ "$(_dhcp_state last_failure_at)" = 0 ] || _ok=0
     [ "$(_dhcp_state retry_available)" = 0 ] || _ok=0
@@ -404,23 +422,23 @@ actual_udhcpd_kill_still_degrades() {
     kill -9 "$_p" 2>/dev/null || return 1
     _i=0; while kill -0 "$_p" 2>/dev/null && [ "$_i" -lt 20 ]; do sleep 0.1; _i=$((_i + 1)); done
     ! kill -0 "$_p" 2>/dev/null || return 1
-    _dhcp_eval 'dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' || return 1
-    [ "$(_dhcp_state degraded)" = 1 ] &&
+    _dhcp_eval 'HSP_DHCP_PIDFILE_TRUST=1 dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' >/dev/null 2>&1 || true
+    [ "$(_dhcp_state degraded)" = 0 ] &&
         [ "$(_dhcp_state reason)" = "udhcpd 连续异常退出" ] &&
         [ "$(_dhcp_state last_error)" = "udhcpd 进程已退出" ] &&
-        [ "$(_dhcp_summary dhcp_degraded)" = 1 ] &&
-        [ "$(_dhcp_state failures)" = 1 ]
+        [ "$(_dhcp_summary dhcp_degraded)" = 0 ] &&
+        [ "$(_dhcp_state attempts)" = 1 ] &&
+        [ "$(_dhcp_state state)" = retrying ] &&
+        grep -q -- ' -D OUTPUT -j hsp_dhcp' "$_dt/iptables.log" &&
+        [ ! -f "$_dt/ipt-state/jump" ]
 }
 
 serving_state_clears_stale_degraded_flag() {
     _dhcp_env stale-clear || return 1
     _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' || return 1
-    _dhcp_eval 'dhcp_set state degraded
-        dhcp_set degraded 1
-        dhcp_set reason ""
-        dhcp_set last_error ""
-        dhcp_summary_write
-        dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' || return 1
+    _dhcp_eval 'echo 1 > "$RUN/fw_ok"
+        dhcp_set next_retry_at 0
+        dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' >/dev/null 2>&1 || return 1
     _ok=1
     [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
     [ "$(_dhcp_state state)" = serving ] || _ok=0
@@ -438,13 +456,61 @@ cleanup_is_idempotent_and_targets_only_hsp_chain() {
         ! grep -q -- ' -X OUTPUT' "$_dt/iptables.log"
 }
 
-daemon_health_check_fail_closes_crashed_udhcpd() {
-    _dhcp_env daemon-crash || return 1
-    grep -q 'dhcp_health_check' "$ROOT/bin/hspd" &&
-        grep -q 'dhcp_crash' "$ROOT/lib/common.sh" &&
-        grep -q 'fw_del' "$ROOT/lib/common.sh" &&
-        grep -q 'dhcp_stop' "$ROOT/lib/common.sh" &&
-        grep -q 'dhcp retry' "$ROOT/bin/hsp"
+consecutive_failures_reach_degraded_budget() {
+    _dhcp_env daemon-degrade || return 1
+    echo fail > "$_dt/dhcp-mode"
+    _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+    _dhcp_eval 'dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+    _dhcp_eval 'dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+    _ok=1
+    _jump_absent || _ok=0
+    [ "$(_dhcp_state attempts)" = 3 ] || _ok=0
+    [ "$(_dhcp_state reason)" = "udhcpd 启动失败" ] || _ok=0
+    [ "$(grep -c '^udhcpd-start$' "$_dt/actions.log")" = 3 ] || _ok=0
+    _dhcp_eval 'dhcp_health_check "$(date +%s)" wlan2 192.168.42.1/24' >/dev/null 2>&1
+    [ "$(grep -c '^udhcpd-start$' "$_dt/actions.log")" = 3 ] || _ok=0
+    _dhcp_cleanup_process
+    [ "$_ok" = 1 ]
+}
+
+initial_failure_then_retry_serves() {
+    _dhcp_env daemon-retry || return 1
+    echo fail > "$_dt/dhcp-mode"
+    _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+    [ "$(_dhcp_state state)" = retrying ] || return 1
+    echo success > "$_dt/dhcp-mode"
+    _dhcp_eval 'dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1 || return 1
+    _ok=1
+    _jump_present || _ok=0
+    [ "$(_dhcp_state serving)" = 1 ] || _ok=0
+    [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
+    _dhcp_cleanup_process
+    [ "$_ok" = 1 ]
+}
+
+manual_retry_recovers_degraded_state() {
+    _dhcp_env daemon-manual || return 1
+    echo fail > "$_dt/dhcp-mode"
+    _dhcp_eval 'dhcp_session_begin && dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+    _dhcp_eval 'dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+    _dhcp_eval 'dhcp_takeover wlan2 192.168.42.1/24' >/dev/null 2>&1
+    [ "$(_dhcp_state attempts)" = 3 ] || return 1
+    echo success > "$_dt/dhcp-mode"
+    _dhcp_run -- dhcp retry > "$_dt/retry.out" 2>&1 || return 1
+    _ok=1
+    _jump_present || _ok=0
+    [ "$(_dhcp_state serving)" = 1 ] || _ok=0
+    [ "$(_dhcp_state degraded)" = 0 ] || _ok=0
+    [ "$(_dhcp_state attempts)" = 0 ] || _ok=0
+    grep -q '自建 DHCP 已恢复' "$_dt/retry.out" || _ok=0
+    _dhcp_cleanup_process
+    [ "$_ok" = 1 ]
+}
+
+cli_retry_is_wired_to_existing_entry() {
+    grep -q 'dhcp retry' "$ROOT/webroot/index.html" &&
+        grep -q 'dhcp)' "$ROOT/bin/hsp" &&
+        grep -q 'do_dhcp_retry' "$ROOT/bin/hsp"
 }
 
 ui_shows_chinese_degraded_warning_and_retry() {
@@ -469,5 +535,8 @@ run_case "explicit reset clears degraded state" explicit_reset_clears_stale_degr
 run_case "actual udhcpd kill still degrades" actual_udhcpd_kill_still_degrades
 run_case "healthy serving clears stale degraded" serving_state_clears_stale_degraded_flag
 run_case "DHCP cleanup is idempotent and exact" cleanup_is_idempotent_and_targets_only_hsp_chain
-run_case "daemon fail-closes a crashed udhcpd" daemon_health_check_fail_closes_crashed_udhcpd
+run_case "consecutive failures reach degraded budget" consecutive_failures_reach_degraded_budget
+run_case "initial failure then retry serves" initial_failure_then_retry_serves
+run_case "manual retry recovers degraded state" manual_retry_recovers_degraded_state
+run_case "CLI retry entry is wired" cli_retry_is_wired_to_existing_entry
 run_case "UI shows Chinese degraded warning and retry" ui_shows_chinese_degraded_warning_and_retry
