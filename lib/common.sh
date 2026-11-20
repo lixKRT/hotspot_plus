@@ -216,16 +216,39 @@ last_usable_ip() { # ip/prefix -> last usable host address
     _lu_size=$(( 1 << (32 - _lu_pfx) ))
     int2ip $(( _lu_n + _lu_size - 2 ))
 }
-wait_dhcp_ready() { # seconds; AP interface exists and its Android DhcpServer is up
+wait_dhcp_ready() { # iface [seconds]; interface has IPv4 and one Android DhcpServer sample names it
+    _wdi=$1
+    _wds=${2:-12}
+    _wdsys=${HSP_SYSFS_NET:-/sys/class/net}
+    case "$_wdi" in ''|*[!A-Za-z0-9_.-]*) echo "AP probe failed: invalid interface" >&2; return 1 ;; esac
+    case "$_wds" in ''|*[!0-9]*) _wds=12 ;; esac
     _wd=0
-    while [ "$_wd" -lt "$1" ]; do
-        if [ -d "/sys/class/net/$AP_IF" ] && \
-           tmo 2 "dumpsys wifi" sh -c 'dumpsys wifi 2>/dev/null | grep -q "mApInterfaceName: wlan2"' ; then
-            return 0
+    while [ "$_wd" -lt "$_wds" ]; do
+        if [ -d "$_wdsys/$_wdi" ] && \
+           $IPB -4 addr show dev "$_wdi" 2>/dev/null | grep -q 'inet '; then
+            break
         fi
         sleep 1; _wd=$((_wd+1))
     done
-    return 1
+    if [ ! -d "$_wdsys/$_wdi" ] || \
+       ! $IPB -4 addr show dev "$_wdi" 2>/dev/null | grep -q 'inet '; then
+        echo "$_wdi not ready after ${_wds}s (interface or IPv4 missing)" >&2
+        return 1
+    fi
+    # One sample only: this probe runs on the hotspot start path, and a dumpsys loop
+    # is a known wakeup/crash trigger. A missing, failed, or empty sample leaves the
+    # lightweight interface/IPv4 checks authoritative; a reported interface must match.
+    if command -v dumpsys >/dev/null 2>&1; then
+        _wdo=$(tmo 2 "dumpsys wifi" dumpsys wifi 2>/dev/null) || _wdo=
+        _wdq=$(printf '%s\n' "$_wdo" | grep "mApInterfaceName:" | head -n1)
+        if [ -n "$_wdq" ]; then
+            case "$_wdq" in
+                *"mApInterfaceName: $_wdi"*) ;;
+                *) echo "$_wdi is not the Android DhcpServer interface" >&2; return 1 ;;
+            esac
+        fi
+    fi
+    return 0
 }
 
 # Map an address configured in the "configured" subnet onto the actual subnet (keeps host part).

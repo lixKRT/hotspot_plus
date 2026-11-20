@@ -38,6 +38,7 @@ TL=""           # cached tethered iface list
 TICK=0
 TL_AT=0
 MON_PID=""
+PROBE_FAILED=""
 
 cleanup() {
     log "daemon exit"
@@ -65,6 +66,7 @@ session_down() {
     fw_del
     dhcp_stop
     CUR=""
+    PROBE_FAILED=""
     rm -f "$RUN/session"
     dhcp_set state idle
     dhcp_set serving 0
@@ -76,6 +78,7 @@ session_down() {
 session_up() {
     log "AP up: $AP_IF $AP_ADDR"
     CUR="$AP_IF $AP_ADDR"
+    PROBE_FAILED=""
     echo "$CUR $(date +%s)" > "$RUN/session"
     dhcp_session_begin
     gw_observe "$AP_IF" "$AP_ADDR"
@@ -83,15 +86,17 @@ session_up() {
     # keeps the hotspot usable, so DHCP still serves the (mapped) actual subnet meanwhile.
     gw_pending && return
     if [ "$DHCP_ENABLE" = 1 ]; then
+        # Probe once per hotspot session. A failed probe has already handed DHCP back
+        # to the system; repeating it on every poll would only add wakeups.
+        [ -n "$PROBE_FAILED" ] && return
         # Do not call wait_hotspot_ready here: on this ROM Tethering may never put a
-        # default route in the AP's table. Wait for the interface itself plus the
-        # system DHCP listener, which is the real precondition for udhcpd.
-        if ! wait_dhcp_ready "${HSP_DHCP_READY_WAIT:-12}"; then
-            # Don't block takeover on this probe: udhcpd itself refuses to start if
-            # wlan2 is still being recreated, and retrying here would leave two DHCP
-            # responders active until the next poll. Proceed and let the real start
-            # attempt decide.
-            log "AP interface probe timed out; trying udhcpd anyway"
+        # default route in the AP's table. Wait for the actual AP interface to have
+        # IPv4, then sample the system DHCP listener at most once.
+        if ! wait_dhcp_ready "$AP_IF" "${HSP_DHCP_READY_WAIT:-12}"; then
+            log "ERROR: AP interface probe failed for $AP_IF; system DHCP keeps the hotspot usable"
+            dhcp_degrade "AP 接口探测失败" "$AP_IF 未就绪或 mApInterfaceName 不匹配"
+            PROBE_FAILED=1
+            return
         fi
     fi
     serve_dhcp

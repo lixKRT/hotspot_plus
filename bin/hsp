@@ -37,22 +37,13 @@ wait_ap() { # wait_ap up|down seconds
     return 1
 }
 
-# Wait until Tethering has installed the hotspot route. This is the observable point
-# where the downstream interface and system DHCP are ready; starting udhcpd earlier
-# races with the kernel tearing down / recreating wlan2.
-wait_hotspot_ready() { # seconds
-    _i=0
-    while [ $_i -lt "$1" ]; do
-        ap_detect && [ -d "/sys/class/net/$AP_IF" ] && {
-            _r=$($IPB -4 route show table all 2>/dev/null | awk -v iface="$AP_IF" '
-                $1 == "default" && $0 ~ ("dev " iface "($| )") { found = 1 }
-                END { exit !found }')
-            [ "$_r" = 1 ] && return 0
-        }
-        sleep 1; _i=$((_i+1))
-    done
-    log "WARN: hotspot default route on $AP_IF not observed after ${1}s"
-    return 1
+# Wait until the actual hotspot interface has IPv4. This ROM may never install a
+# default route in the AP table, so route presence cannot be a start precondition.
+wait_hotspot_ready() { # iface
+    _whi=$1
+    case "$_whi" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+    [ -d "/sys/class/net/$_whi" ] && \
+        $IPB -4 addr show dev "$_whi" 2>/dev/null | grep -q 'inet '
 }
 
 b64d() { echo "$1" | base64 -d 2>/dev/null; }
@@ -159,7 +150,8 @@ do_on() {
     # shellcheck disable=SC2086
     _wait=${HSP_START_WAIT:-20}
     if wait_ap up "$_wait"; then
-        wait_hotspot_ready 12 || true
+        wait_hotspot_ready "$AP_IF" || \
+            log "WARN: hotspot interface $AP_IF has no IPv4; start continues"
         LIFECYCLE_RESULT=started
         say "热点已开启：$AP_IF $AP_ADDR"
         gw_observe "$AP_IF" "$AP_ADDR"

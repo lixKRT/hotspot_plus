@@ -21,6 +21,9 @@ EOF
     cat > "$_lt/bin/ip" <<'EOF'
 #!/bin/sh
 case "$*" in
+    *"addr show dev"*|*"-4 addr show dev"*)
+        [ -f "$AP_STATE_FILE" ] && printf '%s\n' "2: wlan2    inet 192.168.42.1/24 scope global wlan2"
+        ;;
     *"-o addr show"*)
         [ -f "$AP_STATE_FILE" ] && printf '%s\n' "2: wlan2    inet 192.168.42.1/24 scope global wlan2"
         ;;
@@ -54,7 +57,21 @@ case "$_sub" in
 esac
 exit 0
 EOF
-    chmod +x "$_lt/bin/getprop" "$_lt/bin/ip" "$_lt/bin/iptables" "$_lt/bin/app_process"
+    cat > "$_lt/bin/dumpsys" <<'EOF'
+#!/bin/sh
+[ -n "${DUMPSYS_LOG:-}" ] && printf '%s\n' "$*" >> "$DUMPSYS_LOG"
+exit 0
+EOF
+    cat > "$_lt/bin/busybox" <<'EOF'
+#!/bin/sh
+case "$1" in
+    --list) printf 'flock\n' ;;
+esac
+exit 0
+EOF
+    chmod +x "$_lt/bin/getprop" "$_lt/bin/ip" "$_lt/bin/iptables" "$_lt/bin/app_process" \
+        "$_lt/bin/busybox" \
+        "$_lt/bin/dumpsys"
 }
 
 _lifecycle_config() { # AUTO SIM [extra]
@@ -78,7 +95,9 @@ _lifecycle_run() { # [VAR=value ...] -- hsp args...
     # shellcheck disable=SC2086
     env PATH="$_lt/bin:$PATH" HSP_DATA="$_lt/data" HSP_APP_PROCESS="$_lt/bin/app_process" \
         IPB="$_lt/bin/ip" IPT="$_lt/bin/iptables" GETPROP_LOG="$_lt/getprop.log" \
+        HSP_BUSYBOX="$_lt/bin/busybox" \
         SIM_STATE_FILE="$_lt/sim" AP_STATE_FILE="$_lt/ap" HSCTL_LOG="$_lt/hsctl.log" \
+        DUMPSYS_LOG="$_lt/dumpsys.log" \
         HSCTL_MODE="${HSCTL_MODE:-ok}" $_envs sh "$ROOT/bin/hsp" "$@"
 }
 
@@ -318,11 +337,18 @@ service_boot_path_is_one_shot_and_independent() {
             "$ROOT/bin/hsp" "$ROOT/bin/hspd" "$ROOT/lib" "$ROOT/service.sh"
 }
 
-hotspot_start_waits_for_tether_route() {
-    grep -q 'wait_hotspot_ready 12' "$ROOT/bin/hsp" &&
-        grep -q 'wait_dhcp_ready 12' "$ROOT/bin/hspd" &&
-        grep -q 'sys/class/net/\$AP_IF' "$ROOT/bin/hsp" &&
-        grep -q 'dev " iface' "$ROOT/bin/hsp"
+hotspot_start_does_not_block_on_missing_route() {
+    _lifecycle_env wait-timeout || return 1
+    _lifecycle_fakes
+    _lifecycle_config 0 LOADED
+    printf '%s\n' LOADED > "$_lt/sim"
+    _start=$(date +%s)
+    _lifecycle_run -- on > "$_lt/out" 2>&1 || return 1
+    _elapsed=$(( $(date +%s) - _start ))
+    [ "$(_lifecycle_status | _json 'd["last_result"]')" = started ] &&
+        [ "$(_lifecycle_status | _json 'd["ap"]')" = True ] &&
+        [ "$_elapsed" -le 2 ] &&
+        ! grep -q 'default route' "$_lt/data/logs/hsp.log"
 }
 
 default_tethering_is_module_owned() {
@@ -335,9 +361,9 @@ default_tethering_is_module_owned() {
 }
 
 own_dhcp_has_bounded_start_attempts() {
-    grep -q 'DHCP_TRIED=0' "$ROOT/bin/hspd" &&
-        grep -q '\[ "\$DHCP_TRIED" = 0 \]' "$ROOT/bin/hspd" &&
-        grep -q 'one startup attempt for this session' "$ROOT/bin/hspd"
+    grep -q 'dhcp_session_begin' "$ROOT/bin/hspd" &&
+        grep -q 'dhcp_takeover "\$AP_IF" "\$AP_ADDR"' "$ROOT/bin/hspd" &&
+        ! grep -q 'DHCP_TRIED' "$ROOT/bin/hspd"
 }
 
 static_clients_renew_after_takeover() {
@@ -365,7 +391,7 @@ run_case "restart stops before starting" restart_stops_before_start
 run_case "stop reports and leaves AP off" stop_reports_and_leaves_ap_off
 run_case "status JSON survives error text" status_json_survives_error_text
 run_case "service boot path is one-shot and independent" service_boot_path_is_one_shot_and_independent
-run_case "hotspot start waits for tether route" hotspot_start_waits_for_tether_route
+run_case "hotspot start does not block on missing route" hotspot_start_does_not_block_on_missing_route
 run_case "default hotspot DHCP is module-owned" default_tethering_is_module_owned
 run_case "own DHCP has bounded start attempts" own_dhcp_has_bounded_start_attempts
 run_case "static clients renew after DHCP takeover" static_clients_renew_after_takeover
