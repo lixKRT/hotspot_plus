@@ -4,14 +4,28 @@
 # The android/* stubs in src/stubs are compile-time only and are NOT packaged.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-R8=${R8:-/tmp/tools/r8-8.13.19.jar}
-B=$(mktemp -d)
+B=${B:-$(mktemp -d)}
+OUT=${OUT:-"$HERE/../bin/hsctl.jar"}
 mkdir -p "$B/stubs" "$B/cls" "$B/dex"
-javac --release 8 -nowarn -d "$B/stubs" "$HERE"/stubs/android/os/*.java
-(cd "$B/stubs" && jar cf ../stubs.jar .)
-javac --release 8 -Xlint:-options -cp "$B/stubs.jar" -d "$B/cls" "$HERE"/java/com/hsp/*.java
-java -cp "$R8" com.android.tools.r8.D8 --release --min-api 30 --classpath "$B/stubs.jar" \
-    --output "$B/dex" "$B"/cls/com/hsp/*.class
-(cd "$B/dex" && rm -f "$HERE/../bin/hsctl.jar" && zip -q -X "$HERE/../bin/hsctl.jar" classes.dex)
+
+# Compile the android/* stubs, HsCtl and the dex. Tests call this too, so the jar
+# is always compared against the current source rather than a stale artifact.
+build_dex() {
+    R8=${R8:-/tmp/tools/r8-8.13.19.jar}
+    javac --release 8 -nowarn -d "$B/stubs" "$HERE"/stubs/android/os/*.java
+    (cd "$B/stubs" && jar cf ../stubs.jar .)
+    javac --release 8 -Xlint:-options -cp "$B/stubs.jar" -d "$B/cls" "$HERE"/java/com/hsp/*.java
+    java -cp "$R8" com.android.tools.r8.D8 --release --min-api 30 --classpath "$B/stubs.jar" \
+        --output "$B/dex" "$B"/cls/com/hsp/*.class
+}
+
+build_dex
+mkdir -p "$(dirname "$OUT")"
+rm -f "$OUT"
+if command -v zip >/dev/null 2>&1; then
+    (cd "$B/dex" && zip -q -X "$OUT" classes.dex)
+else
+    (cd "$B/dex" && jar --create --file "$OUT" --no-manifest classes.dex)
+fi
 rm -rf "$B"
-echo "built $HERE/../bin/hsctl.jar"
+echo "built $OUT"

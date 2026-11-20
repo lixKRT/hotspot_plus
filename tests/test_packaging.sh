@@ -75,6 +75,49 @@ installer_is_manager_neutral() {
         grep -q '管理器: Magisk' "$ROOT/customize.sh"
 }
 
+hsctl_jar_matches_source() {
+    _missing=
+    for _tool in javac jar java unzip sha256sum; do
+        command -v "$_tool" >/dev/null 2>&1 || _missing="$_missing $_tool"
+    done
+    [ -z "$_missing" ] || {
+        printf 'SKIP: hsctl source/artifact check needs:%s\n' "$_missing"
+        return 0
+    }
+    _r8=${R8:-/tmp/tools/r8-8.13.19.jar}
+    if [ ! -f "$_r8" ]; then
+        printf 'SKIP: hsctl source/artifact check needs R8 8.13.19 (R8=%s)\n' "$_r8"
+        return 0
+    fi
+    _hsctl_tmp=$TMPROOT/hsctl-rebuild
+    mkdir -p "$_hsctl_tmp/dex" || return 1
+    B=$_hsctl_tmp/dex OUT=$_hsctl_tmp/hsctl.jar R8=$_r8 \
+        sh "$ROOT/src/build-dex.sh" >/dev/null || {
+        printf 'FAIL: hsctl rebuild from src/java failed (R8=%s)\n' "$_r8"
+        return 1
+    }
+    unzip -p "$_hsctl_tmp/hsctl.jar" classes.dex > "$_hsctl_tmp/built.dex" || return 1
+    unzip -p "$ROOT/bin/hsctl.jar" classes.dex > "$_hsctl_tmp/shipped.dex" || return 1
+    _built_hash=$(sha256sum "$_hsctl_tmp/built.dex" | cut -d' ' -f1)
+    _shipped_hash=$(sha256sum "$_hsctl_tmp/shipped.dex" | cut -d' ' -f1)
+    [ "$_built_hash" = "$_shipped_hash" ] || {
+        printf 'FAIL: bin/hsctl.jar classes.dex differs from current src/java rebuild\n'
+        printf '  built=%s\n  shipped=%s\n' "$_built_hash" "$_shipped_hash"
+        return 1
+    }
+    if command -v zip >/dev/null 2>&1; then
+        _zip_tmp=$TMPROOT/hsctl-rebuild-zip
+        mkdir -p "$_zip_tmp/dex" || return 1
+        B=$_zip_tmp/dex OUT=$_zip_tmp/hsctl.jar R8=$_r8 \
+            sh "$ROOT/src/build-dex.sh" >/dev/null || return 1
+        unzip -p "$_zip_tmp/hsctl.jar" classes.dex > "$_zip_tmp/built.dex" || return 1
+        [ "$(sha256sum "$_zip_tmp/built.dex" | cut -d' ' -f1)" = "$_shipped_hash" ] || {
+            printf 'FAIL: zip and jar packaging produce different classes.dex\n'
+            return 1
+        }
+    fi
+}
+
 package_omits_private_and_binary_artifacts() {
     [ -n "$PYTHON" ] || return 1
     _outdir=$TMPROOT/package-test
@@ -88,9 +131,10 @@ package_omits_private_and_binary_artifacts() {
     if [ "$_has_apk" = 1 ]; then
         printf '%s\n' "$_pkgout" | grep -q 'warning:.*module-only' || return 1
     fi
-    _out=$("$PYTHON" - "$_outdir" <<'PY'
+    _out=$("$PYTHON" - "$ROOT" "$_outdir" <<'PY'
 import glob, os, re, sys, zipfile
-outdir = sys.argv[1]
+root = sys.argv[1]
+outdir = sys.argv[2]
 pkgs = glob.glob(os.path.join(outdir, "hotspot_plus-v*.zip"))
 if len(pkgs) != 1:
     sys.exit("expected one package, found %d" % len(pkgs))
@@ -107,6 +151,14 @@ with zipfile.ZipFile(pkgs[0]) as z:
     missing = [n for n in required if n not in names]
     if missing:
         print("missing entries: " + ", ".join(missing), file=sys.stderr)
+        sys.exit(1)
+    if "bin/hsctl.jar" not in names:
+        print("missing entry: bin/hsctl.jar", file=sys.stderr)
+        sys.exit(1)
+    with open(os.path.join(root, "bin", "hsctl.jar"), "rb") as f:
+        shipped_jar = f.read()
+    if z.read("bin/hsctl.jar") != shipped_jar:
+        print("bin/hsctl.jar in package differs from the repository artifact", file=sys.stderr)
         sys.exit(1)
     for n in names:
         if n.endswith("/"):
@@ -135,5 +187,6 @@ run_case "default subnet is 192.168.42.0/24" default_subnet_is_42
 run_case "shipped files use LF" shipped_files_are_lf
 run_case ".gitattributes covers shipped text" gitattributes_covers_shipped_text
 run_case "installer is Magisk/KernelSU neutral" installer_is_manager_neutral
+run_case "hsctl.jar matches current source" hsctl_jar_matches_source
 run_case "package excludes private/binary artifacts" package_omits_private_and_binary_artifacts
 run_case "package requires APK when --include-app is used" package_refuses_include_app_without_apk
