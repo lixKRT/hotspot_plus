@@ -318,6 +318,35 @@ service_boot_path_is_one_shot_and_independent() {
             "$ROOT/bin/hsp" "$ROOT/bin/hspd" "$ROOT/lib" "$ROOT/service.sh"
 }
 
+hotspot_start_waits_for_tether_route() {
+    grep -q 'wait_hotspot_ready 12' "$ROOT/bin/hsp" &&
+        grep -q 'wait_dhcp_ready 12' "$ROOT/bin/hspd" &&
+        grep -q 'sys/class/net/\$AP_IF' "$ROOT/bin/hsp" &&
+        grep -q 'dev " iface' "$ROOT/bin/hsp"
+}
+
+default_tethering_is_module_owned() {
+    grep -q '^FIXED_GATEWAY="1"$' "$ROOT/defaults/config.conf" &&
+        grep -q '^DHCP_ENABLE="1"$' "$ROOT/defaults/config.conf" &&
+        grep -q '^ENFORCE_GATEWAY="0"$' "$ROOT/defaults/config.conf" &&
+        grep -q '^    FIXED_GATEWAY=1$' "$ROOT/lib/common.sh" &&
+        grep -q '^    DHCP_ENABLE=1$' "$ROOT/lib/common.sh" &&
+        grep -q '^    ENFORCE_GATEWAY=0$' "$ROOT/lib/common.sh"
+}
+
+own_dhcp_has_bounded_start_attempts() {
+    grep -q 'DHCP_TRIED=0' "$ROOT/bin/hspd" &&
+        grep -q '\[ "\$DHCP_TRIED" = 0 \]' "$ROOT/bin/hspd" &&
+        grep -q 'one startup attempt for this session' "$ROOT/bin/hspd"
+}
+
+static_clients_renew_after_takeover() {
+    grep -q 'dhcp_release_placeholder_clients' "$ROOT/bin/hspd" &&
+        grep -q 'dhcp_drop_stale_placeholder' "$ROOT/bin/hspd" &&
+        grep -q 'lease_ip_for_mac' "$ROOT/lib/common.sh" &&
+        grep -q 'client .* at .* will re-acquire' "$ROOT/lib/common.sh"
+}
+
 run_case "boot decision matrix" boot_decision_matrix
 run_case "AUTO_START defaults off" default_auto_start_is_off
 run_case "boot disabled does not read SIM" boot_disabled_does_not_read_sim
@@ -336,3 +365,7 @@ run_case "restart stops before starting" restart_stops_before_start
 run_case "stop reports and leaves AP off" stop_reports_and_leaves_ap_off
 run_case "status JSON survives error text" status_json_survives_error_text
 run_case "service boot path is one-shot and independent" service_boot_path_is_one_shot_and_independent
+run_case "hotspot start waits for tether route" hotspot_start_waits_for_tether_route
+run_case "default hotspot DHCP is module-owned" default_tethering_is_module_owned
+run_case "own DHCP has bounded start attempts" own_dhcp_has_bounded_start_attempts
+run_case "static clients renew after DHCP takeover" static_clients_renew_after_takeover

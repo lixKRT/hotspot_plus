@@ -7,8 +7,6 @@
 #   clients [--json]                   已连接设备 (IP/MAC/主机名)
 #   apply                              重新加载配置（需要时重启热点 / DHCP）
 #   config --json                      输出配置 + 静态租约 (WebUI 用)
-#   dhcp retry                         仅重试自建 DHCP，不重启热点
-#   dhcp reset                         手动清除 DHCP 连续失败窗口
 #   set KEY=VALUE [KEY=VALUE ...]      修改配置（带校验）
 #   lease list | add <MAC> <IP> [备注] | del <MAC> | import <base64>
 #   backup [list|export DIR] | restore DIR [--yes] | restore-prompt | restore-dismiss
@@ -38,14 +36,34 @@ wait_ap() { # wait_ap up|down seconds
     return 1
 }
 
-client_placeholder() { # last usable address of configured subnet, used only for Android's single-client DhcpServer
-    _m=$(pfx2mask_int "$PREFIX"); _n=$(( $(ip2int "$GATEWAY") & _m )); _sz=$(( 1 << (32 - PREFIX) ))
+# Wait until Tethering has installed the hotspot route. This is the observable point
+# where the downstream interface and system DHCP are ready; starting udhcpd earlier
+# races with the kernel tearing down / recreating wlan2.
+wait_hotspot_ready() { # seconds
+    _i=0
+    while [ $_i -lt "$1" ]; do
+        ap_detect && [ -d "/sys/class/net/$AP_IF" ] && {
+            _r=$($IPB -4 route show table all 2>/dev/null | awk -v iface="$AP_IF" '
+                $1 == "default" && $0 ~ ("dev " iface "($| )") { found = 1 }
+                END { exit !found }')
+            [ "$_r" = 1 ] && return 0
+        }
+        sleep 1; _i=$((_i+1))
+    done
+    log "WARN: hotspot default route on $AP_IF not observed after ${1}s"
+    return 1
+}
+
+b64d() { echo "$1" | base64 -d 2>/dev/null; }
+
+client_placeholder() { # a system-DHCP-only client slot outside the user pool
+    _m=$(pfx2mask_int "$PREFIX")
+    _n=$(( $(ip2int "$GATEWAY") & _m ))
+    _sz=$(( 1 << (32 - PREFIX) ))
     _c=$(int2ip $(( _n + _sz - 2 )))
     [ "$_c" = "$GATEWAY" ] && _c=$(int2ip $(( _n + _sz - 3 )))
     echo "$_c"
 }
-
-b64d() { echo "$1" | base64 -d 2>/dev/null; }
 
 fallback_start() {
     # 1) saved config via IWifiManager, 2) WifiConfigStoreSoftAp.xml, 3) FALLBACK_SSID/FALLBACK_PASS from config
@@ -140,6 +158,7 @@ do_on() {
     # shellcheck disable=SC2086
     _wait=${HSP_START_WAIT:-20}
     if wait_ap up "$_wait"; then
+        wait_hotspot_ready 12 || true
         LIFECYCLE_RESULT=started
         say "热点已开启：$AP_IF $AP_ADDR"
         gw_observe "$AP_IF" "$AP_ADDR"
@@ -295,18 +314,6 @@ do_status_json() {
     _fw=false; [ -n "$_if" ] && fw_check "$_if" && _fw=true
     _dm=false; [ -n "$(daemon_pid)" ] && _dm=true
     _udh=false; bb_has udhcpd && _udh=true
-    _dd=$(dhcp_get degraded); [ -n "$_dd" ] || _dd=0
-    _dmode=$(dhcp_get state); [ -n "$_dmode" ] || _dmode=idle
-    _dreason=$(dhcp_get reason)
-    _dlerr=$(dhcp_get last_error)
-    _dretry=$(dhcp_get retry_available); [ -n "$_dretry" ] || _dretry=0
-    if [ "$_dd" = 1 ]; then
-        _dmode=degraded
-    elif [ "$_dmode" = idle ] && [ "$_dhcp" = true ]; then
-        _dmode=serving
-    fi
-    _ddf=false; [ "$_dd" = 1 ] && _ddf=true
-    _dra=false; [ "$_dretry" = 1 ] && _dra=true
     _eb=false; { [ -f "$RUN/enforce_broken" ] || [ "$(gw_status_value degraded)" = 1 ]; } && _eb=true
     _gr=$(gw_status_value result); [ -n "$_gr" ] || _gr=not_run
     _grr=$(gw_status_value reason)
@@ -343,8 +350,6 @@ do_status_json() {
     printf '"fixed_gateway":%s,"dhcp_enable":%s,"dhcp_running":%s,"fw_ok":%s,"daemon":%s,"udhcpd_available":%s,' \
         "$([ "$FIXED_GATEWAY" = 1 ] && echo true || echo false)" "$([ "$DHCP_ENABLE" = 1 ] && echo true || echo false)" \
         "$_dhcp" "$_fw" "$_dm" "$_udh"
-    printf '"dhcp_mode":"%s","dhcp_degraded":%s,"dhcp_reason":"%s","dhcp_last_error":"%s","dhcp_retry_available":%s,' \
-        "$(json_esc "$_dmode")" "$_ddf" "$(json_esc "$_dreason")" "$(json_esc "$_dlerr")" "$_dra"
     printf '"op_busy":%s,"op_name":"%s","op_pid":"%s","op_age":"%s",' "$_opb" "$H_OP" "$H_PID" "$H_AGE"
     printf '"auto_start":%s,"boot_decision":"%s","boot_result":"%s","boot_sim":"%s","boot_error":"%s","boot_at":"%s",' \
         "$([ "$AUTO_START" = 1 ] && echo true || echo false)" "$(json_esc "$_bd")" "$(json_esc "$_br")" \
@@ -371,13 +376,6 @@ do_status_text() {
     esac
     echo "配置网关: $GATEWAY/$PREFIX (固定=$FIXED_GATEWAY 强制=$ENFORCE_GATEWAY)"
     echo "DHCP: enable=$DHCP_ENABLE running=$(dhcp_running && echo yes || echo no) udhcpd=$(bb_has udhcpd && echo yes || echo no)"
-    if [ "$(dhcp_get degraded)" = 1 ]; then
-        echo "自建 DHCP: 已降级，系统 DHCP 接管（原因: $(dhcp_get reason)）"
-        echo "  最近错误: $(dhcp_get last_error)"
-        echo "  重试: 可用（hsp dhcp retry，不会重启热点）"
-    elif [ "$(dhcp_get state)" = serving ]; then
-        echo "自建 DHCP: 接管确认（$FW_CHAIN/OUTPUT）"
-    fi
     [ -n "$AP_IF" ] && echo "防火墙拦截系统DHCP: $(fw_check "$AP_IF" && echo yes || echo no)"
     echo "守护进程: $([ -n "$(daemon_pid)" ] && echo "运行中 pid $(daemon_pid)" || echo 未运行)"
     if lock_busy; then lock_holder_info; echo "操作锁: 被占用 ${H_OP:-?} pid=${H_PID:-?} ${H_AGE:-?}s"; else echo "操作锁: 空闲"; fi
@@ -622,50 +620,6 @@ do_set() {
     echo "已保存"
 }
 
-lease_import_file() { # path -> replace leases from canonical "MAC IP [备注]" lines
-    _src=$1
-    [ -f "$_src" ] || { echo "导入文件不存在: $_src"; return 1; }
-    _out=$LEASES.new
-    : > "$_out"
-    _err=$(while IFS= read -r _l || [ -n "$_l" ]; do
-        case "$_l" in ''|'#'*) continue ;; esac
-        _lm=${_l%% *}; _rest=${_l#* }
-        _li=${_rest%% *}; _lr=${_rest#* }
-        [ "$_lm" != "$_li" ] || continue
-        [ "$_li" != "$_rest" ] || _lr=""
-        _lv=$(lease_validate_line "$_lm" "$_li" "$_lr") || { echo "$_lv"; break; }
-        echo "$_lv"
-    done < "$_src" > "$_out")
-    _rc=$?
-    if [ "$_rc" -ne 0 ] || [ -n "$_err" ]; then
-        rm -f "$_out"
-        echo "${_err:-导入失败}"
-        return 1
-    fi
-    { echo "# MAC IP 备注   (hotspot_plus 静态租约，WebUI 生成)"; cat "$_out"; } > "$LEASES.tmp" \
-        && mv -f "$LEASES.tmp" "$LEASES"
-    rm -f "$_out"
-    log "leases imported from file: $(grep -vc '^#' "$LEASES") entries"
-    echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约"
-}
-lease_stage_stdin() { # write canonical stdin to fixed import path; do not replace leases yet
-    _dst=$1
-    _src=$(mktemp 2>/dev/null || echo "$DATA/stage.$$")
-    [ "$_dst" = "$LEASE_IMPORT" ] || { echo "无效导入暂存路径"; return 1; }
-    cat > "$_src" || { rm -f "$_src"; echo "读取暂存数据失败"; return 1; }
-    _err=$(while IFS= read -r _l || [ -n "$_l" ]; do
-        case "$_l" in ''|'#'*) continue ;; esac
-        _lm=${_l%% *}; _rest=${_l#* }
-        _li=${_rest%% *}; _lr=${_rest#* }
-        [ "$_li" != "$_rest" ] || _lr=""
-        _lv=$(lease_validate_line "$_lm" "$_li" "$_lr") || { echo "$_lv"; break; }
-    done < "$_src")
-    if [ -n "$_err" ]; then rm -f "$_src"; echo "$_err"; return 1; fi
-    _n=$(grep -vcE '^[[:space:]]*(#|$)' "$_src" 2>/dev/null || true)
-    [ "$_n" -gt 0 ] || { rm -f "$_src"; echo "未提供静态租约"; return 1; }
-    mv -f "$_src" "$_dst" || { rm -f "$_src"; echo "写入暂存文件失败"; return 1; }
-    echo "已暂存 $_n 条静态租约"
-}
 do_lease() {
     _sub=$1; shift
     case "$_sub" in
@@ -774,11 +728,8 @@ EOF
             mv -f "$LEASES.import.$$" "$LEASES"
             rm -f "$_staging"
             log "leases imported: $(grep -vc '^#' "$LEASES") entries"
-            echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约" ;;
-        import-file)
-            lease_import_file "$1" ;;
-        stage)
-            lease_stage_stdin "$1" ;;
+            echo "已保存 $(grep -vc '^#' "$LEASES") 条静态租约"
+            _lease_apply_if_running ;;
         apply)
             if ap_detect_fast; then
                 subnet_setup "$AP_ADDR"
@@ -798,7 +749,7 @@ EOF
             [ "$SUBNET_STATUS" = mapped ] && echo "子网映射: $SUBNET_CFG_CIDR -> $SUBNET_ACTUAL_CIDR（保留主机号）"
             return 0
             ;;
-        *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64|import-file PATH|stage PATH"; return 1 ;;
+        *) echo "用法: hsp lease list|add MAC IP [备注]|del MAC|import BASE64"; return 1 ;;
     esac
 }
 
@@ -813,15 +764,10 @@ _lease_import_conflicts() {
 _lease_apply_if_running() {
     AP_IF=""; AP_ADDR=""
     ap_detect_fast >/dev/null 2>&1 || return 0
-    [ "$(dhcp_get serving)" = 1 ] || return 0
-    dhcp_reload_begin
     dhcp_stop 2>/dev/null
     lease_scrub_conflicts
-    if dhcp_takeover "$AP_IF" "$AP_ADDR"; then
-        log "static leases reloaded for $AP_IF"
-    else
-        log "static lease reload failed for $AP_IF"
-    fi
+    [ -n "$AP_IF" ] && dhcp_write_conf "$AP_IF" "$AP_ADDR" >/dev/null 2>&1
+    log "static leases regenerated for $AP_IF"
     return 0
 }
 
@@ -849,26 +795,20 @@ do_apply() {
     fi
 }
 
-do_dhcp_retry() {
-    if ! ap_detect_fast; then
-        echo "重试失败：热点未开启"
-        return 1
-    fi
-    dhcp_retry "$AP_IF" "$AP_ADDR"
-}
-
-do_dhcp_reset() {
-    dhcp_reset
-}
-
 daemon_ctl() {
     case "$1" in
         start)
-            if [ -n "$(daemon_pid)" ]; then echo "守护进程已在运行 ($(daemon_pid))"; return 0; fi
+            _live=$(daemon_pids)
+            _live=$(printf '%s\n' "$_live" | awk 'NF { print $1; exit }')
+            if [ -n "$_live" ]; then echo "守护进程已在运行 ($_live)"; return 0; fi
             setsid "$BB" sh "$MODDIR/bin/hspd" >/dev/null 2>&1 < /dev/null 9>&- 3>&- &
             sleep 1; if [ -n "$(daemon_pid)" ]; then say "守护进程已启动 ($(daemon_pid))"; else say "守护进程启动失败"; fi ;;
         stop)
-            _p=$(daemon_pid); [ -n "$_p" ] && kill "$_p"; sleep 1
+            _live=$(daemon_pids)
+            [ -n "$_live" ] && printf '%s\n' "$_live" | xargs -r -n1 kill -9 2>/dev/null
+            _w=0
+            while [ -n "$(daemon_pids)" ] && [ "$_w" -lt 30 ]; do sleep 0.2; _w=$((_w+1)); done
+            sleep 0.5
             dhcp_stop; fw_del; echo "守护进程已停止，已移除 DHCP 拦截规则" ;;
         restart) daemon_ctl stop; daemon_ctl start ;;
         *) [ -n "$(daemon_pid)" ] && echo "running $(daemon_pid)" || echo "stopped" ;;
@@ -938,14 +878,6 @@ case "$cmd" in
     config) do_config_json ;;
     set) do_set "$@" ;;
     lease|leases) do_lease "$@" ;;
-    dhcp)
-        case "$1" in
-            retry) : ;;
-            reset) lock dhcp-reset; do_dhcp_reset; exit $? ;;
-            *) echo "用法: hsp dhcp retry|reset"; exit 1 ;;
-        esac
-        lock dhcp-retry
-        do_dhcp_retry ;;
     backup) do_backup "$@" ;;
     restore) do_restore "$@" ;;
     restore-prompt) backup_prompt ;;
