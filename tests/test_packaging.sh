@@ -5,8 +5,8 @@ PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
 module_identity() {
     [ "$(sed -n 's/^id=//p' "$ROOT/module.prop")" = hotspot_plus ] &&
-        [ "$(sed -n 's/^version=//p' "$ROOT/module.prop")" = v0.3.0 ] &&
-        [ "$(sed -n 's/^versionCode=//p' "$ROOT/module.prop")" = 300 ] &&
+        [ "$(sed -n 's/^version=//p' "$ROOT/module.prop")" = v0.3.1 ] &&
+        [ "$(sed -n 's/^versionCode=//p' "$ROOT/module.prop")" = 301 ] &&
         grep -q '^DATA=/data/adb/hotspot_plus$' "$ROOT/customize.sh"
 }
 
