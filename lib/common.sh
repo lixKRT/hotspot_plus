@@ -1286,6 +1286,17 @@ dhcp_start() {
         log "udhcpd started: $DHCP_SUMMARY (pid $(dhcp_pid))"
         return 0
     fi
+    # A single sample can be a false negative under load (udhcpd still exec'ing).
+    # Re-check briefly before spending a retry from the session budget.
+    _ds_i=0
+    while [ "$_ds_i" -lt 10 ]; do
+        sleep 0.1
+        if dhcp_running; then
+            log "udhcpd started after grace: $DHCP_SUMMARY (pid $(dhcp_pid))"
+            return 0
+        fi
+        _ds_i=$((_ds_i + 1))
+    done
     log "ERROR: udhcpd exited immediately, see $LOGDIR/udhcpd.log"
     tail -n 5 "$LOGDIR/udhcpd.log" 2>/dev/null | while read -r _l; do log "  udhcpd: $_l"; done
     rm -f "$RUN/udhcpd.pid"

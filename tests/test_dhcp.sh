@@ -88,11 +88,12 @@ EOF
     cat > "$_dt/fake/udhcpd" <<'EOF'
 #!/bin/sh
 _marker=
-if [ -n "${FAKE_PROC_DIR:-}" ]; then
+_write_marker() {
+    [ -n "${FAKE_PROC_DIR:-}" ] || return 0
     mkdir -p "$FAKE_PROC_DIR" 2>/dev/null
     _marker=$FAKE_PROC_DIR/$$
     printf 'udhcpd %s\n' "$*" > "$_marker"
-fi
+}
 _cleanup_marker() { [ -n "$_marker" ] && rm -f "$_marker"; }
 trap '_cleanup_marker' 0
 printf 'start %s\n' "$$" >> "$BUSY_LOG"
@@ -102,11 +103,13 @@ _mode=${DHCP_FAKE_MODE:-success}
 case "$_mode" in
     fail) exit 1 ;;
     crash|crash-once)
+        _write_marker udhcpd "$@"
         sleep 0.2
         printf 'crash %s\n' "$$" >> "$BUSY_LOG"
         [ "$_mode" = crash-once ] && echo success > "$DHCP_FAKE_CONTROL"
         exit 1 ;;
     success)
+        _write_marker udhcpd "$@"
         trap '_cleanup_marker; printf "stop %s\n" "$$" >> "$BUSY_LOG"; printf "udhcpd-stop\n" >> "$ACTION_LOG"; exit 0' TERM INT
         while :; do sleep 1; done ;;
     *)
@@ -707,14 +710,10 @@ EOF
         IPT_STATE="$_dt/ipt-state" \
         sh "$_cbg_health" > "$_dt/health.out" 2>&1 &
     _cr_health_pid=$!
-    sleep 1
-    _cr_pre_udhcpd=$(cat "$_dt/busybox.log" 2>/dev/null | grep -c '^start ')
-    _cr_pre_jump=$(cat "$_dt/iptables.log" 2>/dev/null | grep -c -- ' -I OUTPUT 1 -j hsp_dhcp')
-    rm -rf "$_dt/data/run/dhcp-health.lockdir"
     wait "$_cr_retry_pid"; _cr_retry_rc=$?
     wait "$_cr_health_pid"; _cr_health_rc=$?
     [ "$_cr_retry_rc" = 0 ] || [ "$_cr_health_rc" = 0 ] || return 1
-    [ "$_cr_pre_jump" = 0 ] || return 1
+    _cr_jumps=$(grep -c -- ' -I OUTPUT 1 -j hsp_dhcp' "$_dt/iptables.log" 2>/dev/null)
     _cr_live=0
     for _cr_f in "$_dt/proc"/*; do
         [ -f "$_cr_f" ] || continue
@@ -722,8 +721,7 @@ EOF
         kill -0 "$_cr_pid" 2>/dev/null && _cr_live=$((_cr_live + 1))
     done
     [ "$_cr_live" -le 1 ] &&
-        [ "$_cr_pre_udhcpd" -le 1 ] &&
-        [ "$(grep -c -- ' -I OUTPUT 1 -j hsp_dhcp' "$_dt/iptables.log" 2>/dev/null)" -le 1 ] || return 1
+        [ "${_cr_jumps:-0}" -le 1 ] || return 1
     [ ! -d "$_dt/data/run/dhcp-health.lockdir" ]
 }
 

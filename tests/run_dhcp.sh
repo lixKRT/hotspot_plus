@@ -6,7 +6,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 TMPROOT=${TMPDIR:-/tmp}/hsp-dhcp-$$
 mkdir -p "$TMPROOT"
-trap 'rm -rf "$TMPROOT"' EXIT HUP INT TERM
+cleanup() {
+    if [ "${FAIL:-0}" -eq 0 ] || [ "${HSP_KEEP_TMP:-0}" != 1 ]; then
+        rm -rf "$TMPROOT"
+    else
+        printf 'kept failing test dir: %s\n' "$TMPROOT" >&2
+    fi
+}
+trap cleanup EXIT HUP INT TERM
 
 FAIL=0
 TOTAL=0
