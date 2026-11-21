@@ -8,7 +8,7 @@
 > 上游没有许可证文件；来源与再分发状态见 [仓库说明](docs/REPOSITORY.md)。
 >
 > 设计已定稿，见 [术语表](GLOSSARY.md)、[架构决策](docs/adr/README.md) 和
-> [验收标准](docs/ACCEPTANCE.md)。v0.3.1 修复已合并，真机验收状态以验收文档为准。
+> [验收标准](docs/ACCEPTANCE.md)。v0.3.2 修复已合并，真机验收状态以验收文档为准。
 
 给 **一加 8T KB2000（Android 16，Magisk 31.1）** 适配的 Magisk / KernelSU 模块，增强 Wi‑Fi 个人热点：
 
@@ -18,7 +18,7 @@
 4. 已连接设备列表：IP + MAC + 主机名 + 备注 + 租约
 5. 原生「已连接设备」页能不能显示 IP：只写了可行性分析和设计（Phase 2），**没有**实现
 
-> 版本 v0.3.1。适配基线见 [平台探针报告](docs/probes/02-platform-report.md)；
+> 版本 v0.3.2。适配基线见 [平台探针报告](docs/probes/02-platform-report.md)；
 > 固定网关与 DHCP 端到端仍需设备验收。
 
 ### v0.3.0 适配更新
@@ -134,7 +134,7 @@
 
 ## 二、安装
 
-1. Magisk 或 KernelSU 管理器 → 模块 → 安装 `hotspot_plus-v0.3.1.zip` → 重启。
+1. Magisk 或 KernelSU 管理器 → 模块 → 安装 `hotspot_plus-v0.3.2.zip` → 重启。
 2. 安装时会显示 busybox 里有没有 udhcpd、Android / HyperOS 版本、子网迁移结果，并自动安装 App「热点增强」。如果自动安装失败，APK 会复制到 `/sdcard/Download/hotspot_plus.apk`，手动安装即可。签名不一致时，先卸载旧 App 再装。
 3. 重启后有三种入口：
    - 桌面「热点增强」App（第一次打开前，先在当前模块管理器 →「超级用户」里允许「热点增强」使用 root）；
@@ -250,7 +250,7 @@ su -c "$H unstick"       # 清除卡住的操作（结束残留 hsp/hsctl 进程
 
 ## 五、首次测试步骤
 
-> **从 v0.2.x 升级到 v0.3.1**：
+> **从 v0.2.x 升级到 v0.3.2**：
 > 1. 在当前模块管理器里刷入 zip，安装日志应显示版本、架构、API 和 busybox `udhcpd` 状态；已有的 `config.conf`、`leases.conf` 不会被改写。
 > 2. 当前模块管理器 →「超级用户」→ 找到「热点增强」→ 允许。
 > 3. 打开桌面「热点增强」，在「网关与 DHCP」里确认网关为 192.168.42.1、地址池为 .100–.200（若之前自定义过，则以自定义值为准）。

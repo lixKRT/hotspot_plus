@@ -422,8 +422,10 @@ do_status_text() {
 clients_collect() { # outfile
     _co=$1
     : > "$_co"
-    _dp=$(dhcp_pid)
-    if [ -n "$_dp" ]; then kill -USR1 "$_dp" 2>/dev/null && sleep 0.3; fi
+    # Do NOT signal udhcpd here. BusyBox udhcpd treats SIGUSR1 as "reload leases and
+    # exit" (it is not a hot reload), so a single `hsp clients` would kill DHCP for
+    # the whole hotspot and hand the session to the retry budget. udhcpd writes the
+    # lease file itself; read it as-is.
     {
         $IPB -4 neigh show dev "$AP_IF" 2>/dev/null
         $IPB -6 neigh show dev "$AP_IF" 2>/dev/null

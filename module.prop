@@ -1,6 +1,6 @@
 id=hotspot_plus
 name=Hotspot Plus 热点增强
-version=v0.3.1
-versionCode=301
+version=v0.3.2
+versionCode=302
 author=lixKRT
 description=热点开关、固定网关 (默认 192.168.42.1)、静态 DHCP 绑定 (MAC→IP)、已连接设备 IP/MAC；Magisk/KernelSU 模块，附带桌面 App「热点增强」与快捷设置磁贴。需 busybox udhcpd。

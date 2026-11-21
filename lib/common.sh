@@ -1046,12 +1046,21 @@ dhcp_health_check() { # now iface addr
 # ---------------------------------------------------------------- udhcpd
 dhcp_pid() {
     _p=$(cat "$RUN/udhcpd.pid" 2>/dev/null)
-    [ -n "$_p" ] || return 0
-    kill -0 "$_p" 2>/dev/null || return 0
-    # setsid(1) normally execs in place. Some test shells keep an intermediate shell and
-    # would hide the real applet from the child's cmdline; trust the pidfile only then.
-    [ "$HSP_DHCP_PIDFILE_TRUST" = 1 ] && { echo "$_p"; return 0; }
-    grep -q udhcpd "/proc/$_p/cmdline" 2>/dev/null && echo "$_p"
+    if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
+        # setsid(1) normally execs in place. Some test shells keep an intermediate shell and
+        # would hide the real applet from the child's cmdline; trust the pidfile only then.
+        if [ "$HSP_DHCP_PIDFILE_TRUST" = 1 ] || grep -q udhcpd "/proc/$_p/cmdline" 2>/dev/null; then
+            echo "$_p"
+            return 0
+        fi
+    fi
+    # Toybox setsid can fork, so the pidfile may hold a short-lived parent while the real
+    # applet keeps running. Fall back to the config path so health checks see the truth.
+    _p=$(pgrep -f "udhcpd -f $RUN/udhcpd.conf" 2>/dev/null | while read -r _qp; do
+        [ "$_qp" = "$$" ] && continue
+        grep -q udhcpd "/proc/$_qp/cmdline" 2>/dev/null && echo "$_qp"
+    done | head -n1)
+    [ -n "$_p" ] && { echo "$_p" > "$RUN/udhcpd.pid"; echo "$_p"; }
 }
 dhcp_running() { [ -n "$(dhcp_pid)" ]; }
 dhcp_stop() {
@@ -1060,9 +1069,14 @@ dhcp_stop() {
         kill "$_p" 2>/dev/null   # SIGTERM -> udhcpd writes lease file and exits
         _i=0; while kill -0 "$_p" 2>/dev/null && [ $_i -lt 10 ]; do sleep 0.2; _i=$((_i+1)); done
         kill -9 "$_p" 2>/dev/null
+        _i=0; while kill -0 "$_p" 2>/dev/null && [ $_i -lt 20 ]; do sleep 0.1; _i=$((_i+1)); done
     fi
     # stray instances started by us (match our conf path)
-    for _q in $(pgrep -f "udhcpd -f $RUN/udhcpd.conf" 2>/dev/null); do kill "$_q" 2>/dev/null; done
+    _stray=$(pgrep -f "udhcpd -f $RUN/udhcpd.conf" 2>/dev/null | tr '\n' ' ')
+    for _q in $_stray; do kill "$_q" 2>/dev/null; done
+    for _q in $_stray; do
+        _i=0; while kill -0 "$_q" 2>/dev/null && [ $_i -lt 20 ]; do sleep 0.1; _i=$((_i+1)); done
+    done
     rm -f "$RUN/udhcpd.pid"
 }
 
@@ -1280,19 +1294,19 @@ dhcp_start() {
     touch "$LEASE_DB"
     # setsid so it survives the caller (WebUI exec / action) exiting
     setsid "$BB" udhcpd -f "$RUN/udhcpd.conf" >> "$LOGDIR/udhcpd.log" 2>&1 < /dev/null 9>&- 3>&- &
-    echo $! > "$RUN/udhcpd.pid"
+    _ds_spawn=$!
+    echo "$_ds_spawn" > "$RUN/udhcpd.pid"
     sleep 1
     if dhcp_running; then
         log "udhcpd started: $DHCP_SUMMARY (pid $(dhcp_pid))"
         return 0
     fi
-    # A single sample can be a false negative under load (udhcpd still exec'ing).
     # Re-check briefly before spending a retry from the session budget.
     _ds_i=0
     while [ "$_ds_i" -lt 10 ]; do
         sleep 0.1
         if dhcp_running; then
-            log "udhcpd started after grace: $DHCP_SUMMARY (pid $(dhcp_pid))"
+            log "udhcpd started after grace: $DHCP_SUMMARY (pid $(cat "$RUN/udhcpd.pid" 2>/dev/null))"
             return 0
         fi
         _ds_i=$((_ds_i + 1))
